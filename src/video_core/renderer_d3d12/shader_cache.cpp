@@ -469,6 +469,7 @@ void ShaderCache::Initialize(ID3D12Device* device, const ResourceCache* resource
     profile.max_viewport_height = D3D12_VIEWPORT_BOUNDS_MAX;
     profile.max_shared_memory_size = D3D12_CS_TGSM_REGISTER_COUNT * sizeof(u32);
     profile.support_int64 = options.Int64ShaderOps;
+    profile.support_bda = true;
     D3D12_FEATURE_DATA_D3D12_OPTIONS numeric_options{};
     winrt::check_hresult(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &numeric_options,
                                                      sizeof(numeric_options)));

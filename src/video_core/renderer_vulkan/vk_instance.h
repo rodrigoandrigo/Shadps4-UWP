@@ -281,6 +281,14 @@ public:
         return vk12_features.shaderSharedInt64Atomics;
     }
 
+    bool IsBufferDeviceAddressSupported() const {
+#ifdef SHADPS4_UWP
+        return false;
+#else
+        return vk12_features.bufferDeviceAddress;
+#endif
+    }
+
     /// Returns true if the subgroup size can be set to match guest subgroup size
     bool IsSubgroupSize64Supported(vk::ShaderStageFlagBits stage = vk::ShaderStageFlagBits::eCompute) const {
         return vk13_features.subgroupSizeControl && vk13_props.minSubgroupSize <= 64 &&

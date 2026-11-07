@@ -315,6 +315,11 @@ constexpr u32 kRtDepthControlBits = 0x7;
 constexpr u32 kRtColorControlBits = 0x78;
 static_assert(sizeof(AmdGpu::DepthControl) == 4 && sizeof(AmdGpu::ColorControl) == 4);
 
+static u32 RtScissorCorner(const AmdGpu::Regs& regs) {
+    const AmdGpu::Scissor scissor = regs.GetCombinedScissor();
+    return u32(u16(scissor.bottom_right_x)) | u32(u16(scissor.bottom_right_y)) << 16;
+}
+
 u64 Rasterizer::RtLaneStamp() const noexcept {
     return rt_state_stamp_ ? liverpool->GetRtStateStamp() : liverpool->GetGfxStateStamp();
 }
@@ -1368,7 +1373,7 @@ void Rasterizer::EmitSkipcacheTelemetry(Skipcache::Framework& skipcache) {
             // br_mem_fast_state off); memok= the ones they did.
             LOG_INFO(Render_Skipcache,
                      "[SkipCache] BRRT br={}/{} brpop={}/{} key={} reg={} tick={} mem={} "
-                     "tex={} idg={} veto={} vdepth={} vcolor={} vfbl={} same={} "
+                     "tex={} idg={} veto={} vdepth={} vcolor={} vfbl={} vscissor={} same={} "
                      "sameopen={} memok={} per300f",
                      bc.eligible - br_last_.eligible, bc.hits - br_last_.hits,
                      bc.populated - br_last_.populated,
@@ -1376,10 +1381,10 @@ void Rasterizer::EmitSkipcacheTelemetry(Skipcache::Framework& skipcache) {
                      bc.miss_key - br_last_.miss_key, lane(Skipcache::LaneReg),
                      lane(Skipcache::LaneTick), lane(Skipcache::LaneMem), lane(Skipcache::LaneTex),
                      lane(Skipcache::LaneImgDirty), vetoes, br_veto_depth_, br_veto_color_,
-                     br_veto_fbl_, br_same_state_, br_same_open_, br_mem_recert_);
+                     br_veto_fbl_, br_veto_scissor_, br_same_state_, br_same_open_, br_mem_recert_);
             br_last_ = bc;
-            br_veto_depth_ = br_veto_color_ = br_veto_fbl_ = br_same_state_ = br_same_open_ =
-                br_mem_recert_ = 0;
+            br_veto_depth_ = br_veto_color_ = br_veto_fbl_ = br_veto_scissor_ = br_same_state_ =
+                br_same_open_ = br_mem_recert_ = 0;
         }
         if (rc.eligible != rt_last_.eligible) {
             const auto d = [&](u64 Skipcache::CacheCounters::* f) { return rc.*f - rt_last_.*f; };
@@ -2778,10 +2783,12 @@ bool Rasterizer::BrProbe(const VideoCore::Skipcache::DrawToken& token,
         const bool color_moved =
             ((std::bit_cast<u32>(regs.color_control) ^ br_color_bits_) & kRtColorControlBits) != 0;
         const bool fbl_moved = draw_samples_target_ != c.attachment_feedback_loop;
-        if (depth_moved || color_moved || fbl_moved) {
+        const bool scissor_moved = br_no_attachment_ && RtScissorCorner(regs) != br_scissor_corner_;
+        if (depth_moved || color_moved || fbl_moved || scissor_moved) {
             br_veto_depth_ += depth_moved;
             br_veto_color_ += color_moved;
             br_veto_fbl_ += fbl_moved;
+            br_veto_scissor_ += scissor_moved;
             ++ctr.veto[BrVetoCtlBits];
             return false;
         }
@@ -2955,6 +2962,11 @@ void Rasterizer::BrPopulate(const RenderState& fresh, const VideoCore::Skipcache
     br_color_samples_ = key.color_samples;
     br_depth_bits_ = std::bit_cast<u32>(regs.depth_control) & kRtDepthControlBits;
     br_color_bits_ = std::bit_cast<u32>(regs.color_control) & kRtColorControlBits;
+    br_no_attachment_ = !br_cache_.has_db;
+    for (u32 cb = 0; cb < fresh.num_color_attachments; ++cb) {
+        br_no_attachment_ = br_no_attachment_ && !br_cache_.cb_guard[cb].image_id;
+    }
+    br_scissor_corner_ = RtScissorCorner(regs);
     // The refused or invalid snapshot is still in place: a byte-equal rebuild
     // is a miss whose cause the body could not see. Consumed by the BRRT line;
     // is_rendering is read after the body's Transits.
@@ -3023,6 +3035,7 @@ const RenderState& Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) 
     state.height = instance.GetMaxFramebufferHeight();
     state.num_layers = std::numeric_limits<u16>::max();
     state.num_color_attachments = std::bit_width(key.mrt_mask);
+    bool has_attachment = false;
     for (auto cb = 0u; cb < state.num_color_attachments; ++cb) {
         auto& [image_id, desc] = cb_descs[cb];
         if (!image_id) {
@@ -3070,6 +3083,7 @@ const RenderState& Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) 
         state.height = std::min<u32>(state.height, std::max(image->info.size.height >> mip, 1u));
         state.num_layers = std::min<u32>(state.num_layers, image_view.info.range.extent.layers);
 
+        has_attachment = true;
         const auto clear_value =
             is_clear ? LiverpoolToVK::ColorBufferClearValue(col_buf) : vk::ClearValue{};
         auto& attachment = state.color_attachments[cb];
@@ -3082,6 +3096,7 @@ const RenderState& Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) 
     }
 
     if (auto image_id = db_desc.image_id; image_id) {
+        has_attachment = true;
         auto& desc = db_desc.desc;
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         const auto& image_view = texture_cache.FindDepthTarget(image_id, desc);
@@ -3136,6 +3151,15 @@ const RenderState& Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) 
         }
 
         image.usage.depth_target = true;
+    }
+
+    if (!has_attachment) {
+        state.num_layers = 1;
+        const AmdGpu::Scissor scissor = regs.GetCombinedScissor();
+        if (scissor.bottom_right_x > 0 && scissor.bottom_right_y > 0) {
+            state.width = std::min<u32>(state.width, scissor.bottom_right_x);
+            state.height = std::min<u32>(state.height, scissor.bottom_right_y);
+        }
     }
 
     if (state.num_layers == std::numeric_limits<u16>::max()) {
@@ -3500,31 +3524,7 @@ bool Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
 void Rasterizer::UpdateViewportScissorState() const {
     const auto& regs = liverpool->regs;
 
-    const auto combined_scissor_value_tl = [](s16 scr, s16 win, s16 gen, s16 win_offset) {
-        return std::max({scr, s16(win + win_offset), s16(gen + win_offset)});
-    };
-    const auto combined_scissor_value_br = [](s16 scr, s16 win, s16 gen, s16 win_offset) {
-        return std::min({scr, s16(win + win_offset), s16(gen + win_offset)});
-    };
-    const bool enable_offset = !regs.window_scissor.window_offset_disable;
-
-    AmdGpu::Scissor scsr{};
-    scsr.top_left_x = combined_scissor_value_tl(
-        regs.screen_scissor.top_left_x, s16(regs.window_scissor.top_left_x),
-        s16(regs.generic_scissor.top_left_x),
-        enable_offset ? regs.window_offset.window_x_offset : 0);
-    scsr.top_left_y = combined_scissor_value_tl(
-        regs.screen_scissor.top_left_y, s16(regs.window_scissor.top_left_y),
-        s16(regs.generic_scissor.top_left_y),
-        enable_offset ? regs.window_offset.window_y_offset : 0);
-    scsr.bottom_right_x = combined_scissor_value_br(
-        regs.screen_scissor.bottom_right_x, regs.window_scissor.bottom_right_x,
-        regs.generic_scissor.bottom_right_x,
-        enable_offset ? regs.window_offset.window_x_offset : 0);
-    scsr.bottom_right_y = combined_scissor_value_br(
-        regs.screen_scissor.bottom_right_y, regs.window_scissor.bottom_right_y,
-        regs.generic_scissor.bottom_right_y,
-        enable_offset ? regs.window_offset.window_y_offset : 0);
+    const AmdGpu::Scissor scsr = regs.GetCombinedScissor();
 
     boost::container::static_vector<vk::Viewport, AmdGpu::NUM_VIEWPORTS> viewports;
     boost::container::static_vector<vk::Rect2D, AmdGpu::NUM_VIEWPORTS> scissors;

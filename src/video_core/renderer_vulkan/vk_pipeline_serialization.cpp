@@ -13,8 +13,8 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 22u;
-static constexpr u32 ShaderMetaVersion = 15u;
+static constexpr u32 ShaderBinaryVersion = 23u;
+static constexpr u32 ShaderMetaVersion = 16u;
 static constexpr u32 PipelineKeyVersion = 6u;
 } // namespace Serialization
 
@@ -411,7 +411,7 @@ void PipelineCache::WarmUp() {
 }
 
 void PipelineCache::Sync() {
-    ReapPendingPipelines(true);
+    DrainCompileTasks();
     SaveDriverCache();
     Storage::DataBase::Instance().Close();
 }
@@ -444,6 +444,7 @@ void PipelineCache::LoadDriverCache() {
 }
 
 void PipelineCache::SaveDriverCache() {
+    std::scoped_lock lock{driver_cache_mutex};
     auto& storage = Storage::DataBase::Instance();
     if (!storage.IsOpened() || !pipeline_cache)
         return;

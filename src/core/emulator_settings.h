@@ -261,6 +261,7 @@ struct NetworkSettings {
     Setting<int> p2p_port{3658}; // 0 is any free port, 3658 is the default PS4 port. With UPnP
                                  // enabled it is forwarded on the router.
     Setting<bool> disable_https{false};
+    Setting<bool> enable_device_discovery{false};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -272,13 +273,15 @@ struct NetworkSettings {
                                            &NetworkSettings::shadnet_webapi_server),
             make_override<NetworkSettings>("enable_upnp", &NetworkSettings::enable_upnp),
             make_override<NetworkSettings>("p2p_port", &NetworkSettings::p2p_port),
+            make_override<NetworkSettings>("enable_device_discovery",
+                                           &NetworkSettings::enable_device_discovery),
             make_override<NetworkSettings>("disable_https", &NetworkSettings::disable_https)};
     }
 };
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(NetworkSettings, connected_to_network, shad_net_enabled,
                                    shadnet_server, shadnet_webapi_server, enable_upnp, p2p_port,
-                                   disable_https)
+                                   disable_https, enable_device_discovery)
 
 // -------------------------------
 // Log settings
@@ -483,6 +486,7 @@ struct GPUSettings {
     // Record the draw scheduler's Vulkan commands and issue its queue submits on a dedicated
     // thread; the GPU command thread stores each call as a closure instead of calling the driver.
     Setting<bool> vk_record_thread{true};
+    Setting<bool> async_shader_recompiling{true};
     // Rebuild the vertex input layout only when the pipeline, the instance step rates or an
     // attribute's format or stride changed, instead of on every draw.
     Setting<bool> vertex_layout_memo{true};
@@ -762,6 +766,7 @@ struct GPUSettings {
             GPU_OVERRIDE(tracker_lock_spin_rounds),
             GPU_OVERRIDE(one_core_gpu_thread_pin),
             GPU_OVERRIDE(vk_record_thread),
+            GPU_OVERRIDE(async_shader_recompiling),
             GPU_OVERRIDE(vertex_layout_memo),
             GPU_OVERRIDE(covered_range_skip),
             GPU_OVERRIDE(residency_bitmap),
@@ -862,7 +867,7 @@ struct GPUSettings {
     vertex_layout_memo, covered_range_skip, residency_bitmap, \
     readback_linear_images_async, inline_fetch_shader, stream_barrier_skip, \
     clean_sync_peek, readback_offload, fast_shader_math, pipeline_sync_budget_ms, \
-    one_core_gpu_thread_pin, vk_record_thread
+    one_core_gpu_thread_pin, vk_record_thread, async_shader_recompiling
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1161,6 +1166,7 @@ public:
     SETTING_FORWARD_BOOL(m_network, UPnPEnabled, enable_upnp)
     SETTING_FORWARD(m_network, P2PPort, p2p_port)
     SETTING_FORWARD_BOOL(m_network, ForcedHttpsDisabled, disable_https)
+    SETTING_FORWARD_BOOL(m_network, DeviceDiscoveryEnabled, enable_device_discovery)
 
     // Log settings
     SETTING_FORWARD_BOOL(m_log, LogAppend, append)
@@ -1199,6 +1205,7 @@ public:
     SETTING_FORWARD(m_gpu, TrackerLockSpinRounds, tracker_lock_spin_rounds)
     SETTING_FORWARD_BOOL(m_gpu, OneCoreGpuThreadPin, one_core_gpu_thread_pin)
     SETTING_FORWARD_BOOL(m_gpu, VkRecordThread, vk_record_thread)
+    SETTING_FORWARD_BOOL(m_gpu, AsyncShaderRecompiling, async_shader_recompiling)
     SETTING_FORWARD_BOOL(m_gpu, VertexLayoutMemo, vertex_layout_memo)
     SETTING_FORWARD_BOOL(m_gpu, CoveredRangeSkip, covered_range_skip)
     SETTING_FORWARD_BOOL(m_gpu, ResidencyBitmap, residency_bitmap)

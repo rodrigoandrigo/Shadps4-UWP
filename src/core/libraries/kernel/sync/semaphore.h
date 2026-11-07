@@ -12,6 +12,7 @@
 
 #ifdef _WIN64
 #include <windows.h>
+#include "core/libraries/kernel/sync/semaphore_pool.h"
 #elif defined(__APPLE__)
 #include <dispatch/dispatch.h>
 #else
@@ -29,17 +30,21 @@ public:
 #endif
     {
 #ifdef _WIN64
-        sem = CreateSemaphore(nullptr, initialCount, max, nullptr);
-        ASSERT_MSG(sem != nullptr, "Failed to create Win32 semaphore");
+        sem = SemaphorePool<max>::Acquire(initialCount);
+        const auto error = GetLastError();
+        ASSERT_MSG(sem != nullptr, "Failed to create Win32 semaphore: {}", error);
 #elif defined(__APPLE__)
         sem = dispatch_semaphore_create(initialCount);
         ASSERT_MSG(sem != nullptr, "Failed to create dispatch semaphore");
 #endif
     }
 
+    Semaphore(const Semaphore&) = delete;
+    Semaphore& operator=(const Semaphore&) = delete;
+
     ~Semaphore() {
 #ifdef _WIN64
-        CloseHandle(sem);
+        SemaphorePool<max>::Recycle(sem);
 #elif defined(__APPLE__)
         dispatch_release(sem);
 #endif
@@ -47,8 +52,12 @@ public:
 
     void release() {
 #ifdef _WIN64
-        ASSERT_MSG(ReleaseSemaphore(sem, 1, nullptr) != 0, "Failed to release Win32 semaphore: {}",
-                   GetLastError());
+        if (!ReleaseSemaphore(sem, 1, nullptr)) {
+            const auto error = GetLastError();
+            ++SemaphoreDiagnostics::counters.release_failures;
+            SemaphoreDiagnostics::Report("ReleaseSemaphore.failed", this, sem, max, 0, error);
+            ASSERT_MSG(false, "Failed to release Win32 semaphore: {}", error);
+        }
 #elif defined(__APPLE__)
         dispatch_semaphore_signal(sem);
 #else
@@ -58,8 +67,9 @@ public:
 
     void acquire() {
 #ifdef _WIN64
+        SemaphoreDiagnostics::Waiting waiting;
         for (;;) {
-            u64 res = WaitForSingleObjectEx(sem, INFINITE, true);
+            const auto res = Wait(INFINITE, true);
             if (res == WAIT_OBJECT_0) {
                 return;
             }
@@ -80,7 +90,7 @@ public:
 
     bool try_acquire() {
 #ifdef _WIN64
-        return WaitForSingleObjectEx(sem, 0, true) == WAIT_OBJECT_0;
+        return Wait(0, true) == WAIT_OBJECT_0;
 #elif defined(__APPLE__)
         return dispatch_semaphore_wait(sem, DISPATCH_TIME_NOW) == 0;
 #else
@@ -92,7 +102,7 @@ public:
     // non-alertable call; the native Darwin and standard C++ semaphore calls already behave so.
     bool try_acquire_pending() {
 #ifdef _WIN64
-        return WaitForSingleObjectEx(sem, 0, false) == WAIT_OBJECT_0;
+        return Wait(0, false) == WAIT_OBJECT_0;
 #elif defined(__APPLE__)
         return dispatch_semaphore_wait(sem, DISPATCH_TIME_NOW) == 0;
 #else
@@ -103,6 +113,7 @@ public:
     template <class Rep, class Period>
     bool try_acquire_for(const std::chrono::duration<Rep, Period>& rel_time) {
 #ifdef _WIN64
+        SemaphoreDiagnostics::Waiting waiting;
         using Clock = std::chrono::steady_clock;
         if (rel_time <= std::chrono::duration<Rep, Period>::zero()) {
             return try_acquire_pending();
@@ -124,7 +135,7 @@ public:
             constexpr auto MaxFiniteWait = static_cast<s64>(INFINITE) - 1;
             const DWORD timeout_ms =
                 static_cast<DWORD>(std::min<s64>(remaining_ms.count(), MaxFiniteWait));
-            const DWORD res = WaitForSingleObjectEx(sem, timeout_ms, true);
+            const DWORD res = Wait(timeout_ms, true);
             if (res == WAIT_OBJECT_0) {
                 return true;
             }
@@ -152,6 +163,19 @@ public:
 
 private:
 #ifdef _WIN64
+    DWORD Wait(DWORD timeout, BOOL alertable) {
+        const auto result = WaitForSingleObjectEx(sem, timeout, alertable);
+        if (result == WAIT_FAILED) {
+            const auto error = GetLastError();
+            ++SemaphoreDiagnostics::counters.wait_failures;
+            SemaphoreDiagnostics::Report("WaitForSingleObjectEx.failed", this, sem, max, 0, error,
+                                         result);
+        } else if (result == WAIT_TIMEOUT) {
+            ++SemaphoreDiagnostics::counters.timeouts;
+        }
+        return result;
+    }
+
     HANDLE sem;
 #elif defined(__APPLE__)
     dispatch_semaphore_t sem;

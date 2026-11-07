@@ -119,7 +119,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
         .size = ARENA_PAGE_SIZE,
-        .usage = ARENA_USAGE,
+        .usage = SupportedUsage(instance, ARENA_USAGE),
         .sharingMode = vk::SharingMode::eExclusive,
     };
     const auto device = instance.GetDevice();

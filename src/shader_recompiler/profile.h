@@ -17,6 +17,7 @@ struct Profile {
     bool support_int8{};
     bool support_int16{};
     bool support_int64{};
+    bool support_bda{};
     bool support_float16{};
     bool support_float64{};
     bool allow_fp64_to_fp32_lowering{true};

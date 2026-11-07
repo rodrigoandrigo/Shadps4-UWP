@@ -11,7 +11,7 @@ namespace Libraries::Kernel::SemaphoreDiagnostics {
 struct Counters {
     std::atomic<uint64_t> created{}, closed{}, live{}, peak{};
     std::atomic<uint64_t> create_failures{}, close_failures{}, wait_failures{}, release_failures{};
-    std::atomic<uint64_t> waiters{}, timeouts{};
+    std::atomic<uint64_t> waiters{}, timeouts{}, cached{}, reused{};
 };
 
 inline Counters counters;
@@ -27,19 +27,20 @@ inline void Report(const char* operation, const void* object, HANDLE handle, int
     const bool available = GetProcessInformation(GetCurrentProcess(), ProcessAppMemoryInfo,
                                                  &memory, sizeof(memory));
     try {
-        LOG_WARNING(Kernel,
-                    "[SemaphoreDiag] operation={} object={} handle={} tid={} max={} initial={} "
-                    "win32={} wait_result={:#x} created={} closed={} live={} peak={} "
-                    "create_failures={} close_failures={} wait_failures={} release_failures={} "
-                    "waiters={} timeouts={} commit_available={} private_commit={} "
-                    "total_commit={} memory_info={}",
-                    operation, object, handle, GetCurrentThreadId(), maximum, initial, error, result,
-                    counters.created.load(), counters.closed.load(), counters.live.load(),
-                    counters.peak.load(), counters.create_failures.load(),
-                    counters.close_failures.load(), counters.wait_failures.load(),
-                    counters.release_failures.load(), counters.waiters.load(),
-                    counters.timeouts.load(), memory.AvailableCommit,
-                    memory.PrivateCommitUsage, memory.TotalCommitUsage, available);
+        LOG_WARNING(
+            Kernel,
+            "[SemaphoreDiag] operation={} object={} handle={} tid={} max={} initial={} "
+            "win32={} wait_result={:#x} created={} closed={} live={} peak={} "
+            "create_failures={} close_failures={} wait_failures={} release_failures={} "
+            "waiters={} timeouts={} cached={} reused={} commit_available={} private_commit={} "
+            "total_commit={} memory_info={}",
+            operation, object, handle, GetCurrentThreadId(), maximum, initial, error, result,
+            counters.created.load(), counters.closed.load(), counters.live.load(),
+            counters.peak.load(), counters.create_failures.load(), counters.close_failures.load(),
+            counters.wait_failures.load(), counters.release_failures.load(),
+            counters.waiters.load(), counters.timeouts.load(), counters.cached.load(),
+            counters.reused.load(), memory.AvailableCommit, memory.PrivateCommitUsage,
+            memory.TotalCommitUsage, available);
     } catch (...) {
     }
     SetLastError(error);

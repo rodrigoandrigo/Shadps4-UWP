@@ -5,9 +5,13 @@
 
 #include <array>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <functional>
 #include <future>
 #include <memory>
-#include <string>
+#include <mutex>
+#include <thread>
 #include <variant>
 #include <nlohmann/json_fwd.hpp>
 #include <tsl/robin_map.h>
@@ -17,7 +21,6 @@
 #include "shader_recompiler/specialization.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
-#include "video_core/renderer_vulkan/vk_pipeline_progress.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "vulkan/vulkan.hpp"
 
@@ -29,7 +32,7 @@ struct std::hash<vk::ShaderModule> {
 };
 
 namespace AmdGpu {
-struct Liverpool;
+class Liverpool;
 }
 
 namespace Serialization {
@@ -45,6 +48,7 @@ namespace Vulkan {
 class Instance;
 class Scheduler;
 class ShaderCache;
+struct ShaderCompileResult;
 
 // Dwords of the flat user-data window the gather-input memo records per stage. A program whose
 // window is wider never arms the memo and is counted as GIMEMO big=.
@@ -60,6 +64,8 @@ struct Program {
 
     Shader::Info info;
     ModuleList modules{};
+    // The permutation whose SPIR-V a shader compile worker emits, added to the modules once done.
+    std::shared_ptr<ShaderCompileResult> pending_compilation{};
     // Index of the permutation matched by the previous lookup; probed first when
     // the MRU probe setting is enabled. Always bounds-checked before use.
     u32 last_hit_perm{};
@@ -193,6 +199,8 @@ public:
 
     void WarmUp();
     void Sync();
+    void DrainCompileTasks();
+    nlohmann::json GraphicsPipelineDiagnostic() const;
 
     bool LoadComputePipeline(Serialization::Archive& ar);
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
@@ -200,8 +208,6 @@ public:
                            Shader::Gcn::FetchShaderData& fetch_out);
 
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
-
-    nlohmann::json GraphicsPipelineDiagnostic() const;
 
     const ComputePipeline* GetComputePipeline();
 
@@ -244,40 +250,6 @@ public:
     void DumpSharpReadStats();
 
 private:
-    struct PendingGraphicsPipeline {
-        PipelineCompileProgress progress;
-        std::chrono::steady_clock::time_point start;
-        u64 hash{};
-        vk::UniquePipelineCache driver_cache;
-        GraphicsPipeline::SerializationSupport sdata{};
-        std::array<std::optional<Shader::Info>, MaxShaderStages> info_copies;
-        std::array<std::array<u32, Shader::NUM_USER_DATA_REGS>, MaxShaderStages> user_data{};
-        std::array<const Shader::Info*, MaxShaderStages> copied_infos{};
-        std::array<const Shader::Info*, MaxShaderStages> live_infos{};
-        std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
-        std::array<vk::ShaderModule, MaxShaderStages> modules{};
-        std::optional<Shader::Gcn::FetchShaderData> fetch_shader;
-        VertexInputs<AmdGpu::Buffer> vertex_sharps;
-        bool photo_waited{};
-        bool abandoned{};
-        std::future<std::unique_ptr<GraphicsPipeline>> future;
-    };
-    std::unique_ptr<PendingGraphicsPipeline> StartGraphicsPipeline(
-        u64 hash, const Shader::Gcn::FetchShaderData* fetch_shader);
-    void InstallGraphicsPipeline(const GraphicsPipelineKey& key, PendingGraphicsPipeline& pending);
-    void ReapPendingPipelines(bool drain = false);
-    bool DrawsPhoto() const;
-    bool WaitForGraphicsPipeline(PendingGraphicsPipeline& pending, bool photo);
-    u32 sync_budget_frame{~u32{0}};
-    std::chrono::steady_clock::duration sync_budget_spent{};
-    tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<PendingGraphicsPipeline>>
-        pending_graphics_pipelines;
-    tsl::robin_map<GraphicsPipelineKey, std::string> abandoned_graphics_pipelines;
-    const char* graphics_unavailable_reason{"not_requested"};
-    s32 graphics_rejected_stage{-1};
-    bool graphics_diagnostic_key_valid{};
-    void LoadDriverCache();
-    void SaveDriverCache();
     bool RefreshGraphicsKey();
     bool RefreshGraphicsStages(bool track_hash_diff);
     bool ReuseGraphicsKey(u64 pipe_gen);
@@ -290,6 +262,21 @@ private:
     vk::ShaderModule CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                    const std::span<const u32>& code, size_t perm_idx,
                                    Shader::Backend::Bindings& binding);
+    bool CompileProgramOnWorker(Program& program, Shader::HwStage stage, Shader::SwStage l_stage,
+                                const Shader::ShaderParams& params,
+                                Shader::Backend::Bindings& binding,
+                                Shader::StageSpecialization* spec, size_t perm_idx, u64 perm_hash);
+    void EmitProgram(ShaderCompileResult& result);
+    bool PublishPendingCompilation(Program& program);
+    template <typename T>
+    bool WaitForQueuedCompile(const std::future<T>& compile);
+    SHAD_NO_INLINE const GraphicsPipeline* CreateGraphicsPipeline();
+    std::future<std::unique_ptr<GraphicsPipeline>> QueueGraphicsPipeline(
+        u64 hash, const Shader::Gcn::FetchShaderData* fetch_shader);
+    const GraphicsPipeline* InstallGraphicsPipeline(std::unique_ptr<GraphicsPipeline> pipeline);
+    bool DrawsPhoto() const;
+    void CompileWorker(u32 index);
+    void QueueCompileTask(std::function<void()>&& task, bool front);
     const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::HwStage stage, Shader::SwStage l_stage);
 
     [[nodiscard]] bool IsPipelineCacheDirty() const {
@@ -304,7 +291,6 @@ private:
     PipelineLayoutCache layouts; // destroyed after every pipeline
     bool share_layouts{};
     vk::UniquePipelineCache pipeline_cache;
-    u64 driver_cache_hash{};
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};
     Shader::Pools pools;
@@ -315,6 +301,14 @@ private:
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
+    // Graphics pipelines a shader compile worker compiles.
+    tsl::robin_map<GraphicsPipelineKey, std::future<std::unique_ptr<GraphicsPipeline>>>
+        pending_graphics_pipelines;
+    // Pipelines ReplaceShader erased, each released by a deferred operation once the GPU passed
+    // the draws binding it; owned here so they die before desc_heap. ReplaceShader pushes from
+    // the devtools thread while the operations pop on the GPU command thread.
+    std::deque<std::unique_ptr<Pipeline>> retired_pipelines;
+    std::mutex retired_pipelines_mutex;
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
     std::array<const Shader::Info*, MaxShaderStages> infos{};
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
@@ -339,8 +333,8 @@ private:
     u64 key_reuse_diff_decisions{};
     u64 nonfull_mask_pipelines{};
     u64 graphics_lookups{};
-    u64 async_skipped_draws{};
-    u64 async_completed_pipelines{};
+    // Cleared by every graphics lookup; the first compile wait of the draw sets compile_deadline.
+    bool compile_deadline_armed{};
     bool key_stamp_reuse{};
     bool key_reuse_validate{}; // ValidateOnly mode: every reuse is rebuilt and compared
     u64 key_reuse_hits{};
@@ -538,6 +532,32 @@ private:
     // deserialized permutations get signatures). Gates the spec-fingerprint tier and the
     // (sig, sig2) permutation resolve in GetProgram; off means byte-identical legacy behavior.
     bool spec_fp_cache{};
+
+    // Shader compile workers. They emit the SPIR-V of the programs the GPU thread translates,
+    // ahead of the graphics pipelines they compile.
+    const char* graphics_unavailable_reason{"ready"};
+    s32 graphics_rejected_stage{-1};
+    bool graphics_diagnostic_key_valid{};
+    u64 driver_cache_hash{};
+    void LoadDriverCache();
+    void SaveDriverCache();
+    std::mutex driver_cache_mutex;
+    bool async_shader_recompiling{};
+    // The draw that queues a compile waits for it within this budget, spread over every compile
+    // the draw queues.
+    std::chrono::milliseconds sync_budget{};
+    std::chrono::steady_clock::time_point compile_deadline{};
+    static constexpr u32 NumCompileWorkers = 6;
+    std::array<std::thread, NumCompileWorkers> compile_workers;
+    std::deque<std::function<void()>> compile_tasks;
+    mutable std::mutex compile_mutex;
+    std::condition_variable compile_cv;
+    std::condition_variable compile_idle_cv;
+    u32 compile_tasks_in_flight{};
+    bool compile_workers_stopping{};
+    // Translated IR stays in its pools until a worker emits it.
+    std::mutex free_pools_mutex;
+    std::vector<std::unique_ptr<Shader::Pools>> free_pools;
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

@@ -234,6 +234,8 @@ private:
         static_cast<Rasterizer*>(self)->br_cache_.valid = false;
     }
     BeginRenderingCache br_cache_{};
+    bool br_no_attachment_{};
+    u32 br_scissor_corner_{};
     bool br_readback_gate_{}; // readbackLinearImages snapshot: cache off when set
     bool batch_copy_lock_{};  // settings snapshot, read at draw rate
     // Interval flush: a readback fence otherwise waits on the whole body
@@ -567,7 +569,8 @@ private:
     VideoCore::ImageViewInfo rt_memo_db_view_{};
     // BRRT census: the three ctl-bits veto inputs, and misses whose fresh
     // state equalled the snapshot they replaced (with the pass still open).
-    u64 br_veto_depth_{}, br_veto_color_{}, br_veto_fbl_{}, br_same_state_{}, br_same_open_{};
+    u64 br_veto_depth_{}, br_veto_color_{}, br_veto_fbl_{}, br_veto_scissor_{}, br_same_state_{},
+        br_same_open_{};
     // br_mem_fast_state latch and its census: moved-mem_gen probes
     // re-certified from the attachment words.
     bool br_mem_fast_state_{};
