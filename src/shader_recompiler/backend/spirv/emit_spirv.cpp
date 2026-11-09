@@ -667,8 +667,9 @@ void PatchPhiNodes(const IR::Program& program, EmitContext& ctx) {
 } // Anonymous namespace
 
 std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info,
-                           const IR::Program& program, Bindings& binding) {
-    EmitContext ctx{profile, runtime_info, program.info, binding};
+                           const IR::Program& program, Bindings& binding,
+                           const std::vector<VertexInputSnapshot>* vertex_inputs) {
+    EmitContext ctx{profile, runtime_info, program.info, binding, vertex_inputs};
     const Id main{DefineMain(ctx, program)};
     DefineEntryPoint(program.info, runtime_info, ctx, main);
     SetupCapabilities(program.info, profile, runtime_info, ctx);

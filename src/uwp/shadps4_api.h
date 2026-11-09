@@ -75,13 +75,33 @@ typedef struct ShadPS4TemporalJitterSample {
 
 SHADPS4_API int32_t __cdecl shadps4_configure_native_temporal_jitter(
     const ShadPS4TemporalJitterConfig* config);
-SHADPS4_API int32_t __cdecl shadps4_get_native_temporal_jitter(
-    ShadPS4TemporalJitterSample* sample, int32_t completed_frame);
+SHADPS4_API int32_t __cdecl shadps4_get_native_temporal_jitter(ShadPS4TemporalJitterSample* sample,
+                                                               int32_t completed_frame);
+
+enum ShadPS4ShaderCompilationStage {
+    SHADPS4_SHADERS_IDLE,
+    SHADPS4_SHADERS_PREPARING,
+    SHADPS4_SHADERS_LOADING_CACHE,
+    SHADPS4_SHADERS_COMPILING,
+    SHADPS4_SHADERS_READY,
+    SHADPS4_SHADERS_FAILED,
+};
+
+typedef struct ShadPS4ShaderCompilationStatus {
+    uint32_t size;
+    uint32_t stage;
+    uint32_t processed;
+    uint32_t total;
+    uint32_t compiled;
+} ShadPS4ShaderCompilationStatus;
+
+SHADPS4_API int32_t __cdecl shadps4_get_shader_compilation_status(
+    ShadPS4ShaderCompilationStatus* status);
 
 SHADPS4_API uint64_t __cdecl shadps4_get_game_frame_count(void);
 SHADPS4_API int32_t __cdecl shadps4_request_presentation_capture(void);
 SHADPS4_API int32_t __cdecl shadps4_cheats_request(const char* request, char* response,
-                                                uint32_t capacity);
+                                                   uint32_t capacity);
 SHADPS4_API uint32_t __cdecl shadps4_get_api_version(void);
 SHADPS4_API void __cdecl shadps4_set_log_callback(ShadPS4LogCallback callback, void* context);
 SHADPS4_API void __cdecl shadps4_set_error_callback(ShadPS4ErrorCallback callback, void* context);
@@ -109,10 +129,10 @@ typedef struct ShadPS4TextInput {
 } ShadPS4TextInput;
 SHADPS4_API int32_t __cdecl shadps4_get_text_input(ShadPS4TextInput* request);
 SHADPS4_API int32_t __cdecl shadps4_complete_text_input(uint64_t id, int32_t confirmed,
-                                                       const wchar_t* text);
+                                                        const wchar_t* text);
 SHADPS4_API void __cdecl shadps4_resize(uint32_t width, uint32_t height);
-SHADPS4_API void __cdecl shadps4_resize_surface(uint32_t width, uint32_t height,
-                                               float scale_x, float scale_y);
+SHADPS4_API void __cdecl shadps4_resize_surface(uint32_t width, uint32_t height, float scale_x,
+                                                float scale_y);
 SHADPS4_API void __cdecl shadps4_set_hdr_output(int32_t enabled, float sdr_white_nits);
 SHADPS4_API int32_t __cdecl shadps4_render_host_frame(void);
 SHADPS4_API uint32_t __cdecl shadps4_get_state(void);

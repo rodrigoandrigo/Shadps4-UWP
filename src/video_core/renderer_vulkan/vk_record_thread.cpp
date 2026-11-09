@@ -11,9 +11,9 @@
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 #ifdef SHADPS4_UWP
 #include <vk_mem_alloc.h>
-#include "video_core/renderer_vulkan/vk_resource_memory.h"
 #include <winrt/Windows.System.h>
 #include "uwp/session.h"
+#include "video_core/renderer_vulkan/vk_resource_memory.h"
 #endif
 
 namespace Vulkan {
@@ -46,7 +46,13 @@ RecordThread::RecordThread(const Instance& instance_, Semaphore& work_semaphore_
     });
 }
 
-RecordThread::~RecordThread() = default;
+RecordThread::~RecordThread() {
+    thread.request_stop();
+    work_cv.notify_all();
+    if (thread.joinable()) {
+        thread.join();
+    }
+}
 
 std::unique_ptr<CommandChunk> RecordThread::AcquireChunk() {
     std::scoped_lock lk{mutex};
@@ -204,12 +210,12 @@ void RecordThread::Diagnose(const char* next_operation, bool failed) noexcept {
             for (u32 i = 0; i < properties.memoryHeapCount; ++i) {
                 const auto& heap = budgets[i];
                 LOG_WARNING(Render_Vulkan,
-                          "[VkRecordMemory] heap={} flags={:#x} size={} usage={} budget={} "
-                          "vma_block_bytes={} vma_allocation_bytes={} blocks={} allocations={}",
-                          i, u32(properties.memoryHeaps[i].flags), properties.memoryHeaps[i].size,
-                          heap.usage, heap.budget, heap.statistics.blockBytes,
-                          heap.statistics.allocationBytes, heap.statistics.blockCount,
-                          heap.statistics.allocationCount);
+                            "[VkRecordMemory] heap={} flags={:#x} size={} usage={} budget={} "
+                            "vma_block_bytes={} vma_allocation_bytes={} blocks={} allocations={}",
+                            i, u32(properties.memoryHeaps[i].flags), properties.memoryHeaps[i].size,
+                            heap.usage, heap.budget, heap.statistics.blockBytes,
+                            heap.statistics.allocationBytes, heap.statistics.blockCount,
+                            heap.statistics.allocationCount);
             }
             Common::Log::Flush();
         }

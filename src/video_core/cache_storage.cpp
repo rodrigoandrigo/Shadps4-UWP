@@ -134,34 +134,34 @@ void DataBase::Close() {
 template <typename T>
 bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector<T>&& v) {
     {
-        auto request = std::packaged_task<void()>{[type, path = std::move(path_),
-                                                 v = std::move(v)]() mutable {
-            path.replace_extension(GetBlobFileExtension(type));
-            if (EmulatorSettings.IsPipelineCacheArchived()) {
-                ASSERT_MSG(!ar_is_read_only,
-                           "The archive is read-only. Did you forget to call `FinishPreload`?");
-                if (!mz_zip_writer_add_mem(&zip_ar, path.string().c_str(), v.data(),
-                                           v.size() * sizeof(T), MZ_BEST_COMPRESSION)) {
-                    LOG_ERROR(Render, "Failed to add {} to the archive", path.string().c_str());
-                }
-            } else {
-                using namespace Common::FS;
-                auto temporary = path;
-                temporary += ".tmp";
-                {
-                    const auto file = IOFile{temporary, FileAccessMode::Create};
-                    if (!file.IsOpen() || file.Write(v) != v.size() || !file.Flush()) {
-                        LOG_ERROR(Render, "Failed to write cache blob {}", path.string());
-                        return;
+        auto request =
+            std::packaged_task<void()>{[type, path = std::move(path_), v = std::move(v)]() mutable {
+                path.replace_extension(GetBlobFileExtension(type));
+                if (EmulatorSettings.IsPipelineCacheArchived()) {
+                    ASSERT_MSG(!ar_is_read_only,
+                               "The archive is read-only. Did you forget to call `FinishPreload`?");
+                    if (!mz_zip_writer_add_mem(&zip_ar, path.string().c_str(), v.data(),
+                                               v.size() * sizeof(T), MZ_BEST_COMPRESSION)) {
+                        LOG_ERROR(Render, "Failed to add {} to the archive", path.string().c_str());
                     }
+                } else {
+                    using namespace Common::FS;
+                    auto temporary = path;
+                    temporary += ".tmp";
+                    {
+                        const auto file = IOFile{temporary, FileAccessMode::Create};
+                        if (!file.IsOpen() || file.Write(v) != v.size() || !file.Flush()) {
+                            LOG_ERROR(Render, "Failed to write cache blob {}", path.string());
+                            return;
+                        }
+                    }
+                    std::error_code error;
+                    std::filesystem::rename(temporary, path, error);
+                    if (error)
+                        LOG_ERROR(Render, "Failed to replace cache blob {}: {}", path.string(),
+                                  error.message());
                 }
-                std::error_code error;
-                std::filesystem::rename(temporary, path, error);
-                if (error)
-                    LOG_ERROR(Render, "Failed to replace cache blob {}: {}", path.string(),
-                              error.message());
-            }
-        }};
+            }};
         std::scoped_lock lock{m_request};
         req_queue.emplace(std::move(request));
     }
@@ -245,6 +245,27 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u32>& da
     auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
                                                            : cache_path / name;
     return LoadVector(type, path, data);
+}
+
+u32 DataBase::CountBlobs(BlobType type) const {
+    if (!opened) {
+        return 0;
+    }
+    const auto ext = "." + GetBlobFileExtension(type);
+    u32 count{};
+    if (EmulatorSettings.IsPipelineCacheArchived()) {
+        const auto files = mz_zip_reader_get_num_files(&zip_ar);
+        for (mz_uint index = 0; index < files; ++index) {
+            std::array<char, MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE> name{};
+            mz_zip_reader_get_filename(&zip_ar, index, name.data(), name.size());
+            count += std::string_view{name.data()}.ends_with(ext);
+        }
+    } else {
+        for (const auto& entry : std::filesystem::directory_iterator{cache_path}) {
+            count += entry.is_regular_file() && entry.path().extension() == ext;
+        }
+    }
+    return count;
 }
 
 void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u8>&& data)>& func) {

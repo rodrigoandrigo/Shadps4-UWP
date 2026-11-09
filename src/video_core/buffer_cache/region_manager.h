@@ -281,6 +281,40 @@ public:
         }
     }
 
+    std::pair<VAddr, u64> OpenWriteRun(VAddr fault_addr) {
+        std::scoped_lock lock{mutex};
+        const u64 page = (fault_addr - cpu_addr) / BYTES_PER_PAGE;
+        const u64 held = readback_words.load(std::memory_order_acquire);
+        if (page >= NUM_REGION_PAGES || !cpu.GetPage(page) || gpu.GetPage(page) ||
+            (held & (u64{1} << (page / PAGES_PER_WORD)))) {
+            return {};
+        }
+        if (last_write_page != ~u64{0} && page == last_write_page + 1) {
+            write_run = std::min<u64>(write_run + 1, 64);
+        } else {
+            write_run = 1;
+        }
+        last_write_page = page;
+        if (write_run < 3) {
+            return {};
+        }
+        const u64 begin = page + 1;
+        u64 end = std::min<u64>(begin + write_run, NUM_REGION_PAGES);
+        for (u64 next = begin; next < end; ++next) {
+            if (gpu.GetPage(next) || (held & (u64{1} << (next / PAGES_PER_WORD)))) {
+                end = next;
+                break;
+            }
+        }
+        if (begin == end) {
+            return {};
+        }
+        ChangeRegionState<StateOp::Set, StateOp::None, false>(begin * BYTES_PER_PAGE,
+                                                              (end - begin) * BYTES_PER_PAGE);
+        last_write_page = end - 1;
+        return {cpu_addr + begin * BYTES_PER_PAGE, (end - begin) * BYTES_PER_PAGE};
+    }
+
     void Lock() noexcept {
         mutex.lock();
     }
@@ -432,6 +466,10 @@ private:
     template <StateOp cpu_op, StateOp gpu_op>
     constexpr void UpdateState(u64 index, u64 mask) {
         const u64 summary_bit = u64{1} << index;
+        if constexpr (cpu_op == StateOp::Clear || gpu_op == StateOp::Set) {
+            last_write_page = ~u64{0};
+            write_run = 0;
+        }
         if constexpr (cpu_op != StateOp::None) {
             cpu[index] = Apply<cpu_op>(cpu[index], mask);
             cpu.set_summary =
@@ -529,6 +567,8 @@ private:
     PageManager* tracker;
     VAddr cpu_addr{};
     u32 readbacks_mode;
+    u64 last_write_page{~u64{0}};
+    u64 write_run{};
     RegionBits cpu;
     RegionBits gpu;
     RegionLock mutex;

@@ -237,6 +237,12 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
     memory_tracker->InvalidateRegion(device_addr, size, [this, device_addr, size, assume_locks] {
         ReadMemory(device_addr, size, true, false, assume_locks);
     });
+    if (size <= 8) {
+        const auto [begin, length] = memory_tracker->OpenWriteRun(device_addr);
+        if (length != 0) {
+            Skipcache::Framework::Instance().BumpMemGen();
+        }
+    }
 }
 
 void BufferCache::UnmarkRegionAsGpuModified(VAddr device_addr, u64 size, bool is_write) {
@@ -618,13 +624,25 @@ std::optional<u64> BufferCache::StreamViaLane(VAddr device_addr, u32 size) {
         lane.NoteInlineUnresolved();
         return std::nullopt;
     }
+    SCOPE_EXIT {
+        if (hardened) {
+            Core::MemoryManager::EndBackingPush();
+        }
+    };
+    std::shared_ptr<void> leases[2];
+#ifdef SHADPS4_UWP
+    for (u32 i = 0; i < num_spans; ++i) {
+        leases[i] = Core::AddressSpace::AcquireHostAccess(spans[i].ptr, spans[i].size);
+    }
+#endif
     // 64-byte slots keep each job's cache lines on one core.
     const u64 alignment = std::max<u64>(instance.UniformMinAlignment(), 64);
     auto [dst, offset] = stream_buffer.Map(size, alignment);
     bool queued = true;
     for (u32 i = 0; i < num_spans; ++i) {
         if (queued) {
-            queued = lane.Push(spans[i].ptr, dst, static_cast<u32>(spans[i].size));
+            queued =
+                lane.Push(spans[i].ptr, dst, static_cast<u32>(spans[i].size), std::move(leases[i]));
         }
         if (!queued) {
 #ifdef SHADPS4_UWP
@@ -633,9 +651,6 @@ std::optional<u64> BufferCache::StreamViaLane(VAddr device_addr, u32 size) {
                 std::memcpy(dst, spans[i].ptr, spans[i].size);
         }
         dst += spans[i].size;
-    }
-    if (hardened) {
-        Core::MemoryManager::EndBackingPush();
     }
     stream_buffer.Commit();
     return offset;
@@ -758,8 +773,8 @@ void BufferCache::ReportDenseArenas() {
                 "capacity_without_resident_bytes={} "
                 "allocated_cumulative_bytes={} migration_copy_bytes={} current_tick={} gpu_tick={}",
                 dense_arenas.size(), capacity, resident, capacity - std::min(capacity, resident),
-                dense_allocated_bytes, dense_copy_bytes,
-                scheduler.CurrentTick(), scheduler.GetWorkSemaphore()->KnownGpuTick());
+                dense_allocated_bytes, dense_copy_bytes, scheduler.CurrentTick(),
+                scheduler.GetWorkSemaphore()->KnownGpuTick());
     for (u32 i = 0; i < largest.size() && largest[i].bytes; ++i)
         LOG_WARNING(Render_Vulkan,
                     "[DenseArena] largest rank={} begin={:#x} capacity_bytes={} "

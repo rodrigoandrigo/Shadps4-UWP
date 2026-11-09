@@ -32,6 +32,14 @@ static const u8* g_srt_codegen_start = nullptr;
 
 namespace Shader {
 
+size_t GetSrtWalkerWatermark() {
+    return g_srt_codegen.getSize();
+}
+void RewindSrtWalker(size_t watermark) {
+    ASSERT(watermark <= g_srt_codegen.getSize());
+    g_srt_codegen.setSize(watermark);
+}
+
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
     const auto func_addr = (PFN_SrtWalker)g_srt_codegen.getCurr();
     g_srt_codegen.db(ptr, size);
@@ -863,6 +871,11 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
 #else
 
 namespace Shader {
+
+size_t GetSrtWalkerWatermark() {
+    return 0;
+}
+void RewindSrtWalker(size_t) {}
 
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
     UNREACHABLE_MSG("RegisterWalkerCode unimplemented for target architecture.");

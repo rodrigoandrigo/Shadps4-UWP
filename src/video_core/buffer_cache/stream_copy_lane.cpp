@@ -57,17 +57,31 @@ void StreamCopyLane::Init(u32 num_workers, bool hardened, u32 idle_ticks) {
         return;
     }
     num_workers = std::min<u32>(num_workers, kMaxWorkers);
-    hardened_ = hardened;
+    hardened_ = true;
     idle_ticks_ = CpuHasMwaitx() ? idle_ticks : 0;
     slots_ = std::make_unique<Slot[]>(kRingSlots);
     for (size_t i = 0; i < kRingSlots; ++i) {
         slots_[i].seq.store(i, std::memory_order_relaxed);
     }
+    enqueue_pos_ = 0;
+    published_.store(0, std::memory_order_relaxed);
+    dequeue_pos_.store(0, std::memory_order_relaxed);
+    completed_seen_.store(0, std::memory_order_relaxed);
+    sleepers_.store(0, std::memory_order_relaxed);
+    for (u32 i = 0; i < kCells; ++i) {
+        cells_[i].done.store(0, std::memory_order_relaxed);
+        done_base_[i] = 0;
+    }
     stop_.store(false, std::memory_order_relaxed);
     producer_tid_.store(0, std::memory_order_relaxed);
     threads_.reserve(num_workers);
-    for (u32 i = 0; i < num_workers; ++i) {
-        threads_.emplace_back([this, i] { WorkerLoop(i); });
+    try {
+        for (u32 i = 0; i < num_workers; ++i) {
+            threads_.emplace_back([this, i] { WorkerLoop(i); });
+        }
+    } catch (...) {
+        Shutdown();
+        throw;
     }
     num_workers_.store(num_workers, std::memory_order_release);
 }
@@ -76,6 +90,7 @@ void StreamCopyLane::Shutdown() {
     if (threads_.empty()) {
         return;
     }
+    DrainRemote();
     num_workers_.store(0, std::memory_order_release);
     stop_.store(true, std::memory_order_release);
     // The value change is what releases sleepers; a bare notify may be missed.
@@ -86,11 +101,9 @@ void StreamCopyLane::Shutdown() {
     }
     threads_.clear();
     slots_.reset();
-    // Cumulative for the object's life: reset together or not at all, or the
-    // next DrainProducer waits on a carried-over target.
 }
 
-bool StreamCopyLane::Push(const u8* src, u8* dst, u32 size) {
+bool StreamCopyLane::Push(const u8* src, u8* dst, u32 size, std::shared_ptr<void> lease) {
     // Single-producer contract, enforced in safe mode: readback fault paths
     // run emulator code on guest threads, and a second producer would corrupt
     // the plain enqueue cursor. A foreign caller copies inline instead.
@@ -111,7 +124,7 @@ bool StreamCopyLane::Push(const u8* src, u8* dst, u32 size) {
         ++inline_full_; // a whole lap is still in flight
         return false;
     }
-    slot.job = Job{src, dst, size};
+    slot.job = Job{src, dst, size, std::move(lease)};
     slot.seq.store(pos + 1, std::memory_order_release);
     enqueue_pos_ = pos + 1;
     published_.store(pos + 1, std::memory_order_release);
@@ -141,15 +154,12 @@ bool StreamCopyLane::ClaimAndCopy() {
             break;
         }
     }
-    const Job job = slot->job;
+    const Job job = std::move(slot->job);
     // Recycle the slot before the copy: the producer only reuses it a full
     // lap later, and the payload bytes are ordered by the caller's completion
     // store, which every drain waiter reads with acquire.
     slot->seq.store(pos + kRingSlots, std::memory_order_release);
-#ifdef SHADPS4_UWP
-    if (!Core::AddressSpace::CopyBacking(job.dst, job.src, job.size))
-#endif
-        std::memcpy(job.dst, job.src, job.size);
+    std::memcpy(job.dst, job.src, job.size);
     // dst is the write-combined staging ring. The tail of the copy can sit in
     // this core's WC buffer past the completion store below (a plain mov that
     // flushes nothing), and an idle worker then pause-spins with no fence or
@@ -176,8 +186,6 @@ void StreamCopyLane::WorkerLoop(u32 rank) {
     u32 idle_rounds = 0;
     const u32 idle_ticks = idle_ticks_;
     Cell& cell = cells_[rank];
-    // Seeded, not zeroed: a rank reused after Shutdown+Init must continue its
-    // cell, or the first store regresses a total the drains wait on.
     u64 local_done = cell.done.load(std::memory_order_relaxed);
     u64 local_mwaits = cell.mwaits.load(std::memory_order_relaxed);
     u64 local_wakes = cell.mwait_wakes.load(std::memory_order_relaxed);

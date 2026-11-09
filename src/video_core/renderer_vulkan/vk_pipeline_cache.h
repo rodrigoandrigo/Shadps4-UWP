@@ -5,6 +5,7 @@
 
 #include <array>
 #include <chrono>
+#include <functional>
 #include <future>
 #include <memory>
 #include <string>
@@ -15,6 +16,7 @@
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
+#include "video_core/renderer_vulkan/vk_compile_queue.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_pipeline_progress.h"
@@ -191,6 +193,14 @@ public:
                            AmdGpu::Liverpool* liverpool, u32 sparse_page_shift);
     ~PipelineCache();
 
+    void PrecompileShaderFiles(const std::function<void(u32, u32, u32)>& progress);
+    bool PrecompileArchiveCompute(const Shader::Info& info, std::span<const u32> spv);
+    bool PrecompileArchiveGraphics(const Shader::Info* vs_info, const Shader::RuntimeInfo& vs_rt,
+                                   std::span<const u32> vs_spv,
+                                   const std::optional<Shader::Gcn::FetchShaderData>& fetch,
+                                   const Shader::Info* fs_info, const Shader::RuntimeInfo& fs_rt,
+                                   std::span<const u32> fs_spv, const GraphicsPipelineKey& key,
+                                   GraphicsPipeline::SerializationSupport& sdata);
     void WarmUp();
     void Sync();
 
@@ -245,6 +255,12 @@ public:
 
 private:
     struct PendingGraphicsPipeline {
+        ~PendingGraphicsPipeline() {
+            if (future.valid()) {
+                future.wait();
+            }
+        }
+
         PipelineCompileProgress progress;
         std::chrono::steady_clock::time_point start;
         u64 hash{};
@@ -308,6 +324,8 @@ private:
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};
     Shader::Pools pools;
+    CompileQueue shader_module_queue{2, "shadPS4:ShaderModule"};
+    CompileQueue graphics_compile_queue{6, "shadPS4:PipelineCompile"};
     DrawIndirectParams draw_indirect_params{};
     // draw_indirect_params packed into one word for the stamp gate and the
     // runtime-input memo.

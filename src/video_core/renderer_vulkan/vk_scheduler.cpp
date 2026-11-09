@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "video_core/renderdoc.h"
-#include <nlohmann/json.hpp>
 #include <algorithm>
+#include <nlohmann/json.hpp>
+#include "video_core/renderdoc.h"
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -38,6 +38,14 @@ Scheduler::Scheduler(const Instance& instance, bool threaded_recording)
 }
 
 Scheduler::~Scheduler() {
+    if (record_thread) {
+        try {
+            record_thread->WaitIdle();
+        } catch (const std::exception& error) {
+            LOG_ERROR(Render_Vulkan, "Unable to drain recording thread: {}", error.what());
+        }
+        record_thread.reset();
+    }
     priority_pending_ops_thread.request_stop();
     priority_pending_ops_cv.notify_all();
     if (priority_pending_ops_thread.joinable()) {
@@ -452,8 +460,7 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
 void Scheduler::DrainPriorityOperations() {
     std::unique_lock lock{priority_pending_ops_mutex};
     priority_pending_ops_cv.wait(lock, [this] {
-        return priority_failure ||
-               (priority_pending_ops.empty() && !priority_operation_running);
+        return priority_failure || (priority_pending_ops.empty() && !priority_operation_running);
     });
     if (priority_failure) {
         std::rethrow_exception(priority_failure);

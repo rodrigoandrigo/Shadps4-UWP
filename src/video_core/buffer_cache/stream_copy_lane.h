@@ -52,7 +52,7 @@ public:
     static constexpr u32 kMinLaneBytes = 192;
 
     /// GPU command thread only. False = ring full; the caller copies inline.
-    bool Push(const u8* src, u8* dst, u32 size);
+    bool Push(const u8* src, u8* dst, u32 size, std::shared_ptr<void> lease = {});
 
     /// GPU command thread: wait until every pushed job has landed.
     void DrainProducer();
@@ -84,6 +84,7 @@ private:
         const u8* src;
         u8* dst;
         u32 size;
+        std::shared_ptr<void> lease;
     };
     struct alignas(64) Slot {
         std::atomic<u64> seq;

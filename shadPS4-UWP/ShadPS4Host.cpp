@@ -208,13 +208,13 @@ void ShadPS4Host::Reload(const std::wstring &user_directory, uint32_t width,
     UwpDiagnostics::CoreStage("core_free_library_begin", this, reinterpret_cast<uintptr_t>(module));
     if (!FreeLibrary(module))
       throw ref new Platform::FailureException(
-          L"Não foi possível descarregar o núcleo.");
+          L"Could not unload the core.");
     module = nullptr;
     UwpDiagnostics::CoreStage("core_free_library_end", this);
     if (GetModuleHandleExW(0, L"shadPS4.dll", &module))
       throw ref new Platform::FailureException(
-          L"O núcleo ainda possui tarefas ativas; não é seguro iniciar outra "
-          L"sessão.");
+          L"The core still has active tasks; it is not safe to start another "
+          L"session.");
   }
   initialize = nullptr;
   state = nullptr;
@@ -275,8 +275,8 @@ std::wstring ShadPS4Host::MountFolder(Platform::Agile<Windows::Storage::StorageF
     if (result) {
         throw ref new Platform::FailureException(ref new Platform::String(message.c_str()));
     }
-    return L"Pasta vinculada por acesso brokered. eboot.bin: " + std::to_wstring(length) +
-           L" bytes. Pronto para iniciar o jogo.";
+    return L"Folder linked through brokered access. eboot.bin: " + std::to_wstring(length) +
+           L" bytes. Ready to start the game.";
 }
 
 void ShadPS4Host::Run(std::wstring executable,
@@ -290,9 +290,9 @@ void ShadPS4Host::Run(std::wstring executable,
     UwpDiagnostics::Record("game_run_return result", static_cast<uint32_t>(result));
     UwpDiagnostics::Memory("game_run_end bytes/limit");
     const auto message = FAILED(initialized)
-                             ? L"Não foi possível iniciar o worker MTA."
+                             ? L"Could not start the MTA worker."
                          : result ? Error()
-                                  : L"Sessão encerrada.";
+                                  : L"Session ended.";
     if (SUCCEEDED(initialized)) {
       RoUninitialize();
     }

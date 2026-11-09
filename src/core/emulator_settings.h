@@ -514,13 +514,7 @@ struct GPUSettings {
     // pop (a lock plus a fence-query ioctl) once per this many draw-rate
     // polls instead of every draw. 0 polls every call.
     Setting<u32> pending_pop_throttle{64};
-    // Stream copy lane mode. 0 disables it (copies stay inline on the GPU
-    // command thread). 1 runs the unsafe fast path: no foreign-producer
-    // refusal and no unmap push windows - only for titles that never unmap
-    // mid-play. 2 runs the hardened path, safe everywhere. Both modes drain
-    // through worker threads, two unless stream_copy_lane_threads says
-    // otherwise, fenced before every submit.
-    Setting<u32> stream_copy_workers{1};
+    Setting<u32> stream_copy_workers{2};
     // Resolves shader permutations through an address-masked specialization
     // fingerprint: a hit skips the StageSpecialization rebuild and the deep
     // permutation compares entirely.

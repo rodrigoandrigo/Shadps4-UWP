@@ -859,6 +859,7 @@ set(COMMON src/common/logging/classes.cpp
            src/common/arch.h
            src/common/assert.cpp
            src/common/assert.h
+           src/common/scoped_assert.h
            src/common/bit_field.h
            src/common/bounded_threadsafe_queue.h
            src/common/concepts.h
@@ -1255,8 +1256,10 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_graphics_pipeline.h
                src/video_core/renderer_vulkan/vk_instance.cpp
                src/video_core/renderer_vulkan/vk_instance.h
+               src/video_core/renderer_vulkan/vk_shader_precompile.cpp
                src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
                src/video_core/renderer_vulkan/vk_pipeline_cache.h
+               src/video_core/renderer_vulkan/vk_compile_queue.h
                src/video_core/renderer_vulkan/vk_pipeline_common.cpp
                src/video_core/renderer_vulkan/vk_pipeline_common.h
                src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp

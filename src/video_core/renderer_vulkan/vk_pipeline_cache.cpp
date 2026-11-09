@@ -29,8 +29,8 @@
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
-#include "video_core/texture_cache/photo_readback.h"
 #include "video_core/skipcache/skipcache.h"
+#include "video_core/texture_cache/photo_readback.h"
 
 namespace Vulkan {
 
@@ -1172,23 +1172,24 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     if (auto pending_it = pending_graphics_pipelines.find(graphics_key);
         pending_it != pending_graphics_pipelines.end()) {
         auto& pending = *pending_it->second;
-        if (!pending.photo_waited && DrawsPhoto()) {
-            pending.photo_waited = true;
-            if (pre_compile_hook_)
+        if (pending.future.wait_for(std::chrono::milliseconds{0}) != std::future_status::ready) {
+            if (pre_compile_hook_) {
                 pre_compile_hook_(pre_compile_user_);
-            WaitForGraphicsPipeline(pending, true);
-            ReapPendingPipelines();
+            }
+            if (!WaitForGraphicsPipeline(pending, DrawsPhoto())) {
+                graphics_unavailable_reason = "compilation_pending";
+                ++async_skipped_draws;
+                return nullptr;
+            }
         }
-        if (!graphics_pipelines.contains(graphics_key)) {
-            graphics_unavailable_reason = "compilation_pending";
-            ++async_skipped_draws;
-            return nullptr;
-        }
+        ReapPendingPipelines();
     }
-    if (!graphics_pipelines.contains(graphics_key) && pending_graphics_pipelines.size() >= 4) {
-        graphics_unavailable_reason = "compile_queue_full";
-        ++async_skipped_draws;
-        return nullptr;
+    if (pending_graphics_pipelines.size() >= 12) {
+        if (pre_compile_hook_) {
+            pre_compile_hook_(pre_compile_user_);
+        }
+        pending_graphics_pipelines.begin()->second->future.wait();
+        ReapPendingPipelines();
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {
@@ -1367,7 +1368,7 @@ std::unique_ptr<PipelineCache::PendingGraphicsPipeline> PipelineCache::StartGrap
         throw std::runtime_error("Unable to create asynchronous compiler cache");
     pending->driver_cache = std::move(cache);
     PendingGraphicsPipeline* job = pending.get();
-    pending->future = std::async(std::launch::async, [this, job, key = graphics_key] {
+    pending->future = graphics_compile_queue.Submit([this, job, key = graphics_key] {
         PipelineCompileProgress::Scope compile_scope{job->progress};
         try {
 #ifdef SHADPS4_UWP
@@ -1431,15 +1432,6 @@ void PipelineCache::ReapPendingPipelines(bool drain) {
         if (drain)
             pending.future.wait();
         if (pending.future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
-            if (!pending.abandoned &&
-                std::chrono::steady_clock::now() - pending.start >= std::chrono::seconds(30)) {
-                pending.abandoned = true;
-                abandoned_graphics_pipelines.insert_or_assign(it->first, "compile_timeout_30s");
-                LOG_ERROR(Render_Vulkan,
-                          "Abandoning graphics pipeline {:#x} after 30 seconds; compilation "
-                          "resources remain alive",
-                          pending.hash);
-            }
             ++it;
             continue;
         }
@@ -1467,11 +1459,27 @@ void PipelineCache::ReapPendingPipelines(bool drain) {
 }
 
 bool PipelineCache::WaitForGraphicsPipeline(PendingGraphicsPipeline& pending, bool photo) {
-    const int budget_ms = std::clamp(EmulatorSettings.GetPipelineSyncBudgetMs(), 0, 50000);
-    if (photo) {
-        return pending.future.wait_for(std::chrono::milliseconds{std::max(budget_ms, 700)}) ==
-               std::future_status::ready;
+    const bool side_effects = std::ranges::any_of(pending.live_infos, [](const Shader::Info* info) {
+        if (!info) {
+            return false;
+        }
+        return info->uses_dma ||
+               std::ranges::any_of(
+                   info->buffers,
+                   [](const auto& resource) {
+                       return resource.is_written ||
+                              resource.buffer_type == Shader::BufferType::GdsBuffer ||
+                              resource.buffer_type == Shader::BufferType::Strmout ||
+                              resource.buffer_type == Shader::BufferType::StrmoutCounter;
+                   }) ||
+               std::ranges::any_of(info->images,
+                                   [](const auto& resource) { return resource.is_written; });
+    });
+    if (photo || side_effects) {
+        pending.future.wait();
+        return true;
     }
+    const int budget_ms = std::clamp(EmulatorSettings.GetPipelineSyncBudgetMs(), 0, 50000);
     const u32 frame = DebugState.GetFrameNum();
     if (sync_budget_frame != frame) {
         sync_budget_frame = frame;
@@ -1714,7 +1722,8 @@ void PipelineCache::DumpProgramIdentityStats() {
 }
 
 void PipelineCache::DumpKeyReuseStats() {
-    LOG_INFO(Render_Skipcache, "[AsyncPipeline] completed={} skipped_draws={} pending={} abandoned={}",
+    LOG_INFO(Render_Skipcache,
+             "[AsyncPipeline] completed={} skipped_draws={} pending={} abandoned={}",
              async_completed_pipelines, async_skipped_draws, pending_graphics_pipelines.size(),
              abandoned_graphics_pipelines.size());
     if (!key_stamp_reuse) {
@@ -2180,7 +2189,23 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
     info.ResolveDirectReads();
-    auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
+    std::vector<Shader::Backend::SPIRV::VertexInputSnapshot> vertex_inputs;
+    if (info.sw_stage == SwStage::Vertex && !info.has_inline_fetch_shader) {
+        Shader::Gcn::FetchShaderData fetch;
+        if (Shader::Gcn::ParseFetchShader(info, fetch)) {
+            for (const auto& attrib : fetch.attributes) {
+                vertex_inputs.push_back(
+                    {attrib.GetSharp(info),
+                     attrib.GetStepRate() != Shader::Gcn::VertexAttribute::None});
+            }
+        }
+    }
+    auto spv = shader_module_queue
+                   .Submit([&] {
+                       return Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program,
+                                                                binding, &vertex_inputs);
+                   })
+                   .get();
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
 
     vk::ShaderModule module;
@@ -2189,12 +2214,14 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     const bool is_patched = patch && EmulatorSettings.IsPatchShaders();
     if (is_patched) {
         LOG_INFO(Loader, "Loaded patch for {} shader {:#x}", info.hw_stage, info.pgm_hash);
-        module = CompileSPV(*patch, instance.GetDevice());
+        module = shader_module_queue
+                     .Submit([this, &patch] { return CompileSPV(*patch, instance.GetDevice()); })
+                     .get();
     } else {
-        module = CompileSPV(spv, instance.GetDevice());
+        module = shader_module_queue
+                     .Submit([this, &spv] { return CompileSPV(spv, instance.GetDevice()); })
+                     .get();
     }
-
-    RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
 
     const auto name = GetShaderName(info.hw_stage, info.pgm_hash, perm_idx);
     Vulkan::SetObjectName(instance.GetDevice(), module, name);
@@ -2202,6 +2229,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
         DebugState.CollectShader(name, info.sw_stage, module, spv, code,
                                  patch ? *patch : std::span<const u32>{}, is_patched);
     }
+    RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
     return module;
 }
 
@@ -2716,8 +2744,7 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
                 }
             } else if (std::holds_alternative<ComputePipelineKey>(key)) {
                 auto& compute_key = std::get<ComputePipelineKey>(key);
-                if (auto it = compute_pipelines.find(compute_key);
-                    it != compute_pipelines.end()) {
+                if (auto it = compute_pipelines.find(compute_key); it != compute_pipelines.end()) {
                     scheduler.DeferOperation([pipeline = std::move(it.value())] {});
                     compute_pipelines.erase(it);
                 }

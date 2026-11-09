@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "FrontendRenderer.h"
 #include "ShadPS4Host.h"
@@ -45,7 +45,7 @@ struct FrontendGame {
     std::string metadata_path;
     std::string region;
     std::string firmware;
-    std::string format{"Pasta"};
+    std::string format{"Folder"};
     std::string executable;
     std::string launch_error;
     std::string source_path;
@@ -118,6 +118,7 @@ class ImGuiFrontend : public std::enable_shared_from_this<ImGuiFrontend> {
     void RequestImage(const std::string& key, const std::string& path);
     void Draw();
     void DrawLibrary();
+    void DrawShaderCompilation();
     void DrawSettings();
     void DrawSetting(Setting& setting);
     void DrawLogs();
@@ -171,6 +172,11 @@ class ImGuiFrontend : public std::enable_shared_from_this<ImGuiFrontend> {
     float log_height{140.0f};
     std::string launcher_layout;
     std::string active_game_path;
+    bool shader_startup_visible{};
+    uint64_t shader_startup_frame{};
+    std::string shader_startup_image, shader_startup_fallback, shader_startup_title;
+    ShadPS4ShaderCompilationStatus shader_startup_status{sizeof(ShadPS4ShaderCompilationStatus)};
+    decltype(&shadps4_get_shader_compilation_status) get_shader_compilation_status{};
     bool restart_requested{};
     std::string requested_settings_group;
     std::map<std::pair<std::string, std::string>, nlohmann::json> settings_changes;
@@ -191,7 +197,7 @@ class ImGuiFrontend : public std::enable_shared_from_this<ImGuiFrontend> {
     std::string settings_profile;
     std::atomic<uint64_t> settings_request{};
     char search[256]{};
-    std::string status{"Inicializando…"};
+    std::string status{"Initializing…"};
     int next_graphics_backend{-1};
     std::wstring user_root;
     std::vector<FrontendRoot> roots;

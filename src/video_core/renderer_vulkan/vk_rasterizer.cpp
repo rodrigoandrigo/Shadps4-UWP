@@ -186,16 +186,13 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     // EstimateRDTSCFrequency sleeps ~101ms to measure: boot path only, never
     // the per-300-frame telemetry block.
     tsc_hz_ = Common::EstimateRDTSCFrequency();
-    // The lane moves the small read-only stream copies of BufferCache::ObtainBuffer. Mode, not a
-    // worker count: 0 off, 1 the unsafe fast path (titles that never unmap mid-play), >=2
-    // hardened; two workers unless stream_copy_lane_threads says otherwise.
     const u32 lane_mode = EmulatorSettings.GetStreamCopyWorkers();
     if (lane_mode != 0) {
         const u32 lane_threads = EmulatorSettings.GetStreamCopyLaneThreads();
         const u32 workers = lane_threads == 0 ? 2u : std::min(lane_threads, 4u);
         const u64 idle_ticks = EmulatorSettings.GetStreamCopyIdleUs() * tsc_hz_ / 1000000u;
         VideoCore::StreamCopyLane::Instance().Init(
-            workers, lane_mode >= 2,
+            workers, true,
             static_cast<u32>(std::min<u64>(idle_ticks, std::numeric_limits<u32>::max())));
         Core::MemoryManager::RegisterUnmapDrain(
             [] { VideoCore::StreamCopyLane::Instance().DrainRemote(); });

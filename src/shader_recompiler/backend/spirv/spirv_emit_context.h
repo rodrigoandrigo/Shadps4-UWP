@@ -8,6 +8,7 @@
 #include <sirit/sirit.h>
 
 #include "shader_recompiler/backend/bindings.h"
+#include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/value.h"
 #include "shader_recompiler/profile.h"
@@ -39,7 +40,8 @@ struct VectorIds {
 class EmitContext final : public Sirit::Module {
 public:
     explicit EmitContext(const Profile& profile, const RuntimeInfo& runtime_info, Info& info,
-                         Bindings& binding);
+                         Bindings& binding,
+                         const std::vector<VertexInputSnapshot>* vertex_inputs = nullptr);
     ~EmitContext();
 
     Id Def(const IR::Value& value);
@@ -352,6 +354,7 @@ public:
     };
 
     Bindings& binding;
+    const std::vector<VertexInputSnapshot>* vertex_inputs;
     boost::container::small_vector<Id, 16> buf_type_ids;
     boost::container::small_vector<BufferDefinition, 16> buffers;
     boost::container::small_vector<u32, 4> strmout_buffers;
