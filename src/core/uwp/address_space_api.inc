@@ -101,7 +101,7 @@ u64 AddressSpace::MemoryHeadroom() {
     auto previous = checked.load(std::memory_order_relaxed);
     if (now - previous >= 100 && checked.compare_exchange_strong(previous, now)) {
         try {
-            const auto limit = winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
+            const auto limit = Impl::AppMemoryLimit();
             const auto used = winrt::Windows::System::MemoryManager::AppMemoryUsage();
             available.store(limit ? limit - std::min(used, limit) : UINT64_MAX,
                             std::memory_order_release);

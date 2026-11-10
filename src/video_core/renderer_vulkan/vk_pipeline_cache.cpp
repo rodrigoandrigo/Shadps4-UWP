@@ -2178,11 +2178,6 @@ bool PipelineCache::RefreshComputeKey() {
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
                                               Shader::Backend::Bindings& binding) {
-#ifdef SHADPS4_UWP
-    if (Core::AddressSpace::MemoryHeadroom() < 640_MB)
-        Core::AddressSpace::ReclaimMemory(32_MB, false);
-#endif
-
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");

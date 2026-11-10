@@ -654,12 +654,15 @@ u64 Rasterizer::RecoverAllocationMemory(bool caches, bool aggressive) {
 #ifdef SHADPS4_UWP
     if (!liverpool->OnGpuThread())
         return 0;
+    const auto now = GetTickCount64();
+    if (!aggressive && now - allocation_maintenance_time < 16)
+        return 0;
+    allocation_maintenance_time = now;
     const u64 before = ResourceMemory::AllocatedBytes();
     scheduler.GetWorkSemaphore()->Refresh();
     scheduler.DrainPendingOperations();
     if (AllocationRecoveryScope::CanTrimStaging())
         runtime.GetStagingPool().ReleaseCompleted(aggressive);
-    const auto now = GetTickCount64();
     u64 retired_images{};
     u64 clean_buffers{};
     if (caches && Core::AddressSpace::MemoryHeadroom() < 640_MB &&

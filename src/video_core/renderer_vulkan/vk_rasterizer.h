@@ -301,6 +301,7 @@ private:
     }
     u64 RecoverAllocationMemory(bool caches, bool aggressive);
     u64 memory_recovery_time{};
+    u64 allocation_maintenance_time{};
     u64 bindpf_img_{};
     u64 bindpf_backing_{};
     // bind_write_plan: the mode, this bind's verdicts, and the write list the

@@ -494,10 +494,6 @@ GraphicsPipeline::GraphicsPipeline(
     };
 
     PipelineCompileProgress::Mark(PipelineCompileProgress::Phase::VulkanCreatePipeline);
-#ifdef SHADPS4_UWP
-    if (Core::AddressSpace::MemoryHeadroom() < 512_MB)
-        AllocationRecoveryScope::RecoverOrPage(128_MB);
-#endif
     auto [pipeline_result, pipe] =
         device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
 #ifdef SHADPS4_UWP

@@ -82,6 +82,7 @@ std::string Label(std::string text) {
         {"gpu_id", "Graphics device"},
         {"pipeline_cache_enabled", "Enable pipeline cache"},
         {"pipeline_cache_archived", "Compress pipeline cache"},
+        {"pipeline_cache_precompile_archives", "Precompile shaders from game files (Dozen)"},
         {"use_keyboard_as_keyboard", "Use keyboard as PS4 keyboard"},
         {"use_mice_as_mice", "Use mouse as PS4 mouse"},
         {"is_circle_enter", "Use Circle to confirm"},

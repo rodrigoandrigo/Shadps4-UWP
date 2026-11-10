@@ -364,7 +364,8 @@ void PipelineCache::WarmUp() {
     };
 #endif
     const auto finish = [&] {
-        if (EmulatorSettings.IsPipelineCacheEnabled()) {
+        if (EmulatorSettings.IsPipelineCacheEnabled() &&
+            EmulatorSettings.IsPipelineCachePrecompileArchives()) {
             const u32 previous_done = processed, previous_total = total, previous_ready = ready;
             PrecompileShaderFiles([&](u32 done, u32 count, u32 compiled) {
                 processed = previous_done + done;

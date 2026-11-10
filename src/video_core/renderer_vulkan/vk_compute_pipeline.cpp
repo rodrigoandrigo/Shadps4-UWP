@@ -92,10 +92,6 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         .stage = shader_ci,
         .layout = pipeline_layout,
     };
-#ifdef SHADPS4_UWP
-    if (Core::AddressSpace::MemoryHeadroom() < 512_MB)
-        AllocationRecoveryScope::RecoverOrPage(128_MB);
-#endif
     auto [pipeline_result, pipe] =
         instance.GetDevice().createComputePipelineUnique(pipeline_cache, compute_pipeline_ci);
 #ifdef SHADPS4_UWP

@@ -1434,7 +1434,7 @@ void ExtractPayload(std::span<const u8> payload, const std::string& name,
         if (!program)
             continue;
         ExtractedShader shader;
-        const bool extracted = program->type == 3   ? TryExtractCs(payload, *program, shader)
+        const bool extracted = program->type == 4   ? TryExtractCs(payload, *program, shader)
                                : program->type == 0 ? TryExtractPs(payload, *program, shader)
                                : program->type == 1 ? TryExtractVs(payload, *program, shader)
                                                     : false;

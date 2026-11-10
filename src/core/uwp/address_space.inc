@@ -421,6 +421,21 @@ struct AddressSpace::Impl {
         return result;
     }
 
+    static u64 AppMemoryLimit() {
+        static const u64 validation_limit = [] {
+            char value[16]{};
+            const auto size = GetEnvironmentVariableA("SHADPS4_UWP_VALIDATION_MEMORY_MIB",
+                                                      value, sizeof(value));
+            if (!size || size >= sizeof(value))
+                return u64{};
+            char* end{};
+            const auto mib = std::strtoull(value, &end, 10);
+            return !*end && mib >= 1024 && mib <= 65536 ? u64{mib} * 1_MB : u64{};
+        }();
+        const auto limit = winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
+        return validation_limit && (!limit || validation_limit < limit) ? validation_limit : limit;
+    }
+
     void StartPager() {
         std::scoped_lock lock{pager_mutex};
         if (pager.joinable() || !EmulatorSettings.IsMemorySwapEnabled())
@@ -435,7 +450,7 @@ struct AddressSpace::Impl {
             while (!stop.stop_requested()) {
                 u64 reclaimed{};
                 try {
-                    const auto limit = winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
+                    const auto limit = AppMemoryLimit();
                     const auto used = winrt::Windows::System::MemoryManager::AppMemoryUsage();
                     if (limit > 1024_MB) {
                         if (used > limit - 640_MB)
