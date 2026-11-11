@@ -10,7 +10,11 @@
       <Border x:Name="fpsOverlay" HorizontalAlignment="Left" VerticalAlignment="Top"
             Margin="12" Padding="8,4" Background="#A0000000" CornerRadius="3"
             IsHitTestVisible="False" Visibility="Collapsed">
-        <TextBlock x:Name="fpsText" Foreground="White" FontSize="18" FontWeight="SemiBold"/>
+        <StackPanel>
+          <TextBlock x:Name="fpsText" Foreground="White" FontSize="18" FontWeight="SemiBold"/>
+          <TextBlock x:Name="ramText" Foreground="White" FontSize="16"/>
+          <TextBlock x:Name="swapText" Foreground="White" FontSize="16"/>
+        </StackPanel>
     </Border>
 </Grid>
 </Page>

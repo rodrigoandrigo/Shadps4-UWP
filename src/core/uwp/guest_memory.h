@@ -23,6 +23,7 @@ int uwp_memory_copy(void* destination, const void* source, uint64_t size);
 int uwp_memory_discard(uint64_t physical, uint64_t size);
 uint64_t uwp_memory_reclaim(uint64_t bytes, int urgent);
 void uwp_memory_report(void);
+int uwp_memory_swap_usage(uint64_t* used, uint64_t* total);
 #ifdef __cplusplus
 }
 #endif

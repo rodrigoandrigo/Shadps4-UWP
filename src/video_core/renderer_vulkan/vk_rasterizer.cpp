@@ -664,11 +664,10 @@ u64 Rasterizer::RecoverAllocationMemory(bool caches, bool aggressive) {
     if (AllocationRecoveryScope::CanTrimStaging())
         runtime.GetStagingPool().ReleaseCompleted(aggressive);
     u64 retired_images{};
-    u64 clean_buffers{};
     if (caches && Core::AddressSpace::MemoryHeadroom() < 640_MB &&
         now - memory_recovery_time >= 250) {
         memory_recovery_time = now;
-        clean_buffers = buffer_cache.ReleaseCleanArenas(64_MB);
+        buffer_cache.ReleaseCleanArenas(64_MB);
         retired_images = texture_cache.ReleaseCleanImages(64_MB);
         if (retired_images && Core::AddressSpace::MemoryHeadroom() < 256_MB)
             scheduler.Flush();
@@ -676,10 +675,6 @@ u64 Rasterizer::RecoverAllocationMemory(bool caches, bool aggressive) {
     }
     const u64 after = ResourceMemory::AllocatedBytes();
     const u64 released = before - std::min(before, after);
-    if (released || retired_images)
-        LOG_INFO(Render_Vulkan,
-                 "[AllocationRecovery] released={} clean_buffers={} retired_images={} tick={}",
-                 released, clean_buffers, retired_images, scheduler.CurrentTick());
     return released;
 #else
     return 0;

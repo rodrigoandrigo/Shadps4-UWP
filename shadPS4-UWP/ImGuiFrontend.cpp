@@ -414,6 +414,7 @@ void ImGuiFrontend::ResolveApi() {
 #define RESOLVE(member, name) member = core->GetApi<decltype(member)>(name)
     RESOLVE(get_settings, "shadps4_get_settings");
     RESOLVE(get_game_frame_count, "shadps4_get_game_frame_count");
+    RESOLVE(get_memory_usage, "shadps4_get_memory_usage");
     RESOLVE(get_shader_compilation_status, "shadps4_get_shader_compilation_status");
     RESOLVE(request_presentation_capture, "shadps4_request_presentation_capture");
     RESOLVE(cheats_request, "shadps4_cheats_request");
@@ -664,9 +665,13 @@ void ImGuiFrontend::Run(std::wstring root) {
             if (now - fps_time >= std::chrono::milliseconds(500)) {
                 const auto count = get_game_frame_count();
                 const auto seconds = std::chrono::duration<float>(now - fps_time).count();
+                const bool visible = game_running && show_fps && !shader_startup_visible;
+                static ShadPS4MemoryUsage memory{sizeof(ShadPS4MemoryUsage)};
+                if (visible)
+                    get_memory_usage(&memory);
                 if (set_game_fps)
-                    set_game_fps(game_running && show_fps && !shader_startup_visible,
-                                 (count >= fps_count ? count - fps_count : 0) / seconds);
+                    set_game_fps(visible,
+                                 (count >= fps_count ? count - fps_count : 0) / seconds, memory);
                 fps_count = count;
                 fps_time = now;
             }
@@ -718,7 +723,7 @@ void ImGuiFrontend::Run(std::wstring root) {
         }
     }
     if (set_game_fps)
-        set_game_fps(false, 0);
+        set_game_fps(false, 0, {});
     stopping.store(true);
     work_ready.notify_all();
     if (worker.joinable())

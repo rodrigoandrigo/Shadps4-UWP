@@ -98,6 +98,15 @@ typedef struct ShadPS4ShaderCompilationStatus {
 SHADPS4_API int32_t __cdecl shadps4_get_shader_compilation_status(
     ShadPS4ShaderCompilationStatus* status);
 
+typedef struct ShadPS4MemoryUsage {
+    uint32_t size;
+    uint64_t ram_used;
+    uint64_t ram_total;
+    uint64_t swap_used;
+    uint64_t swap_total;
+} ShadPS4MemoryUsage;
+
+SHADPS4_API int32_t __cdecl shadps4_get_memory_usage(ShadPS4MemoryUsage* usage);
 SHADPS4_API uint64_t __cdecl shadps4_get_game_frame_count(void);
 SHADPS4_API int32_t __cdecl shadps4_request_presentation_capture(void);
 SHADPS4_API int32_t __cdecl shadps4_cheats_request(const char* request, char* response,

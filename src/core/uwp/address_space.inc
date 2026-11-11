@@ -446,7 +446,6 @@ struct AddressSpace::Impl {
             u64 retry_at{};
             u64 unreclaimed_usage{};
             u64 retry_delay{40};
-            auto reported = GetTickCount64();
             while (!stop.stop_requested()) {
                 u64 reclaimed{};
                 try {
@@ -475,16 +474,6 @@ struct AddressSpace::Impl {
                         }
                     }
                 } catch (const winrt::hresult_error&) {
-                }
-                if (GetTickCount64() - reported >= 5000) {
-                    uwp_memory_report();
-                    if (auto driver = GetModuleHandleW(L"vulkan_dzn.dll")) {
-                        using ReportCompiles = void (*)();
-                        if (auto report = reinterpret_cast<ReportCompiles>(
-                                GetProcAddress(driver, "mesa_uwp_report_compiles")))
-                            report();
-                    }
-                    reported = GetTickCount64();
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(reclaimed ? 1 : 40));
             }

@@ -358,6 +358,16 @@ uint64_t uwp_memory_reclaim(uint64_t bytes, int urgent) {
     return result;
 }
 
+int uwp_memory_swap_usage(uint64_t* used, uint64_t* total) {
+    InitOnceExecuteOnce(&gate_once, initialize_gate, NULL, NULL);
+    if (!TryEnterCriticalSection(&gate))
+        return 0;
+    *used = uwp_physical && !uwp_swap_disabled ? uwp_swap_store_next : 0;
+    *total = uwp_physical && !uwp_swap_disabled ? uwp_swap_disk_budget : 0;
+    LeaveCriticalSection(&gate);
+    return 1;
+}
+
 void uwp_memory_report(void) {
     MEMORY_BEGIN();
     uwp_memory_report_internal();

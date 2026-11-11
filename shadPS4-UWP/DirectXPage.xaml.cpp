@@ -46,14 +46,21 @@ void DirectXPage::OnLoaded(Object ^, RoutedEventArgs ^) {
     frontend = std::make_shared<ImGuiFrontend>(swapChainPanel, gameSwapChainPanel);
     WeakReference weak(this);
     const auto dispatch = Dispatcher;
-    frontend->set_game_fps = [weak, dispatch](bool visible, float fps) {
-        dispatch->RunAsync(CoreDispatcherPriority::Low, ref new DispatchedHandler([weak, visible, fps] {
+    frontend->set_game_fps = [weak, dispatch](bool visible, float fps, ShadPS4MemoryUsage memory) {
+        dispatch->RunAsync(CoreDispatcherPriority::Low, ref new DispatchedHandler([weak, visible, fps, memory] {
             if (auto page = weak.Resolve<DirectXPage>()) {
                 page->fpsOverlay->Visibility = visible ? Windows::UI::Xaml::Visibility::Visible
                                                       : Windows::UI::Xaml::Visibility::Collapsed;
-                wchar_t text[40]{};
+                wchar_t text[128]{};
                 swprintf_s(text, L"%.1f FPS", fps);
                 page->fpsText->Text = ref new Platform::String(text);
+                constexpr double mib = 1024.0 * 1024.0;
+                swprintf_s(text, L"RAM: %.0f / %.0f MiB", memory.ram_used / mib,
+                           memory.ram_total / mib);
+                page->ramText->Text = ref new Platform::String(text);
+                swprintf_s(text, L"Swap: %.0f / %.0f MiB", memory.swap_used / mib,
+                           memory.swap_total / mib);
+                page->swapText->Text = ref new Platform::String(text);
             }
         }));
     };

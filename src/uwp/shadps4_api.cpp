@@ -19,6 +19,7 @@
 #include "common/path_util.h"
 #include "common/scope_exit.h"
 #include "core/address_space.h"
+#include "core/uwp/guest_memory.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/audio/audioout_backend.h"
@@ -614,6 +615,19 @@ int32_t shadps4_render_host_frame() {
     } catch (const std::exception& exception) {
         return Fail(exception.what());
     }
+}
+
+int32_t shadps4_get_memory_usage(ShadPS4MemoryUsage* usage) {
+    if (!usage || usage->size != sizeof(ShadPS4MemoryUsage))
+        return -1;
+    try {
+        usage->ram_used = winrt::Windows::System::MemoryManager::AppMemoryUsage();
+        usage->ram_total = winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
+    } catch (const winrt::hresult_error&) {
+        return -1;
+    }
+    uwp_memory_swap_usage(&usage->swap_used, &usage->swap_total);
+    return 0;
 }
 
 uint64_t shadps4_get_game_frame_count() {

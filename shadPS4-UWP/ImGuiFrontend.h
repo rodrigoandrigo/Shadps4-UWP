@@ -76,7 +76,7 @@ class ImGuiFrontend : public std::enable_shared_from_this<ImGuiFrontend> {
     std::function<void()> ready;
     std::function<void()> toggle_fullscreen;
     std::function<void(bool)> set_pointer_mode;
-    std::function<void(bool, float)> set_game_fps;
+    std::function<void(bool, float, ShadPS4MemoryUsage)> set_game_fps;
 
   private:
     struct Setting {
@@ -185,6 +185,7 @@ class ImGuiFrontend : public std::enable_shared_from_this<ImGuiFrontend> {
     float ui_scale{1.0f};
     bool show_fps{true};
     decltype(&shadps4_get_game_frame_count) get_game_frame_count{};
+    decltype(&shadps4_get_memory_usage) get_memory_usage{};
     decltype(&shadps4_request_presentation_capture) request_presentation_capture{};
     decltype(&shadps4_cheats_request) cheats_request{};
     bool cheats_open{}, cheats_busy{};
