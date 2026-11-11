@@ -31,6 +31,7 @@ struct IndexFetch {
     VAddr address{};
     u32 size{}, element_size{}, byte_xor{};
     u32 count{UINT32_MAX};
+    u32 prefix{};
     bool operator==(const IndexFetch&) const = default;
 };
 bool LowerIndexFetch(CompiledShader& shader, Shader::IR::Program& program,

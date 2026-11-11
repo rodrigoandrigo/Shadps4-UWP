@@ -2148,9 +2148,9 @@ Value IREmitter::ImageSampleExplicitLod(const Value& handle, const Value& coords
 
 Value IREmitter::ImageSampleDrefImplicitLod(const Value& handle, const Value& coords,
                                             const F32& dref, const F32& bias, const Value& offset,
-                                            TextureInstInfo info) {
-    return Inst(Opcode::ImageSampleDrefImplicitLod, Flags{info}, handle, coords, dref, bias,
-                offset);
+                                            TextureInstInfo info, const F32& lod_clamp) {
+    return Inst(Opcode::ImageSampleDrefImplicitLod, Flags{info}, handle, coords, dref, bias, offset,
+                lod_clamp);
 }
 
 Value IREmitter::ImageSampleDrefExplicitLod(const Value& handle, const Value& coords,
@@ -2182,9 +2182,13 @@ Value IREmitter::ImageQueryLod(const Value& handle, const Value& coords, const V
 
 Value IREmitter::ImageGradient(const Value& handle, const Value& coords,
                                const Value& derivatives_dx, const Value& derivatives_dy,
-                               const Value& offset, const F32& lod_clamp, TextureInstInfo info) {
+                               const Value& offset, const F32& lod_clamp, const F32& dref,
+                               TextureInstInfo info) {
+    const Value depth_and_clamp =
+        dref.IsEmpty() ? Value{lod_clamp}
+                       : CompositeConstruct(dref, lod_clamp.IsEmpty() ? Imm32(0.f) : lod_clamp);
     return Inst(Opcode::ImageGradient, Flags{info}, handle, coords, derivatives_dx, derivatives_dy,
-                offset, lod_clamp);
+                offset, depth_and_clamp);
 }
 
 Value IREmitter::ImageRead(const Value& handle, const Value& coords, const U32& lod,

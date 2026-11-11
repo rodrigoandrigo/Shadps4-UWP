@@ -44,6 +44,14 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
     return code;
 }
 
+VAddr VertexAttribute::DescriptorAddress(const Shader::Info& info) const noexcept {
+    if (sgpr_base + 1 >= info.user_data.size())
+        return 0;
+    VAddr address{};
+    std::memcpy(&address, &info.user_data[sgpr_base], sizeof(address));
+    return (address & 0xFFFFFFFFFFFFULL) + u64(dword_offset) * sizeof(u32);
+}
+
 namespace {
 
 /**
@@ -75,8 +83,9 @@ struct FetchShaderMemo {
 
 } // Anonymous namespace
 
-bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data) {
-    if (!info.has_fetch_shader) {
+bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data, size_t max_words) {
+    if (!info.has_fetch_shader || !max_words ||
+        info.fetch_shader_sgpr_base + 1 >= info.user_data.size()) {
         return false;
     }
 
@@ -88,7 +97,7 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
         memo = std::make_unique<FetchShaderMemo>();
     }
     auto& entry = memo->entries[FetchShaderMemo::Index(code)];
-    if (entry.code == code && !entry.words.empty() &&
+    if (entry.code == code && !entry.words.empty() && entry.words.size() <= max_words &&
         std::memcmp(code, entry.words.data(), entry.words.size() * sizeof(u32)) == 0) {
         out_fetch_data = entry.data;
         return true;
@@ -107,6 +116,8 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
 
     const u32* ptr = code;
     while (true) {
+        if (size_t(ptr - code) == max_words)
+            return false;
         const u32 word0 = *(ptr++);
         const auto encoding = GetInstructionEncoding(word0);
 
@@ -137,6 +148,8 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
                 UNREACHABLE();
             }
         } else if (encoding == InstEncoding::MUBUF || encoding == InstEncoding::MTBUF) {
+            if (size_t(ptr - code) == max_words)
+                return false;
             // SRSRC is in units of 4 SPGRs while SBASE is in pairs of SGPRs
             const u32 word1 = *(ptr++);
             const u32 srsrc = ((word1 >> 16) & 0x1f) * 4;

@@ -82,11 +82,13 @@ public:
         std::optional<Shader::ShaderParams> hull, domain;
         Shader::RuntimeInfo hull_runtime{}, domain_runtime{};
         std::vector<u32> converted_indices;
+        bool converted_indices_are_ordinals{};
         std::optional<GpuCommands::Arguments> indirect;
         std::optional<GpuCommands::Expansion> expansion;
         u32 source_index_count{};
         u32 index_capacity{UINT32_MAX};
         u32 index_read_count{UINT32_MAX};
+        u32 index_prefix{};
         bool rectangles{};
         bool rectangle_points{};
         std::vector<VideoCore::ImageInfo> colors;
@@ -166,7 +168,8 @@ public:
     void DrawDepthGated(const DrawRequest& request);
     static u64 GsInvocations(D3D_PRIMITIVE_TOPOLOGY topology, u64 count);
     void Resolve(const VideoCore::ImageInfo& source, const VideoCore::ImageInfo& destination,
-                 u32 source_layer = 0, u32 destination_layer = 0, u32 layers = 0);
+                 u32 source_layer = 0, u32 destination_layer = 0, u32 layers = 0,
+                 const AmdGpu::ColorBuffer* fmask = nullptr);
     void MaterializeColorClear(const AmdGpu::ColorBuffer& buffer, const VideoCore::ImageInfo& info);
     std::shared_ptr<VideoCore::ResidentFrame> CapturePresentation(const VideoCore::ImageInfo& info);
     u64 Flush();

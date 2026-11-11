@@ -294,7 +294,8 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
     }
 
     // Patch image instruction if image is FMask.
-    if (AmdGpu::IsFmask(image.GetDataFmt())) {
+    if (AmdGpu::IsFmask(image.GetDataFmt()) &&
+        !(profile.reject_approximate_fmask_access && inst.GetOpcode() == IR::Opcode::ImageRead)) {
         if (is_written && profile.reject_approximate_fmask_access)
             throw std::runtime_error("Guest FMASK storage is not implemented for this backend");
         ASSERT_MSG(!is_written, "FMask storage instructions are not supported");
@@ -826,13 +827,14 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
         }
         if (inst_info.has_derivatives) {
             return ir.ImageGradient(handle, coords, derivatives_dx, derivatives_dy, offset,
-                                    lod_clamp, inst_info);
+                                    lod_clamp, dref, inst_info);
         }
         if (inst_info.is_depth) {
             if (explicit_lod) {
                 return ir.ImageSampleDrefExplicitLod(handle, coords, dref, lod, offset, inst_info);
             }
-            return ir.ImageSampleDrefImplicitLod(handle, coords, dref, bias, offset, inst_info);
+            return ir.ImageSampleDrefImplicitLod(handle, coords, dref, bias, offset, inst_info,
+                                                 lod_clamp);
         }
         if (explicit_lod) {
             return ir.ImageSampleExplicitLod(handle, coords, lod, offset, inst_info);

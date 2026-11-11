@@ -93,7 +93,8 @@ public:
     void PrepareDownloads(ID3D12GraphicsCommandList* commands);
     void CommitDownloads();
     void RetireUploads(u64 fence);
-    void Resolve(Image& source, Image& destination, ID3D12GraphicsCommandList* commands);
+    void Resolve(Image& source, Image& destination, ID3D12GraphicsCommandList* commands,
+                 ID3D12Resource* fmask = nullptr);
     const std::vector<u8>& MaskShader() const {
         return transfers.MaskShader();
     }

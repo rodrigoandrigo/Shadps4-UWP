@@ -395,7 +395,8 @@ public:
 
     [[nodiscard]] Value ImageSampleDrefImplicitLod(const Value& handle, const Value& body,
                                                    const F32& dref, const F32& bias,
-                                                   const Value& offset, TextureInstInfo info);
+                                                   const Value& offset, TextureInstInfo info,
+                                                   const F32& lod_clamp);
 
     [[nodiscard]] Value ImageSampleDrefExplicitLod(const Value& handle, const Value& body,
                                                    const F32& dref, const F32& lod,
@@ -415,7 +416,7 @@ public:
     [[nodiscard]] Value ImageGradient(const Value& handle, const Value& coords,
                                       const Value& derivatives_dx, const Value& derivatives_dy,
                                       const Value& offset, const F32& lod_clamp,
-                                      TextureInstInfo info);
+                                      const F32& dref, TextureInstInfo info);
     [[nodiscard]] Value ImageRead(const Value& handle, const Value& coords, const U32& lod,
                                   const U32& multisampling, TextureInstInfo info);
     void ImageWrite(const Value& handle, const Value& coords, const U32& lod,

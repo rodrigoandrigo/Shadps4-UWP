@@ -1465,9 +1465,11 @@ void ImageCache::PrepareDownloads(ID3D12GraphicsCommandList* commands) {
         }
     }
 }
-void ImageCache::Resolve(Image& source, Image& destination, ID3D12GraphicsCommandList* commands) {
+void ImageCache::Resolve(Image& source, Image& destination, ID3D12GraphicsCommandList* commands,
+                         ID3D12Resource* fmask) {
     const bool multisampled = bool(source.msaa);
-    if (destination.msaa || (multisampled && destination.info.props.is_volume) ||
+    if (destination.msaa || (fmask && !multisampled) ||
+        (multisampled && destination.info.props.is_volume) ||
         source.info.props.is_depth || destination.info.props.is_depth ||
         source.info.size.width != destination.info.size.width ||
         source.info.size.height != destination.info.size.height ||
@@ -1479,12 +1481,20 @@ void ImageCache::Resolve(Image& source, Image& destination, ID3D12GraphicsComman
         D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
         winrt::check_hresult(device->Device()->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,
                                                                    &support, sizeof(support)));
-        if (!(support.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE))
+        const auto required = fmask ? D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD
+                                    : D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE;
+        if (!(support.Support1 & required))
             throw std::runtime_error("D3D12 format does not support multisample color resolve");
     }
     Upload(source, commands);
     Upload(destination, commands);
-    if (multisampled) {
+    if (fmask) {
+        Barrier(source, commands, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        Barrier(destination, commands, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        transfers.RecordResolve(commands, source.Native(), destination.Native(), *source.msaa,
+                                fmask, format, source.info.size.width, source.info.size.height,
+                                source.native_layers);
+    } else if (multisampled) {
         Barrier(source, commands, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
         Barrier(destination, commands, D3D12_RESOURCE_STATE_RESOLVE_DEST);
         for (u32 layer = 0; layer < source.native_layers; ++layer) {

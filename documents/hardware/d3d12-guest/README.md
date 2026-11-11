@@ -76,4 +76,31 @@ O caso `COMMAND_DEPENDENCIES` também lê duas vezes os mesmos 12 bytes de `/app
 
 `BOUNDED_INDEX_FETCH` mantém `INDEX_COUNT=3` e varia `MAX_SIZE` entre 0, 1, 2 e 3 no pacote `DRAW_INDEX_2`, usando um alias físico para os índices. Somente capacidade 3 deve produzir o quadrado; nos demais casos os índices ausentes são zero e a primitiva é degenerada. O contador do VS é observado entre 1 e 3, sem presumir reutilização exata pelo vertex cache. Não submete memória GPU desmapeada.
 
+`COHERENT_INDEX_FAN` repete a matriz de capacidade com triangle fan. Verifica
+expansão, fetch pelo alias físico, o contador de invocações e preservação do
+padding no mesmo draw.
+
+`COHERENT_INDEX_SWAP` usa `DRAW_INDEX_INDIRECT` com índices de 16 bits e
+início no segundo índice da primeira palavra. Verifica `Swap32` e
+`SwapWord` em triangle list e triangle fan, com o índice em um alias
+virtual do buffer gravável pelo VS. O primeiro índice lógico é uma
+sentinela e os três índices do draw são 0, 1 e 2.
+
+`COHERENT_INDEX_RESTART` usa um triangle fan com dois marcadores de
+restart customizados delimitando os três índices válidos. O vertex shader
+grava em outras palavras do mesmo backing. O resultado esperado contém
+três invocações, ambos os marcadores preservados e o quadrado verde.
+
+`COHERENT_FETCH_DESCRIPTOR` corrige na GPU o stride de um descritor de
+vértices antes do draw. O fetch shader usa outro mapeamento virtual para a
+mesma tabela. A saída esperada é o quadrado verde e stride 16 após a fence.
+
+`FMASK_READ` lê mapas 4× e 8× por um alias virtual em um dispatch. Os
+valores de armazenamento são `4e` e `01234567`. A saída esperada é
+`00001032` e `01234567`, respectivamente, com um nibble por amostra.
+
+`FMASK_RESOLVE` encadeia o clear de um tile MSAA 4× com um resolve que
+usa um mapa que referencia o fragmento zero. Confere a cor no destino
+single-sample. Esse caso exercita o caminho de resolve com metadata.
+
 O grupo `CMASK_MSAA` acrescenta superfícies 2×/4×/8× com FMASK em memória, CMASK inicialmente expandido D/E/F e um tile com o nibble de fast-clear zero. Após eliminar o clear, conta os texels materializados e verifica a preservação dos outros texels e dos estados FMASK. É um probe de hardware GNM para executar no PS4; não integra os testes automatizados do emulador.

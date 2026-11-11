@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <bitset>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -12,6 +13,8 @@
 #include "common/hash.h"
 #include "common/logging/log.h"
 #include "core/memory.h"
+#include "shader_recompiler/frontend/decode.h"
+#include "shader_recompiler/frontend/fetch_shader.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_d3d12/primitive_conversion.h"
 #include "video_core/renderer_d3d12/profile.h"
@@ -380,6 +383,49 @@ u32 MappedIndexCount(Core::MemoryManager& memory, VAddr address, u64 count, u32 
             high = middle - 1;
     }
     return low;
+}
+void SynchronizeFetchInputs(Core::MemoryManager& memory, CommandRuntime& runtime,
+                            const Program& program) {
+    using namespace Shader::Gcn;
+    constexpr u32 FetchCallMask = u32(EncodingMask::MASK_9bit) | 0xff00;
+    constexpr u32 FetchCall = u32(InstEncoding::SOP1) | (u32(OpcodeSOP1::S_SWAPPC_B64) << 8);
+    if (std::ranges::none_of(program.code, [](u32 word) {
+            return (word & FetchCallMask) == FetchCall;
+        }))
+        return;
+
+    Shader::Info info{Shader::HwStage::Vertex, Shader::SwStage::Vertex, program.Params()};
+    info.has_fetch_shader = true;
+    std::bitset<Shader::NUM_USER_DATA_REGS> synchronized;
+    GcnDecodeContext decoder;
+    GcnCodeSlice code{program.code.data(), program.code.data() + program.code.size()};
+    while (!code.atEnd()) {
+        const auto inst = decoder.decodeInstruction(code);
+        if (inst.opcode != Opcode::S_SWAPPC_B64)
+            continue;
+        const auto slot = inst.src[0].code;
+        if (slot + 1 >= info.user_data.size())
+            throw std::runtime_error("Invalid D3D12 fetch shader pointer register");
+        if (synchronized.test(slot))
+            continue;
+        synchronized.set(slot);
+        info.fetch_shader_sgpr_base = slot;
+        const auto address = reinterpret_cast<VAddr>(GetFetchShaderCode(info, slot));
+        if (!address || address % sizeof(u32))
+            throw std::runtime_error("Invalid D3D12 fetch shader code address");
+        constexpr u32 MaxFetchWords = 4096;
+        const auto words = MappedIndexCount(memory, address, MaxFetchWords, sizeof(u32));
+        const auto code_access =
+            words ? runtime.AcquireCpuAccess(address, u64(words) * sizeof(u32), false) : nullptr;
+        FetchShaderData fetch;
+        if (!ParseFetchShader(info, fetch, words ? words : MaxFetchWords))
+            throw std::runtime_error("D3D12 fetch shader exceeds its mapped code range");
+        for (const auto& attribute : fetch.attributes) {
+            const auto descriptor = attribute.DescriptorAddress(info);
+            if (descriptor)
+                static_cast<void>(runtime.AcquireCpuAccess(descriptor, sizeof(AmdGpu::Buffer), false));
+        }
+    }
 }
 void ReadIndexBuffer(Core::MemoryManager& memory, VAddr address, u32 capacity, u32 bytes,
                      AmdGpu::IndexSwapMode swap, u32 prefix, std::span<u32> output,
@@ -795,14 +841,10 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         throw GpuDrawFallback{};
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Resolve) {
         const auto& source_buffer = regs.color_buffers[0];
-        if (source_buffer && source_buffer.info.compression && source_buffer.FmaskAddress() &&
-            (source_buffer.attrib.num_samples_log2 || source_buffer.attrib.num_fragments_log2)) {
-            throw std::runtime_error(fmt::format(
-                "Unsupported D3D12 resolve from FMASK-backed multisample color source: "
-                "address={:#x}, coverage_log2={}, fragments_log2={}",
-                source_buffer.FmaskAddress(), u32(source_buffer.attrib.num_samples_log2),
-                u32(source_buffer.attrib.num_fragments_log2)));
-        }
+        const bool uses_fmask = source_buffer && source_buffer.info.compression &&
+                                source_buffer.FmaskAddress() &&
+                                (source_buffer.attrib.num_samples_log2 ||
+                                 source_buffer.attrib.num_fragments_log2);
         for (u32 i = 0; i < 2; ++i)
             if (regs.color_buffers[i])
                 runtime->MaterializeColorClear(
@@ -811,7 +853,7 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
         const VideoCore::ImageInfo source{regs.color_buffers[0], liverpool.last_cb_extent[0]};
         const VideoCore::ImageInfo destination{regs.color_buffers[1], liverpool.last_cb_extent[1]};
         runtime->Resolve(source, destination, regs.color_buffers[0].BaseSlice(),
-                         regs.color_buffers[1].BaseSlice());
+                         regs.color_buffers[1].BaseSlice(), 0, uses_fmask ? &source_buffer : nullptr);
         return;
     }
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::FmaskDecompress) {
@@ -913,10 +955,12 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
     auto vs =
         ReadProgram(memory, tessellation ? regs.ls_program
                                          : (has_geometry ? regs.es_program : regs.vs_program));
+    SynchronizeFetchInputs(memory, *runtime, vs);
     Program hs{}, ds{};
     if (tessellation) {
         hs = ReadProgram(memory, regs.hs_program);
         ds = ReadProgram(memory, has_geometry ? regs.es_program : regs.vs_program);
+        SynchronizeFetchInputs(memory, *runtime, ds);
     }
     Program gs{}, copy{};
     if (has_geometry) {
@@ -1708,10 +1752,17 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
                          : regs.index_buffer_type.swap_mode == AmdGpu::IndexSwapMode::Swap16
                              ? std::max(2u, size)
                              : 4;
-        const u64 read_count =
-            (u64(logical_count) + unit / size - 1) / (unit / size) * (unit / size);
-        draw.index_read_count = MappedIndexCount(memory, draw.index_address, read_count, size);
-        draw.index_capacity = std::min(logical_count, draw.index_read_count);
+        draw.index_prefix = indirect ? (u64(index_offset) * size) % unit : 0;
+        const u64 read_count = logical_count
+                                   ? ((u64(logical_count) * size + draw.index_prefix + unit - 1) /
+                                      unit * unit) /
+                                         size
+                                   : 0;
+        draw.index_read_count =
+            MappedIndexCount(memory, draw.index_address - draw.index_prefix, read_count, size);
+        const u32 prefix_indices = draw.index_prefix / size;
+        draw.index_capacity = std::min(
+            logical_count, draw.index_read_count - std::min(draw.index_read_count, prefix_indices));
         if (indirect && indirect->gpu && draw.index_capacity < draw.count)
             throw GpuDrawFallback{};
         draw.index_format = size == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
@@ -1870,45 +1921,35 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
             draw.expansion = GpuCommands::Expansion{9, draw.count, draw.count, false};
         }
     }
+    const u32 element_bytes = draw.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4;
     const auto read_indices = [&](std::span<u32> output) {
-        const u32 bytes = draw.index_format == DXGI_FORMAT_R16_UINT ? 2 : 4;
-        const u32 unit = draw.index_swap == AmdGpu::IndexSwapMode::None     ? bytes
-                         : draw.index_swap == AmdGpu::IndexSwapMode::Swap16 ? std::max(2u, bytes)
-                                                                            : 4;
-        const u32 prefix = indirect ? (u64(index_offset) * bytes) % unit : 0;
-        ReadIndexBuffer(memory, draw.index_address, draw.index_capacity, bytes, draw.index_swap,
-                        prefix, output,
+        const auto access = draw.index_read_count
+                                ? runtime->AcquireCpuAccess(draw.index_address - draw.index_prefix,
+                                                            u64(draw.index_read_count) * element_bytes,
+                                                            false)
+                                : nullptr;
+        ReadIndexBuffer(memory, draw.index_address, draw.index_capacity, element_bytes,
+                        draw.index_swap, draw.index_prefix, output,
                         [&](VAddr address, std::span<u8> data) { Read(address, data); });
     };
-    if (!convert && !draw.expansion && indexed && indirect &&
-        (draw.index_swap == AmdGpu::IndexSwapMode::Swap32 ||
-         draw.index_swap == AmdGpu::IndexSwapMode::SwapWord) &&
-        draw.index_format == DXGI_FORMAT_R16_UINT && (index_offset & 1)) {
-        if (draw.count > 4 * 1024 * 1024)
-            throw std::runtime_error("Guest index conversion exceeds upload budget");
-        draw.converted_indices.resize(draw.count);
-        read_indices(draw.converted_indices);
-    }
     if (convert && !draw.expansion) {
         if (draw.count > 4 * 1024 * 1024)
             throw std::runtime_error("Guest index conversion exceeds upload budget");
+        draw.source_index_count = draw.count;
         std::vector<u32> indices(draw.count);
-        if (indexed) {
-            read_indices(indices);
-        } else {
-            for (u32 i = 0; i < draw.count; ++i)
-                indices[i] = i;
-            draw.base_vertex = draw.first_vertex;
-        }
-        if (indexed)
-            std::fill(indices.begin() + std::min(draw.index_capacity, draw.count), indices.end(),
-                      0);
         u32 restart_index = regs.primitive_restart_index;
         if (restart_index == 0xffff || restart_index == UINT32_MAX)
             restart_index = draw.index_format == DXGI_FORMAT_R16_UINT ? 0xffff : UINT32_MAX;
         const auto restart = indexed && regs.enable_primitive_restart
-                                 ? std::optional<u32>{restart_index}
+                                 ? std::optional<u32>{UINT32_MAX}
                                  : std::nullopt;
+        if (restart)
+            read_indices(indices);
+        draw.converted_indices_are_ordinals = indexed;
+        for (u32 i = 0; i < draw.count; ++i)
+            indices[i] = restart && indices[i] == restart_index ? *restart : i;
+        if (!indexed)
+            draw.base_vertex = draw.first_vertex;
         if (face_passes)
             draw.face_masks = ConvertPolygonFaceMasks(regs.primitive_type, indices, restart);
         if (draw.flat_last && !has_geometry && !tessellation)

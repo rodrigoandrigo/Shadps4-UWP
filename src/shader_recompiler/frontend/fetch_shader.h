@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <limits>
+
 #include "common/small_vector.h"
 #include "common/types.h"
 #include "shader_recompiler/info.h"
@@ -33,6 +35,8 @@ struct VertexAttribute {
     InstanceIdType GetStepRate() const {
         return static_cast<InstanceIdType>(instance_data);
     }
+
+    VAddr DescriptorAddress(const Shader::Info& info) const noexcept;
 
     constexpr AmdGpu::Buffer GetSharp(const Shader::Info& info) const noexcept {
         auto buffer = info.ReadUdReg<AmdGpu::Buffer>(sgpr_base, dword_offset);
@@ -68,6 +72,7 @@ struct FetchShaderData {
 
 const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base);
 
-bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data);
+bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data,
+                      size_t max_words = std::numeric_limits<size_t>::max());
 
 } // namespace Shader::Gcn

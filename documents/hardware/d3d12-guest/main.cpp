@@ -408,7 +408,7 @@ bool RunNonlinearAliases(uint8_t *bytes, uint8_t *alias_bytes, off_t physical,
 }
 bool RunImageFeedback(uint8_t *bytes, bool integer_constant = false,
                       uint8_t *read_alias = nullptr,
-                      bool read_existing = false) {
+                      bool read_existing = false, uint32_t fmask_samples = 0) {
   auto *source = reinterpret_cast<volatile uint32_t *>(bytes + 0x40000);
   if (!read_existing)
     source[0] = 0xdeadbeef;
@@ -446,6 +446,21 @@ bool RunImageFeedback(uint8_t *bytes, bool integer_constant = false,
   }
   if (integer_constant)
     user[11] = (user[11] & ~7u) | 1;
+  if (fmask_samples) {
+    auto *metadata_bytes = bytes + 0x90000;
+    const uintptr_t metadata_address = uintptr_t(
+        (read_alias ? read_alias : bytes) + 0x90000);
+    const uint32_t storage = fmask_samples == 4 ? 0x4e4e4e4e : 0x01234567;
+    for (uint32_t i = 0; i < 0x40000 / sizeof(storage); ++i)
+      std::memcpy(metadata_bytes + i * sizeof(storage), &storage, sizeof(storage));
+    const uint32_t format = fmask_samples == 4 ? 49 : 54;
+    image[0] = (metadata_address >> 8) | (uint64_t(format) << 52) | (uint64_t(4) << 58);
+    image[1] = 15 | (uint64_t(15) << 14) | (uint64_t(4) << 32) |
+               (uint64_t(5) << 35) | (uint64_t(6) << 38) |
+               (uint64_t(7) << 41) | (uint64_t(14) << 52) | (uint64_t(9) << 60);
+    image[2] = uint64_t(255) << 13;
+    std::memcpy(user + 8, image, sizeof(image));
+  }
   int rc{};
   auto *words = reinterpret_cast<uint32_t *>(bytes + 0x30000);
   const int initialized = sceGnmDrawInitDefaultHardwareState350(words, 0x1000);
@@ -493,7 +508,10 @@ bool RunImageFeedback(uint8_t *bytes, bool integer_constant = false,
       }
       sceKernelUsleep(1000);
     }
-  const uint32_t expected = integer_constant ? 1 : original;
+  const uint32_t expected = fmask_samples == 4 ? 0x1032u
+                            : fmask_samples == 8 ? 0x01234567u
+                            : integer_constant  ? 1u
+                                                : original;
   const bool pass =
       rc >= 0 && !timed_out && source[0] == original && source[1] == expected;
   std::printf("IMAGE_LOAD_FEEDBACK %s constant=%u virtual_alias=%u writer=%08x "
@@ -821,7 +839,11 @@ bool RunImageBufferAtomics(uint8_t *bytes) {
 
 bool RunStageSharing(uint8_t *bytes, uint8_t *read_alias, uint32_t blend_case = 0,
                      bool readonly_feedback = false, bool coherent_fetch = false,
-                     bool coherent_indices = false, uint32_t index_capacity = 3) {
+                     bool coherent_indices = false, uint32_t index_capacity = 3,
+                     bool index_fan = false, uint32_t index_swap = 0,
+                     bool index_restart = false, bool update_fetch_descriptor = false) {
+  constexpr uint32_t RestartIndex = 0x11223344;
+  constexpr uint32_t RestartStream[]{RestartIndex, 0, 1, 2, RestartIndex};
   auto *source = reinterpret_cast<volatile uint32_t *>(bytes + 0x40000);
   auto *target = reinterpret_cast<volatile uint32_t *>(bytes + 0x60000);
   for (uint32_t i = 0; i < 64 * 32; ++i)
@@ -903,8 +925,15 @@ bool RunStageSharing(uint8_t *bytes, uint8_t *read_alias, uint32_t blend_case = 
   if (coherent_indices) {
     source[0] = 0;
     source[1] = 1;
+    if (index_swap) {
+      source[0] = index_swap == 2 ? 0x55000000 : 0x00000055;
+      source[1] = index_swap == 2 ? 0x01000200 : 0x00010002;
+    }
     source[2] = 2;
     source[4] = 0;
+    if (index_restart)
+      for (uint32_t i = 0; i < std::size(RestartStream); ++i)
+        source[8 + i] = RestartStream[i];
     const uint32_t writer[]{
         0xc0840300, vop2(26, 1, 129, 0), vop2(27, 1, 130, 1), vop2(27, 2, 130, 0),
         vop1(6, 1, 257), vop1(6, 2, 258), vop2(8, 1, 244, 1), vop2(8, 2, 244, 2),
@@ -942,6 +971,7 @@ bool RunStageSharing(uint8_t *bytes, uint8_t *read_alias, uint32_t blend_case = 
   image[0] = (uintptr_t(read_alias + 0x40000) >> 8) | (uint64_t(4) << 52) |
              (uint64_t(7) << 58);
   std::memcpy(ps_user, image, sizeof(image));
+  uint32_t descriptor_word{};
   if (coherent_fetch || coherent_indices) {
     auto *fetch = reinterpret_cast<uint32_t *>(bytes + 0x72000);
     const uint32_t instructions[]{0xc0860304, 0xe00c2000, 0x80030800,
@@ -954,13 +984,18 @@ bool RunStageSharing(uint8_t *bytes, uint8_t *read_alias, uint32_t blend_case = 
     std::memcpy(table, descriptor, sizeof(descriptor));
     if (coherent_indices) {
       table[1] = uint32_t(uintptr_t(source) >> 32);
-      table[2] = 20;
+      table[2] = index_restart ? 52 : 20;
     }
     std::memcpy(table + 4, descriptor, sizeof(descriptor));
     const uintptr_t alias_address = uintptr_t(read_alias + 0x40000);
     table[4] = uint32_t(alias_address);
     table[5] = uint32_t(alias_address >> 32) | (16u << 16);
-    const uintptr_t table_address = uintptr_t(table), fetch_address = uintptr_t(fetch);
+    descriptor_word = table[5];
+    if (update_fetch_descriptor)
+      table[5] = uint32_t(alias_address >> 32) | (32u << 16);
+    const uintptr_t table_address =
+        uintptr_t(update_fetch_descriptor ? read_alias + 0x72100 : bytes + 0x72100);
+    const uintptr_t fetch_address = uintptr_t(fetch);
     std::memcpy(vs_user + 2, &table_address, sizeof(table_address));
     std::memcpy(vs_user + 4, &fetch_address, sizeof(fetch_address));
   }
@@ -969,6 +1004,33 @@ bool RunStageSharing(uint8_t *bytes, uint8_t *read_alias, uint32_t blend_case = 
   if (initialized <= 0 || initialized > 0x1000)
     return false;
   Commands commands{words, words + initialized};
+  if (update_fetch_descriptor) {
+    auto *store = reinterpret_cast<uint32_t *>(bytes + 0x72300);
+    const uint32_t store_code[]{0x7e0002ff, descriptor_word, 0x7e020280, 0xe0701000,
+                                 0x80000001, 0xbf8c0f70, 0xbf810000};
+    const ShaderBinaryInfo store_info{{'O', 'r', 'b', 'S', 'h', 'd', 'r'}, 1,
+                                     uint32_t(sizeof(store_code)) << 8, 0, 0x6630326665746368, 0};
+    std::memcpy(store, store_code, sizeof(store_code));
+    std::memcpy(bytes + 0x72340, &store_info, sizeof(store_info));
+    for (uint32_t reg = 0x2e04; reg <= 0x2e06; ++reg)
+      commands.Register(reg, 0);
+    for (uint32_t reg = 0x2e07; reg <= 0x2e09; ++reg)
+      commands.Register(reg, 1);
+    commands.Register(0x2e0c, uint32_t(uintptr_t(store) >> 8));
+    commands.Register(0x2e0d, uint32_t(uintptr_t(store) >> 40));
+    commands.Register(0x2e12, 0);
+    commands.Register(0x2e13, 4 << 1);
+    commands.Register(0x2e15, 0x170);
+    commands.Register(0x2e16, 0xffffffff);
+    commands.Register(0x2e17, 0xffffffff);
+    const auto destination = uintptr_t(bytes + 0x72100 + 5 * sizeof(uint32_t));
+    commands.Packet(0x76, {0x240, uint32_t(destination), uint32_t(destination >> 32) & 0xff,
+                           4, 4u | (5u << 3) | (6u << 6) | (7u << 9) | (3u << 27)}, true);
+    commands.Packet(0x15, {1, 1, 1, 0x21}, true);
+    commands.Packet(0x46, {7u | (4u << 8)}, true);
+    commands.Packet(0x58, {(1u << 18) | (1u << 22) | (1u << 23),
+                           0xffffffff, 0xff, 0, 0, 10}, true);
+  }
   const auto shader = [&](uint32_t reg, uint32_t value) {
     commands.Packet(0x76, {reg - 0x2c00, value});
   };
@@ -1055,13 +1117,32 @@ bool RunStageSharing(uint8_t *bytes, uint8_t *read_alias, uint32_t blend_case = 
     context(0xa1b6, 1);
     context(0xa205, blend_case == 14 ? 1u << 19 : 0u);
   }
-  commands.Packet(0x79, {0x242, blend_case == 11 ? 0u : blend_case >= 13 ? 6u : 4u});
+  commands.Packet(0x79,
+                  {0x242, index_fan ? 5u : blend_case == 11 ? 0u : blend_case >= 13 ? 6u : 4u});
   commands.Packet(0x2f, {1});
   if (coherent_indices) {
-    const uintptr_t index_address = uintptr_t(read_alias + 0x40000);
-    commands.Packet(0x2a, {1});
-    commands.Packet(0x27, {index_capacity, uint32_t(index_address),
-                            uint32_t(index_address >> 32), 3, 0});
+    const uintptr_t index_address = uintptr_t(read_alias + 0x40000 + (index_restart ? 32 : 0));
+    if (index_swap) {
+      auto *arguments = reinterpret_cast<uint32_t *>(bytes + 0x20400);
+      const uint32_t parameters[]{3, 1, 1, 0, 0};
+      std::memcpy(arguments, parameters, sizeof(parameters));
+      const auto base = uintptr_t(arguments);
+      commands.Packet(0x11, {1, uint32_t(base), uint32_t(base >> 32)});
+      commands.Packet(0x2a, {index_swap << 2});
+      commands.Packet(0x26, {uint32_t(index_address), uint32_t(index_address >> 32)});
+      commands.Packet(0x13, {index_capacity + 1});
+      commands.Packet(0x25, {0, 0x4c, 0x4d, 0});
+    } else if (index_restart) {
+      context(0xa103, RestartIndex);
+      context(0xa2a5, 1);
+      commands.Packet(0x2a, {1});
+      constexpr uint32_t count = std::size(RestartStream);
+      commands.Packet(0x27, {count, uint32_t(index_address), uint32_t(index_address >> 32), count, 0});
+    } else {
+      commands.Packet(0x2a, {1});
+      commands.Packet(0x27, {index_capacity, uint32_t(index_address),
+                              uint32_t(index_address >> 32), 3, 0});
+    }
   } else {
     commands.Packet(0x2d, {blend_case >= 13 ? 4u : 3u, 2});
   }
@@ -1099,8 +1180,13 @@ bool RunStageSharing(uint8_t *bytes, uint8_t *read_alias, uint32_t blend_case = 
         expected_source = y == 0 && x < 12 ? positions[x] : 0xdeadbeef;
       }
       if (coherent_indices) {
-        const uint32_t words[]{0, 1, 2, 0x12345678, 3};
+        const uint32_t words[]{index_swap == 2 ? 0x55000000u : index_swap == 3 ? 0x55u : 0u,
+                               index_swap == 2 ? 0x01000200u :
+                               index_swap == 3 ? 0x00010002u : 1u,
+                               2, 0x12345678, 3};
         expected_source = y == 0 && x < 5 ? words[x] : 0xdeadbeef;
+        if (index_restart && y == 0 && x >= 8 && x < 8 + std::size(RestartStream))
+          expected_source = RestartStream[x - 8];
         if (index_capacity < 3 && y == 0 && x == 4) {
           pass &= source[4] >= 1 && source[4] <= 3;
           expected_source = source[4];
@@ -1138,6 +1224,9 @@ bool RunStageSharing(uint8_t *bytes, uint8_t *read_alias, uint32_t blend_case = 
         colored += x < 16 && target[y * 64 + x] == expected;
       }
     }
+  if (update_fetch_descriptor)
+    pass &= *reinterpret_cast<volatile uint32_t *>(bytes + 0x72100 + 5 * sizeof(uint32_t)) ==
+            descriptor_word;
   std::printf("STAGE_SHARING_VS_PS readonly_attachment=%u blend_case=%u virtual_alias=%u colored=%u padding=%s %s "
               "submit=%08x\n",
               uint32_t(readonly_feedback), blend_case, variant, colored,
@@ -1149,7 +1238,7 @@ bool RunMixedCmask(uint8_t *bytes, uint32_t format = 10, uint32_t number = 0,
                    uint32_t swap = 0, uint32_t word0 = 0xff000080,
                    uint32_t word1 = 0, uint32_t pixel_bytes = 4,
                    const uint8_t *expected_pixel = nullptr,
-                   uint32_t coverage_log2 = 0) {
+                   uint32_t coverage_log2 = 0, bool resolve_fmask = false) {
   auto *target = reinterpret_cast<volatile uint8_t *>(bytes + 0x140000);
   auto *metadata = bytes + 0x150000;
   const uint32_t samples = 1u << coverage_log2;
@@ -1261,7 +1350,7 @@ bool RunMixedCmask(uint8_t *bytes, uint32_t format = 10, uint32_t number = 0,
                                    (coverage_log2 << 15) : 8);
   if (coverage_log2) {
     context(0xa321, uint32_t(uintptr_t(bytes + 0x600000) >> 8));
-    context(0xa322, coverage_log2 == 3 ? 4095 : 1023);
+    context(0xa322, resolve_fmask ? 2047 : coverage_log2 == 3 ? 4095 : 1023);
   }
   context(0xa31f, uint32_t(uintptr_t(metadata) >> 8));
   context(0xa320, 15);
@@ -1271,6 +1360,21 @@ bool RunMixedCmask(uint8_t *bytes, uint32_t format = 10, uint32_t number = 0,
   commands.Packet(0x79, {0x242, 4});
   commands.Packet(0x2f, {1});
   commands.Packet(0x2d, {3, 2});
+  auto *resolved = reinterpret_cast<volatile uint32_t *>(bytes + 0x500000);
+  if (resolve_fmask) {
+    for (uint32_t i = 0; i < 512 * 256; ++i)
+      resolved[i] = 0xdeadbeef;
+    context(0xa327, uint32_t(uintptr_t(resolved) >> 8));
+    context(0xa328, 63);
+    context(0xa329, 2047);
+    context(0xa32a, 0);
+    context(0xa32b, (format << 2) | (number << 8));
+    context(0xa32c, 8);
+    context(0xa202, 0x00cc0030);
+    context(0xa08e, 0xff);
+    context(0xa08f, 0xff);
+    commands.Packet(0x2d, {3, 2});
+  }
   auto *fence = reinterpret_cast<volatile uint32_t *>(bytes + 0x20100);
   *fence = 0;
   const auto completion = uintptr_t(fence);
@@ -1290,6 +1394,12 @@ bool RunMixedCmask(uint8_t *bytes, uint32_t format = 10, uint32_t number = 0,
       sceKernelUsleep(1000);
     }
   bool pass = rc >= 0 && !timed_out;
+  if (resolve_fmask) {
+    pass &= resolved[0] == word0 && resolved[512 * 7 + 7] == word0;
+    std::printf("FMASK_RESOLVE clear=%08x expected=%08x %s\n", resolved[0], word0,
+                pass ? "PASS" : "FAIL");
+    return pass;
+  }
   if (coverage_log2) {
     uint32_t cleared{};
     for (uint32_t offset = 0; offset < target_bytes; offset += 4) {
@@ -1501,6 +1611,12 @@ int main() {
       RunNonlinearAliases(bytes, alias_bytes, physical, true);
   const bool image_feedback = RunImageFeedback(bytes);
   const bool image_feedback_one = RunImageFeedback(bytes, true);
+  bool fmask_reads = true;
+  for (uint32_t samples : {4u, 8u}) {
+    const bool result = RunImageFeedback(bytes, false, alias_bytes, true, samples);
+    std::printf("FMASK_READ samples=%u %s\n", samples, result ? "PASS" : "FAIL");
+    fmask_reads &= result;
+  }
   const bool image_feedback_alias = RunImageFeedback(bytes, false, alias_bytes);
   const bool image_feedback_alias_one =
       RunImageFeedback(bytes, true, alias_bytes);
@@ -1517,12 +1633,16 @@ int main() {
   for (uint32_t coverage_log2 : {1u, 2u, 3u})
     cmask_mixed &= RunMixedCmask(bytes, 10, 0, 0, 0xff000080, 0, 4, nullptr,
                                coverage_log2);
+  fmask_reads &= RunMixedCmask(bytes, 10, 0, 0, 0xff000080, 0, 4, nullptr, 2, true);
   const bool typed_clears = RunTypedClears(bytes);
   const bool command_dependencies = RunCommandDependencies(bytes, alias_bytes);
   const bool coherent_fetch = RunStageSharing(bytes, bytes, 0, false, true);
   const bool coherent_fetch_alias = RunStageSharing(bytes, alias_bytes, 0, false, true);
   std::printf("COHERENT_VERTEX_FETCH direct=%s alias=%s\n",
               coherent_fetch ? "PASS" : "FAIL", coherent_fetch_alias ? "PASS" : "FAIL");
+  const bool fetch_descriptor =
+      RunStageSharing(bytes, alias_bytes, 0, false, true, false, 3, false, 0, false, true);
+  std::printf("COHERENT_FETCH_DESCRIPTOR %s\n", fetch_descriptor ? "PASS" : "FAIL");
   const bool coherent_indices = RunStageSharing(bytes, bytes, 0, false, false, true);
   const bool coherent_indices_alias = RunStageSharing(bytes, alias_bytes, 0, false, false, true);
   std::printf("COHERENT_INDEX_FETCH direct=%s alias=%s\n",
@@ -1533,8 +1653,24 @@ int main() {
     std::printf("BOUNDED_INDEX_FETCH capacity=%u draw_count=3 %s\n", capacity,
                 bounded ? "PASS" : "FAIL");
     bounded_indices &= bounded;
+    const bool fan = RunStageSharing(bytes, alias_bytes, 0, false, false, true, capacity, true);
+    std::printf("COHERENT_INDEX_FAN capacity=%u draw_count=3 %s\n", capacity,
+                fan ? "PASS" : "FAIL");
+    bounded_indices &= fan;
   }
   const bool stage_sharing = RunStageSharing(bytes, bytes);
+  const bool coherent_restart =
+      RunStageSharing(bytes, alias_bytes, 0, false, false, true, 3, true, 0, true);
+  std::printf("COHERENT_INDEX_RESTART %s\n", coherent_restart ? "PASS" : "FAIL");
+  bounded_indices &= coherent_restart;
+  for (const uint32_t swap : {2u, 3u}) {
+    for (const bool fan : {false, true}) {
+      const bool result = RunStageSharing(bytes, alias_bytes, 0, false, false, true, 3, fan, swap);
+      std::printf("COHERENT_INDEX_SWAP mode=%u fan=%u %s\n", swap, uint32_t(fan),
+                  result ? "PASS" : "FAIL");
+      bounded_indices &= result;
+    }
+  }
   const bool stage_sharing_alias = RunStageSharing(bytes, alias_bytes);
   const bool readonly_attachment = RunStageSharing(bytes, bytes, 0, true);
   const bool readonly_attachment_alias = RunStageSharing(bytes, alias_bytes, 0, true);
@@ -1579,12 +1715,13 @@ int main() {
   sceKernelReleaseDirectMemory(physical, AllocationSize);
   return cpu_alias && gpu_alias && cpu_neighbors && segmented_alias &&
                  nonlinear_alias && repeated_alias && image_feedback &&
-                 image_feedback_one && image_feedback_alias &&
+                 image_feedback_one && image_feedback_alias && fmask_reads &&
                  image_feedback_alias_one && image_buffer_atomics &&
                  image_buffer_writes && image_buffer_r8 && image_buffer_r16 &&
                  image_buffer_alt && image_buffer_alt_bank && image_residency &&
                  image_residency_alias && cmask_mixed && typed_clears &&
                  stage_sharing && stage_sharing_alias && coherent_fetch && coherent_fetch_alias &&
+                 fetch_descriptor &&
                  coherent_indices && coherent_indices_alias && bounded_indices &&
                  readonly_attachment &&
                  readonly_attachment_alias && command_dependencies && minmax_blend && !timed_out && rc >= 0

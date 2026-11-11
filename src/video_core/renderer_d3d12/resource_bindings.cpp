@@ -461,7 +461,7 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
                     CheckWrapMode(sharp.clamp_y);
                     CheckWrapMode(sharp.clamp_z);
                     const u32 xy_linear = sharp.xy_min_filter == AmdGpu::Filter::Bilinear ? 1U : 0U;
-                    const u32 z_linear = sharp.z_filter.Value() == 1U ? 1U : 0U;
+                    const u32 z_linear = sharp.z_filter == AmdGpu::ZFilter::Linear ? 1U : 0U;
                     u32 border = 0;
                     std::array<float, 4> border_float{};
                     switch (sharp.border_color_type.Value()) {

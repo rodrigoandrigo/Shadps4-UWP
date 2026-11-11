@@ -32,6 +32,7 @@ public:
         D3D12_RESOURCE_STATES stencil_state{D3D12_RESOURCE_STATE_COMMON};
         D3D12DescriptorArena descriptors, targets, depth_targets;
         D3D12DescriptorArena stencil_descriptors;
+        D3D12DescriptorArena resolve_descriptors, resolve_targets;
     };
     void Initialize(ID3D12Device* device);
     u64 MemoryBytes() const {
@@ -49,6 +50,9 @@ public:
                 DXGI_FORMAT format, bool depth, bool upload);
     void RecordStencil(ID3D12GraphicsCommandList* commands, ID3D12Resource* image,
                        Resources& resources, DXGI_FORMAT dsv_format, bool upload);
+    void RecordResolve(ID3D12GraphicsCommandList* commands, ID3D12Resource* source,
+                       ID3D12Resource* destination, Resources& resources, ID3D12Resource* fmask,
+                       DXGI_FORMAT format, u32 width, u32 height, u32 layers);
 
 private:
     struct Pipeline {
@@ -56,11 +60,12 @@ private:
         Microsoft::WRL::ComPtr<ID3D12PipelineState> state;
     };
     Pipeline& GetPipeline(DXGI_FORMAT format, u32 samples, bool integer, bool depth, bool upload,
-                          bool stencil, DXGI_FORMAT dsv_format);
+                          bool stencil, DXGI_FORMAT dsv_format, bool resolve = false);
     std::vector<u8> Compile(std::string_view source, const wchar_t* target);
     Microsoft::WRL::ComPtr<ID3D12Device> device;
     Microsoft::WRL::ComPtr<IDxcCompiler3> compiler;
     std::vector<u8> vertex, mask_shader;
-    std::map<std::tuple<DXGI_FORMAT, u32, bool, bool, bool, bool, DXGI_FORMAT>, Pipeline> pipelines;
+    std::map<std::tuple<DXGI_FORMAT, u32, bool, bool, bool, bool, DXGI_FORMAT, bool>, Pipeline>
+        pipelines;
 };
 } // namespace D3D12
