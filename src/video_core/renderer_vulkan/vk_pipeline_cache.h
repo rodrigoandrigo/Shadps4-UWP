@@ -197,6 +197,14 @@ public:
                            AmdGpu::Liverpool* liverpool, u32 sparse_page_shift);
     ~PipelineCache();
 
+    void PrecompileShaderFiles(const std::function<void(u32, u32, u32)>& progress);
+    bool PrecompileArchiveCompute(const Shader::Info& info, std::span<const u32> spv);
+    bool PrecompileArchiveGraphics(const Shader::Info* vs_info, const Shader::RuntimeInfo& vs_rt,
+                                   std::span<const u32> vs_spv,
+                                   const std::optional<Shader::Gcn::FetchShaderData>& fetch,
+                                   const Shader::Info* fs_info, const Shader::RuntimeInfo& fs_rt,
+                                   std::span<const u32> fs_spv, const GraphicsPipelineKey& key,
+                                   GraphicsPipeline::SerializationSupport& sdata);
     void WarmUp();
     void Sync();
     void DrainCompileTasks();

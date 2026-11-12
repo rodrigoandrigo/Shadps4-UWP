@@ -10,7 +10,13 @@
 
 namespace Shader::Backend::SPIRV {
 
-[[nodiscard]] std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info,
-                                         const IR::Program& program, Bindings& binding);
+struct VertexInputSnapshot {
+    AmdGpu::Buffer sharp;
+    bool per_instance;
+};
+
+[[nodiscard]] std::vector<u32> EmitSPIRV(
+    const Profile& profile, const RuntimeInfo& runtime_info, const IR::Program& program,
+    Bindings& binding, const std::vector<VertexInputSnapshot>* vertex_inputs = nullptr);
 
 } // namespace Shader::Backend::SPIRV

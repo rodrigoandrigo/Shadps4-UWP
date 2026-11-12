@@ -137,8 +137,9 @@ std::vector<u8> MsaaTransfer::Compile(std::string_view source, const wchar_t* ta
 }
 MsaaTransfer::Pipeline& MsaaTransfer::GetPipeline(DXGI_FORMAT format, u32 samples, bool integer,
                                                   bool depth, bool upload, bool stencil,
-                                                  DXGI_FORMAT dsv_format) {
-    const auto key = std::tuple{format, samples, integer, depth, upload, stencil, dsv_format};
+                                                  DXGI_FORMAT dsv_format, bool resolve) {
+    const auto key =
+        std::tuple{format, samples, integer, depth, upload, stencil, dsv_format, resolve};
     if (const auto found = pipelines.find(key); found != pipelines.end())
         return found->second;
     if (pipelines.size() >= 128)
@@ -149,7 +150,20 @@ MsaaTransfer::Pipeline& MsaaTransfer::GetPipeline(DXGI_FORMAT format, u32 sample
         type, type);
     source += "cbuffer State : register(b0) { uint layer; uint samples; uint selectedSample; uint "
               "unused; };\n";
-    if (stencil && upload)
+    if (resolve)
+        source = R"(
+Buffer<uint> fmask : register(t0);
+Texture2DMSArray<float4> image : register(t1);
+cbuffer State : register(b0) { uint layer; uint samples; uint width; uint height; };
+float4 main(float4 p : SV_Position) : SV_Target0 {
+    uint2 xy = uint2(p.xy);
+    uint map = fmask[(layer * height + xy.y) * width + xy.x];
+    float4 color = 0;
+    for (uint i = 0; i < samples; ++i)
+        color += image.Load(int3(xy, layer), (map >> (i * 4)) & 15);
+    return color / samples;
+})";
+    else if (stencil && upload)
         source += "uint main(float4 p : SV_Position, uint sample : SV_SampleIndex) : "
                   "SV_StencilRef { return planes.Load(int4(int2(p.xy), layer * samples + sample, "
                   "0)).x; }";
@@ -220,6 +234,52 @@ MsaaTransfer::Pipeline& MsaaTransfer::GetPipeline(DXGI_FORMAT format, u32 sample
     }
     winrt::check_hresult(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline.state)));
     return pipelines.emplace(key, std::move(pipeline)).first->second;
+}
+void MsaaTransfer::RecordResolve(ID3D12GraphicsCommandList* commands, ID3D12Resource* source,
+                                 ID3D12Resource* destination, Resources& resources,
+                                 ID3D12Resource* fmask, DXGI_FORMAT format, u32 width, u32 height,
+                                 u32 layers) {
+    const u32 samples = source->GetDesc().SampleDesc.Count;
+    auto& pipeline =
+        GetPipeline(format, samples, false, false, false, false, DXGI_FORMAT_UNKNOWN, true);
+    if (!resources.resolve_descriptors.Heap()) {
+        resources.resolve_descriptors.Initialize(device.Get(),
+                                                 D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, true);
+        resources.resolve_targets.Initialize(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, layers,
+                                             false);
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Format = DXGI_FORMAT_R32_UINT;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Buffer.NumElements = width * height * layers;
+    device->CreateShaderResourceView(fmask, &srv, resources.resolve_descriptors.Cpu(0));
+    srv.Format = format;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+    srv.Texture2DMSArray = {0, layers};
+    device->CreateShaderResourceView(source, &srv, resources.resolve_descriptors.Cpu(1));
+    commands->SetPipelineState(pipeline.state.Get());
+    commands->SetGraphicsRootSignature(pipeline.root.Get());
+    ID3D12DescriptorHeap* heaps[]{resources.resolve_descriptors.Heap()};
+    commands->SetDescriptorHeaps(1, heaps);
+    commands->SetGraphicsRootDescriptorTable(1, resources.resolve_descriptors.Gpu(0));
+    commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const D3D12_VIEWPORT viewport{0, 0, float(width), float(height), 0, 1};
+    const D3D12_RECT scissor{0, 0, LONG(width), LONG(height)};
+    commands->RSSetViewports(1, &viewport);
+    commands->RSSetScissorRects(1, &scissor);
+    for (u32 layer = 0; layer < layers; ++layer) {
+        const std::array<u32, 4> constants{layer, samples, width, height};
+        commands->SetGraphicsRoot32BitConstants(0, constants.size(), constants.data(), 0);
+        D3D12_RENDER_TARGET_VIEW_DESC view{};
+        view.Format = format;
+        view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+        view.Texture2DArray = {0, layer, 1, 0};
+        const auto target = resources.resolve_targets.Cpu(layer);
+        device->CreateRenderTargetView(destination, &view, target);
+        commands->OMSetRenderTargets(1, &target, FALSE, nullptr);
+        commands->DrawInstanced(3, 1, 0, 0);
+    }
 }
 void MsaaTransfer::Barrier(Resources& resources, ID3D12GraphicsCommandList* commands,
                            D3D12_RESOURCE_STATES state) {

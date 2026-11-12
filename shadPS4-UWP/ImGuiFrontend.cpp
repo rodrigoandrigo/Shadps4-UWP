@@ -58,6 +58,7 @@ std::string Label(std::string text) {
         {"pipeline_sync_budget_ms", "Synchronous pipeline budget (ms)"},
         {"readback_offload", "Readback on copy queue"},
         {"memory_swap_enabled", "Memory swap (default on Xbox)"},
+        {"memory_swap_compression", "LZ4 swap cache (64 MiB, next game start)"},
         {"show_fps_counter", "Show FPS counter"},
         {"console_language", "Console language"},
         {"volume_slider", "Volume (%)"},
@@ -81,6 +82,7 @@ std::string Label(std::string text) {
         {"gpu_id", "Graphics device"},
         {"pipeline_cache_enabled", "Enable pipeline cache"},
         {"pipeline_cache_archived", "Compress pipeline cache"},
+        {"pipeline_cache_precompile_archives", "Precompile shaders from game files (Dozen)"},
         {"use_keyboard_as_keyboard", "Use keyboard as PS4 keyboard"},
         {"use_mice_as_mice", "Use mouse as PS4 mouse"},
         {"is_circle_enter", "Use circle to confirm"},
@@ -412,6 +414,8 @@ void ImGuiFrontend::ResolveApi() {
 #define RESOLVE(member, name) member = core->GetApi<decltype(member)>(name)
     RESOLVE(get_settings, "shadps4_get_settings");
     RESOLVE(get_game_frame_count, "shadps4_get_game_frame_count");
+    RESOLVE(get_memory_stats, "shadps4_get_memory_stats");
+    RESOLVE(get_shader_compilation_status, "shadps4_get_shader_compilation_status");
     RESOLVE(request_presentation_capture, "shadps4_request_presentation_capture");
     RESOLVE(cheats_request, "shadps4_cheats_request");
     RESOLVE(set_host_state, "shadps4_set_host_state");
@@ -539,6 +543,8 @@ void ImGuiFrontend::Run(std::wstring root) {
             for (auto& update : updates)
                 update();
             if (reload_core) {
+                renderer->ReleaseImage(shader_startup_image);
+                shader_startup_visible = false;
                 worker_stopping.store(true);
                 work_ready.notify_all();
                 if (worker.joinable())
@@ -567,6 +573,18 @@ void ImGuiFrontend::Run(std::wstring root) {
                 });
             }
             const bool running = core->State() == SHADPS4_RUNNING;
+            if (shader_startup_visible) {
+                if (get_shader_compilation_status(&shader_startup_status))
+                    throw std::runtime_error("Unable to query shader compilation progress");
+                const auto current_state = core->State();
+                const bool prepared = shader_startup_status.stage == SHADPS4_SHADERS_READY ||
+                                      core->GraphicsBackend() == SHADPS4_GRAPHICS_D3D12_NATIVE;
+                if ((running && prepared && get_game_frame_count() > shader_startup_frame) ||
+                    current_state == SHADPS4_FAILED || current_state == SHADPS4_STOPPED) {
+                    renderer->ReleaseImage(shader_startup_image);
+                    shader_startup_visible = false;
+                }
+            }
             ShadPS4TextInput text_request{};
             text_request.size = sizeof(text_request);
             if (get_text_input(&text_request))
@@ -606,7 +624,7 @@ void ImGuiFrontend::Run(std::wstring root) {
                 }
             }
             const bool pressed = snapshot.keys[27];
-            if (game_running && pressed && !menu_pressed)
+            if (game_running && !shader_startup_visible && pressed && !menu_pressed)
                 menu_open = !menu_open;
             menu_pressed = pressed;
             const bool show_pointer = (!(game_running || session_pending) || menu_open || snapshot.captured);
@@ -617,7 +635,8 @@ void ImGuiFrontend::Run(std::wstring root) {
             }
             if (set_host_state(
                     !snapshot.suspended,
-                    !snapshot.active || !snapshot.visible || snapshot.captured || snapshot.system_pointer ||
+                    !snapshot.active || !snapshot.visible || snapshot.captured ||
+                        snapshot.system_pointer || shader_startup_visible ||
                         (game_running ? menu_open : io.NavActive || io.WantCaptureKeyboard)))
                 throw std::runtime_error(Utf8(core->Error()));
             if (snapshot.suspended || !snapshot.active || !snapshot.visible) {
@@ -628,8 +647,9 @@ void ImGuiFrontend::Run(std::wstring root) {
             renderer->Resize(snapshot.width, snapshot.height, snapshot.scale_x, snapshot.scale_y);
             if (game_surface)
                 core->Resize(snapshot.width, snapshot.height, snapshot.scale_x, snapshot.scale_y);
-            renderer->SetTransparent(game_running);
-            const bool show_overlay = !game_surface || !game_running || menu_open;
+            renderer->SetTransparent(game_running && !shader_startup_visible);
+            const bool show_overlay =
+                !game_surface || !game_running || menu_open || shader_startup_visible;
             if (show_overlay != overlay_visible) {
                 overlay_visible = show_overlay;
                 auto target = panel;
@@ -646,9 +666,20 @@ void ImGuiFrontend::Run(std::wstring root) {
             if (now - fps_time >= std::chrono::milliseconds(500)) {
                 const auto count = get_game_frame_count();
                 const auto seconds = std::chrono::duration<float>(now - fps_time).count();
+                static ShadPS4MemoryStats memory{};
+                ShadPS4MemoryStats sample{};
+                const auto sampled = get_memory_stats(&sample);
+                if (sampled >= 0) {
+                    memory.ram_used = sample.ram_used;
+                    memory.ram_total = sample.ram_total;
+                    if (sampled == 0) {
+                        memory.swap_used = sample.swap_used;
+                        memory.swap_total = sample.swap_total;
+                    }
+                }
                 if (set_game_fps)
-                    set_game_fps(game_running && show_fps,
-                                 (count >= fps_count ? count - fps_count : 0) / seconds);
+                    set_game_fps(game_running && show_fps && !shader_startup_visible,
+                                 (count >= fps_count ? count - fps_count : 0) / seconds, memory);
                 fps_count = count;
                 fps_time = now;
             }
@@ -660,7 +691,13 @@ void ImGuiFrontend::Run(std::wstring root) {
                            0.75f, 3.0f);
             renderer->BeginFrame(delta);
             unsigned uploads{};
-            while ((!game_running || menu_open) && !decoded.empty() && uploads < 2) {
+            while ((!game_running || menu_open || shader_startup_visible) && !decoded.empty() &&
+                   uploads < 2) {
+                if (decoded.front().key.compare(0, 8, "startup:") == 0 && !shader_startup_visible) {
+                    pending_images.erase(decoded.front().key);
+                    decoded.pop_front();
+                    continue;
+                }
                 if (!renderer->Upload(decoded.front()))
                     break;
                 pending_images.erase(decoded.front().key);
@@ -695,7 +732,7 @@ void ImGuiFrontend::Run(std::wstring root) {
         }
     }
     if (set_game_fps)
-        set_game_fps(false, 0);
+        set_game_fps(false, 0, {});
     stopping.store(true);
     work_ready.notify_all();
     if (worker.joinable())
@@ -1145,7 +1182,8 @@ ThumbnailPixels ImGuiFrontend::Decode(const std::string& key, const std::string&
     Check(frame->GetSize(&width, &height));
     if (!width || !height || width > 16384 || height > 16384)
         throw std::runtime_error("Invalid image.");
-    const auto ratio = std::min(1.0, 256.0 / std::max(width, height));
+    const double maximum = key.compare(0, 8, "startup:") == 0 ? 1024.0 : 256.0;
+    const auto ratio = std::min(1.0, maximum / std::max(width, height));
     ThumbnailPixels output{key,
                            std::max(1U, static_cast<uint32_t>(width * ratio)),
                            std::max(1U, static_cast<uint32_t>(height * ratio)),
@@ -1168,8 +1206,9 @@ ThumbnailPixels ImGuiFrontend::Decode(const std::string& key, const std::string&
     return output;
 }
 void ImGuiFrontend::RequestImage(const std::string& key, const std::string& path) {
-    if (pending_images.find(key) != pending_images.end() || pending_images.size() >= 32 ||
-        decoded.size() >= 16)
+    const bool startup = key.compare(0, 8, "startup:") == 0;
+    if (pending_images.find(key) != pending_images.end() ||
+        (!startup && (pending_images.size() >= 32 || decoded.size() >= 16)))
         return;
     const auto failure = failed_images.find(key);
     if (failure != failed_images.end() && std::chrono::steady_clock::now() < failure->second)
@@ -1184,10 +1223,17 @@ void ImGuiFrontend::RequestImage(const std::string& key, const std::string& path
                     }
                     auto pixels = Decode(key, path);
                     Complete([this, pixels = std::move(pixels), request]() mutable {
-                        if (library && library->generation == request && decoded.size() < 16)
-                            decoded.push_back(std::move(pixels));
-                        else
+                        const bool startup = pixels.key.compare(0, 8, "startup:") == 0;
+                        if (library && library->generation == request &&
+                            (startup ? shader_startup_visible && pixels.key == shader_startup_image
+                                     : decoded.size() < 16)) {
+                            if (startup)
+                                decoded.push_front(std::move(pixels));
+                            else
+                                decoded.push_back(std::move(pixels));
+                        } else {
                             pending_images.erase(pixels.key);
+                        }
                     });
                 } catch (...) {
                     Complete([this, key] {
@@ -1199,7 +1245,7 @@ void ImGuiFrontend::RequestImage(const std::string& key, const std::string& path
                     });
                 }
             },
-            true))
+            !startup))
         pending_images.insert(key);
 }
 
@@ -1300,6 +1346,10 @@ bool ImGuiFrontend::ToolbarButton(const char* label, const char* icon, bool enab
 }
 
 void ImGuiFrontend::Draw() {
+    if (shader_startup_visible) {
+        DrawShaderCompilation();
+        return;
+    }
     if (game_running && !menu_open)
         return;
     const auto display = ImGui::GetIO().DisplaySize;
@@ -1527,6 +1577,64 @@ void ImGuiFrontend::Draw() {
     }
 }
 
+void ImGuiFrontend::DrawShaderCompilation() {
+    const auto display = ImGui::GetIO().DisplaySize;
+    const float scale = ImGui::GetIO().FontGlobalScale;
+    auto* draw = ImGui::GetBackgroundDrawList();
+    auto texture = renderer->Image(shader_startup_image);
+    if (!texture)
+        texture = renderer->Image(shader_startup_fallback);
+    draw->AddRectFilled({0, 0}, display, IM_COL32(0, 0, 0, 255));
+    if (texture)
+        draw->AddImage(reinterpret_cast<ImTextureID>(texture), {0, 0}, display);
+    draw->AddRectFilledMultiColor({0, std::max(0.0f, display.y - 220 * scale)}, display,
+                                  IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0),
+                                  IM_COL32(0, 0, 0, 240), IM_COL32(0, 0, 0, 240));
+    ImGui::SetNextWindowPos({0, std::max(0.0f, display.y - 160 * scale)});
+    ImGui::SetNextWindowSize({display.x, 160 * scale});
+    ImGui::Begin("shader-startup", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBackground |
+                     ImGuiWindowFlags_NoInputs);
+    const auto centered = [&](const char* text) {
+        const float width = ImGui::CalcTextSize(text).x;
+        ImGui::SetCursorPosX(std::max(16 * scale, (display.x - width) / 2));
+        ImGui::TextUnformatted(text);
+    };
+    ImGui::PushStyleColor(ImGuiCol_Text, {1, 1, 1, 1});
+    centered(shader_startup_title.c_str());
+    const auto& progress = shader_startup_status;
+    if (progress.stage == SHADPS4_SHADERS_COMPILING) {
+        centered("Compiling shaders and pipelines…");
+        const float width = std::min(display.x - 32 * scale, 640 * scale);
+        ImGui::SetCursorPosX((display.x - width) / 2);
+        char label[128]{};
+        std::snprintf(label, sizeof(label), "%u / %u items (%u ready)", progress.processed,
+                      progress.total, progress.compiled);
+        const float fraction =
+            progress.total ? std::min(1.0f, static_cast<float>(progress.processed) / progress.total)
+                           : 0.0f;
+        ImGui::ProgressBar(fraction, {width, 24 * scale}, label);
+    } else if (progress.stage == SHADPS4_SHADERS_LOADING_CACHE) {
+        if (progress.total) {
+            centered("Scanning shader files…");
+            char label[96]{};
+            std::snprintf(label, sizeof(label), "%u / %u files", progress.processed,
+                          progress.total);
+            centered(label);
+        } else {
+            centered("Loading shader cache…");
+        }
+    } else if (progress.stage == SHADPS4_SHADERS_READY) {
+        centered(progress.total ? "Shader cache preparation complete. Starting game…"
+                                : "Starting game…");
+    } else {
+        centered("Preparing game…");
+    }
+    ImGui::PopStyleColor();
+    ImGui::End();
+}
+
 void ImGuiFrontend::DrawLibrary() {
     if (!library || !visible || visible->empty()) {
         ImGui::TextWrapped("No games found. Use File > Add game folder. For "
@@ -1670,10 +1778,18 @@ void ImGuiFrontend::StartGame() {
         return;
     }
     active_game_path = game.path;
+    shader_startup_visible = true;
+    shader_startup_frame = get_game_frame_count();
+    shader_startup_status = {sizeof(ShadPS4ShaderCompilationStatus), SHADPS4_SHADERS_PREPARING};
+    shader_startup_title = game.title;
+    shader_startup_fallback = std::to_string(library->generation) + ":" + game.path;
+    shader_startup_image = "startup:" + shader_startup_fallback;
+    if (!game.metadata_path.empty())
+        RequestImage(shader_startup_image, game.metadata_path + "/icon0.png");
     const auto executable = game.executable;
     session_pending = true;
     menu_open = false;
-    status = "Starting game...";
+    status = "Starting game…";
     const auto weak = weak_from_this();
     if (!Queue([this, executable, weak] {
             core->Run(Wide(executable), [weak](std::wstring message) {
@@ -1687,6 +1803,8 @@ void ImGuiFrontend::StartGame() {
             });
         })) {
         session_pending = false;
+        renderer->ReleaseImage(shader_startup_image);
+        shader_startup_visible = false;
         status = "The worker is busy.";
     }
 }

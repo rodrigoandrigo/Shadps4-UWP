@@ -72,9 +72,10 @@ void Name(EmitContext& ctx, Id object, std::string_view format_str, Args&&... ar
 } // Anonymous namespace
 
 EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_info_, Info& info_,
-                         Bindings& binding_)
+                         Bindings& binding_, const std::vector<VertexInputSnapshot>* vertex_inputs_)
     : Sirit::Module(profile_.supported_spirv), info{info_}, runtime_info{runtime_info_},
-      profile{profile_}, hw_stage{info.hw_stage}, sw_stage{info.sw_stage}, binding{binding_} {
+      profile{profile_}, hw_stage{info.hw_stage}, sw_stage{info.sw_stage}, binding{binding_},
+      vertex_inputs{vertex_inputs_} {
     if (info.uses_dma) {
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
     } else {
@@ -338,29 +339,35 @@ void EmitContext::DefineInputs() {
                 DefineVariable(U32[1], spv::BuiltIn::BaseInstance, spv::StorageClass::Input);
         }
 
-        if (info.has_inline_fetch_shader)
-            break;
-        Shader::Gcn::FetchShaderData parsed_fetch_shader;
-        const auto* fetch_shader = info.emit_fetch_shader;
-        if (!fetch_shader) {
-            if (!Gcn::ParseFetchShader(info, parsed_fetch_shader)) {
+        std::vector<VertexInputSnapshot> live_inputs;
+        if (!vertex_inputs) {
+            Shader::Gcn::FetchShaderData parsed_fetch_shader;
+            const auto* fetch_shader = info.emit_fetch_shader;
+            if (info.has_inline_fetch_shader ||
+                (!fetch_shader && !Gcn::ParseFetchShader(info, parsed_fetch_shader))) {
                 break;
             }
-            fetch_shader = &parsed_fetch_shader;
+            if (!fetch_shader)
+                fetch_shader = &parsed_fetch_shader;
+            for (u32 index = 0; index < fetch_shader->attributes.size(); ++index) {
+                const auto& attrib = fetch_shader->attributes[index];
+                live_inputs.push_back({info.emit_fetch_shader ? info.emit_vertex_sharps[index]
+                                                              : attrib.GetSharp(info),
+                                       attrib.GetStepRate() != Gcn::VertexAttribute::None});
+            }
         }
-        ASSERT(fetch_shader->attributes.size() <= IR::NumParams);
-        for (u32 semantic = 0; semantic < fetch_shader->attributes.size(); ++semantic) {
-            const auto& attrib = fetch_shader->attributes[semantic];
-            const auto sharp =
-                info.emit_fetch_shader ? info.emit_vertex_sharps[semantic] : attrib.GetSharp(info);
-            const Id type{GetAttributeType(*this, sharp.GetNumberFmt())[4]};
+        const auto& inputs = vertex_inputs ? *vertex_inputs : live_inputs;
+        ASSERT(inputs.size() <= IR::NumParams);
+        for (u32 semantic = 0; semantic < inputs.size(); ++semantic) {
+            const auto& input = inputs[semantic];
+            const Id type{GetAttributeType(*this, input.sharp.GetNumberFmt())[4]};
             Id id{DefineInput(type, semantic)};
-            if (attrib.GetStepRate() != Gcn::VertexAttribute::InstanceIdType::None) {
+            if (input.per_instance) {
                 Name(id, fmt::format("vs_instance_attr{}", semantic));
             } else {
                 Name(id, fmt::format("vs_in_attr{}", semantic));
             }
-            input_params[semantic] = GetAttributeInfo(sharp.GetNumberFmt(), id, 4, false);
+            input_params[semantic] = GetAttributeInfo(input.sharp.GetNumberFmt(), id, 4, false);
         }
         break;
     }

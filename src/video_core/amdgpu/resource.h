@@ -286,7 +286,7 @@ struct Image {
         if (!alt_tile_mode || dfmt == DataFormat::FormatInvalid || !IsMacroTiled(array_mode)) {
             return 0;
         }
-        const u32 bpp = NumBitsPerElement(dfmt);
+        const u32 bpp = NumBitsPerBlock(dfmt);
         const auto macro_tile_mode = CalculateMacrotileMode(tile_mode, bpp, NumSamples());
         const u32 banks = GetAltNumBanks(macro_tile_mode);
         return (((banks - 1) << 4) & base_address) >> 4;
@@ -400,6 +400,12 @@ enum class MipFilter : u64 {
     Linear = 2,
 };
 
+enum class ZFilter : u64 {
+    FollowXY = 0,
+    Point = 1,
+    Linear = 2,
+};
+
 enum class BorderColor : u64 {
     TransparentBlack = 0,
     OpaqueBlack = 1,
@@ -435,7 +441,7 @@ struct Sampler {
         BitField<14, 6, u64> lod_bias_sec;
         BitField<20, 2, Filter> xy_mag_filter;
         BitField<22, 2, Filter> xy_min_filter;
-        BitField<24, 2, u64> z_filter;
+        BitField<24, 2, ZFilter> z_filter;
         BitField<26, 2, MipFilter> mip_filter;
         BitField<28, 1, u64> mip_point_preclamp;
         BitField<29, 1, u64> disable_lsb_ceil;
@@ -451,7 +457,7 @@ struct Sampler {
 
     bool Valid() const {
         return max_aniso.Value() <= AnisoRatio::Sixteen && filter_mode.Value() <= FilterMode::Max &&
-               mip_filter.Value() <= MipFilter::Linear;
+               mip_filter.Value() <= MipFilter::Linear && z_filter.Value() <= ZFilter::Linear;
     }
 
     bool operator==(const Sampler& other) const noexcept {

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
-
+#include <optional>
 #include <span>
 #include <unordered_map>
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -206,6 +206,9 @@ public:
     void V_ADD_I32(const GcnInst& inst);
     void V_SUB_I32(const GcnInst& inst);
     void V_SUBREV_I32(const GcnInst& inst);
+    void V_ADD_CO_U32(const GcnInst& inst);
+    void V_SUB_CO_U32(const GcnInst& inst);
+    void V_SUBREV_CO_U32(const GcnInst& inst);
     void V_ADDC_U32(const GcnInst& inst);
     void V_SUBB_U32(const GcnInst& inst);
     void V_SUBBREV_U32(const GcnInst& inst);
@@ -215,6 +218,7 @@ public:
     void V_CVT_PKRTZ_F16_F32(const GcnInst& inst);
     void V_ADD_F16(const GcnInst& inst);
     void V_SUB_F16(const GcnInst& inst);
+    void V_SUBREV_F16(const GcnInst& inst);
     void V_MUL_F16(const GcnInst& inst);
     void V_MAX_F16(const GcnInst& inst);
     void V_MIN_F16(const GcnInst& inst);
@@ -298,6 +302,12 @@ public:
     void V_MED3_U32(bool is_signed, const GcnInst& inst);
     void V_SAD(const GcnInst& inst);
     void V_SAD_U32(const GcnInst& inst);
+    void V_SAD_U8(const GcnInst& inst, bool high_accumulate);
+    void V_MSAD_U8(const GcnInst& inst);
+    void V_QSAD_PK_U16_U8(const GcnInst& inst, bool masked);
+    void V_MQSAD_U32_U8(const GcnInst& inst);
+    void V_SAD_U16(const GcnInst& inst);
+    void V_LERP_U8(const GcnInst& inst);
     void V_CVT_PK_U16_U32(const GcnInst& inst);
     void V_CVT_PK_I16_I32(const GcnInst& inst);
     void V_CVT_PK_U8_F32(const GcnInst& inst);
@@ -311,7 +321,9 @@ public:
     void V_MAX_F64(const GcnInst& inst);
     void V_MUL_LO_U32(const GcnInst& inst);
     void V_MUL_HI_U32(bool is_signed, const GcnInst& inst);
+    void V_MUL_HI_24(const GcnInst& inst, bool is_signed);
     void V_MAD_U64_U32(const GcnInst& inst);
+    void V_MAD_I64_I32(const GcnInst& inst);
     void V_LSHRREV_B16(const GcnInst& inst);
     void V_ASHRREV_I16(const GcnInst& inst);
     void V_LSHLREV_B16(const GcnInst& inst);
@@ -355,6 +367,8 @@ public:
     // DS
     template <typename T = IR::U32>
     void DS_OP(const GcnInst& inst, AtomicOp op, bool rtn);
+    void DS_INC_DEC(bool decrement, bool rtn, const GcnInst& inst);
+    void DS_MSKOR(bool rtn, const GcnInst& inst);
     void DS_WRITE(int bit_size, bool is_signed, bool is_pair, bool stride64, const GcnInst& inst);
     void DS_READ(int bit_size, bool is_signed, bool is_pair, bool stride64, const GcnInst& inst);
     void DS_SWIZZLE_B32(const GcnInst& inst);
@@ -388,7 +402,7 @@ private:
     template <typename T = IR::U32>
     [[nodiscard]] T GetSrc(const InstOperand& operand, bool sgpr_oob_returns_sgpr0 = true);
     template <typename T = IR::U32, bool is_signed = false>
-    [[nodiscard]] T GetSrc16(const InstOperand& operand);
+    [[nodiscard]] T GetSrc16(const InstOperand& operand, bool allow_sdwa = false);
     template <typename T = IR::U64>
     [[nodiscard]] T GetSrc64(const InstOperand& operand);
     [[nodiscard]] IR::F32 GetSrcMix(const InstOperand& operand);
@@ -396,7 +410,7 @@ private:
     [[nodiscard]] pk_type<T> GetSrcPk(const InstOperand& operand);
     void SetDst(const InstOperand& operand, const IR::U32F32& value);
     template <bool is_signed = false>
-    void SetDst16(const InstOperand& operand, const IR::U32F32& value);
+    void SetDst16(const InstOperand& operand, const IR::U32F32& value, bool allow_sdwa = false);
     void SetDst64(const InstOperand& operand, const IR::U64F64& value_raw);
     template <typename T = IR::U32, bool is_signed = false>
     void SetDstPk(const InstOperand& operand, const pk_type<T>& value);
@@ -419,6 +433,8 @@ private:
     Info& info;
     const RuntimeInfo& runtime_info;
     const Profile& profile;
+    std::optional<IR::U1> dpp_source_lane_valid;
+    std::optional<DppOperation> dpp_operation;
     u32 next_vgpr_num;
     std::unordered_map<u32, IR::VectorReg> vgpr_map;
     std::array<IR::Attribute, MaxInterpVgpr> vgpr_to_interp{};

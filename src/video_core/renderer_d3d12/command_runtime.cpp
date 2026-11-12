@@ -11,6 +11,7 @@
 #include "common/logging/log.h"
 #include "video_core/renderer_d3d12/cmask_address.h"
 #include "video_core/renderer_d3d12/color_clear.h"
+#include "video_core/renderer_d3d12/logic_op_policy.h"
 #include "video_core/renderer_d3d12/profile.h"
 #include "video_core/renderer_d3d12/resource_bindings.h"
 #include "video_core/renderer_d3d12/temporal_jitter.h"
@@ -21,6 +22,48 @@ namespace D3D12 {
 namespace {
 Profile runtime_profile;
 std::atomic<u64> runtime_identity{1};
+
+VideoCore::ImageInfo FmaskResolveLayout(const AmdGpu::ColorBuffer& buffer,
+                                        const VideoCore::ImageInfo& source) {
+    const u32 samples = source.num_samples;
+    const u32 coverage_log2 = buffer.attrib.num_samples_log2;
+    const u32 fragments_log2 = buffer.attrib.num_fragments_log2;
+    if (!buffer.info.compression || !buffer.FmaskAddress() || coverage_log2 < 1 ||
+        coverage_log2 > 3 || fragments_log2 != coverage_log2 || samples != (1u << fragments_log2) ||
+        buffer.info.dcc_enable || buffer.info.cmask_addr_type || buffer.attrib.fmask_bank_height ||
+        buffer.info.fmask_compression_disable_ci || buffer.info.fmask_compress_1frag_only ||
+        AmdGpu::IsInteger(buffer.GetNumberFmt()))
+        throw std::runtime_error("Unsupported D3D12 FMASK resolve configuration");
+    const u32 pitch = (buffer.pitch.fmask_tile_max + 1) * 8;
+    const u32 pixels = (buffer.fmask_slice.tile_max + 1) * 64;
+    const u32 height = pixels / pitch;
+    if (!source.size.width || !source.size.height || source.size.width > pitch ||
+        source.size.height > height || pixels % pitch || height > 16384 ||
+        !source.resources.layers || source.resources.layers > 2048)
+        throw std::runtime_error("Invalid D3D12 FMASK resolve dimensions");
+    auto descriptor = AmdGpu::Image::Null(false);
+    descriptor.base_address = buffer.fmask_base_address;
+    descriptor.type = u64(AmdGpu::ImageType::Color2DArray);
+    descriptor.depth = descriptor.last_array = source.resources.layers - 1;
+    descriptor.width = pitch - 1;
+    descriptor.height = height - 1;
+    descriptor.pitch = pitch - 1;
+    descriptor.tiling_index = u32(buffer.attrib.fmask_tile_mode_index);
+    descriptor.alt_tile_mode = source.alt_tile;
+    descriptor.data_format =
+        u64(samples == 8 ? AmdGpu::DataFormat::Format32 : AmdGpu::DataFormat::Format8);
+    descriptor.num_format = u64(AmdGpu::NumberFormat::Uint);
+    if (descriptor.GetTileMode() != AmdGpu::TileMode::Thin2DThin &&
+        descriptor.GetTileMode() != AmdGpu::TileMode::Thin3DThin)
+        throw std::runtime_error("Unsupported D3D12 FMASK resolve tile mode");
+    VideoCore::ImageInfo layout{descriptor, false};
+    const auto& mip = layout.mips_layout[0];
+    const u64 expected = u64(pixels) * source.resources.layers * (layout.num_bits / 8);
+    if (mip.pitch != pitch || mip.height != height || layout.guest_size != expected ||
+        expected > 64ULL * 1024 * 1024 || buffer.FmaskAddress() > UINT64_MAX - expected)
+        throw std::runtime_error("D3D12 FMASK resolve storage differs from the descriptor");
+    return layout;
+}
 } // namespace
 CommandRuntime::CommandRuntime() = default;
 u64 CommandRuntime::NextRuntimeIdentity() {
@@ -279,6 +322,21 @@ void CommandRuntime::Initialize(ResourceCache::Read read, ResourceCache::Write w
                                 ResourceCache::Resolve resolve, ResourceCache::Overlaps overlaps) {
     if (!device.Device())
         device.Initialize();
+    if (coordinator) {
+        output_merger_logic_op_supported = coordinator->output_merger_logic_op_supported;
+        uint4_render_target_supported = coordinator->uint4_render_target_supported;
+    } else {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+        const HRESULT options_result = device.Device()->CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options));
+        output_merger_logic_op_supported = SUCCEEDED(options_result) && options.OutputMergerLogicOp;
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT uint4_format{DXGI_FORMAT_R32G32B32A32_UINT};
+        const HRESULT format_result = device.Device()->CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT, &uint4_format, sizeof(uint4_format));
+        uint4_render_target_supported =
+            SUCCEEDED(format_result) &&
+            (uint4_format.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) != 0;
+    }
     if (!coordinator)
         memory_budget.Initialize(device.Device());
     transfer_pool = std::make_shared<TransferPool>();
@@ -300,13 +358,14 @@ void CommandRuntime::Initialize(ResourceCache::Read read, ResourceCache::Write w
         device, std::move(read), std::move(write),
         [this](VAddr address, u64 size) { return resources.Canonicalize(address, size); }, &shaders,
         transfer_pool, &resources);
-    resource_descriptors.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 512,
-                                    true);
-    sampler_descriptors.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 128, true);
+    resource_descriptors.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                                    MaxResourceDescriptorCount, true);
+    sampler_descriptors.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                                   MaxSamplerDescriptorCount, true);
     color_descriptors.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 8, false);
     depth_descriptors.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2, false);
-    static_cast<void>(resource_descriptors.Allocate(512));
-    static_cast<void>(sampler_descriptors.Allocate(128));
+    static_cast<void>(resource_descriptors.Allocate(MaxResourceDescriptorCount));
+    static_cast<void>(sampler_descriptors.Allocate(MaxSamplerDescriptorCount));
     static_cast<void>(color_descriptors.Allocate(8));
     static_cast<void>(depth_descriptors.Allocate(2));
     if (std::getenv("GAME_PROFILE") &&
@@ -768,7 +827,9 @@ void CommandRuntime::Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo r
                               {},
                               &resource_descriptors,
                               &sampler_descriptors,
-                              coordinator != nullptr};
+                              coordinator != nullptr,
+                              shaders.DescriptorTier(),
+                              shaders.FeatureLevel11_1OrHigher()};
     std::vector<D3D12_ROOT_PARAMETER> parameters(2);
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[0].Constants = {0, 0, 20};
@@ -779,6 +840,7 @@ void CommandRuntime::Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo r
         if (!ranges.empty()) {
             D3D12_ROOT_PARAMETER parameter{};
             parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
             parameter.DescriptorTable = {static_cast<UINT>(ranges.size()), ranges.data()};
             parameters.push_back(parameter);
         }
@@ -890,19 +952,38 @@ void CommandRuntime::Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo r
                     nullptr, mapping_stable);
     recording.completed = true;
 }
-void CommandRuntime::Resolve(const VideoCore::ImageInfo& source,
-                             const VideoCore::ImageInfo& destination, u32 source_layer,
-                             u32 destination_layer, u32 layers) {
+void CommandRuntime::CopyDepthStencil(const VideoCore::ImageInfo& source,
+                                      const VideoCore::ImageInfo& destination, u32 base_layer,
+                                      u32 layers, bool copy_depth, bool copy_stencil) {
+    if (!copy_depth && !copy_stencil)
+        return;
     auto lock = ProfileSample(runtime_profile, "runtime_lock", 512,
                               [&] { return std::unique_lock{mutex}; });
     if (failed)
         throw std::runtime_error(
             "D3D12 command runtime requires recreation after recording failure");
     MaintainMemory();
+
+    const auto append_range = [](std::vector<ResourceCache::Range>& ranges, VAddr address,
+                                 u64 size) {
+        if (address && size)
+            ranges.push_back({address, size});
+    };
+    std::vector<ResourceCache::Range> reads;
+    std::vector<ResourceCache::Range> writes;
+    const auto append_image_reads = [&](const VideoCore::ImageInfo& info) {
+        append_range(reads, info.guest_address, info.guest_size);
+        append_range(reads, info.stencil_addr, info.stencil_size);
+    };
+    append_image_reads(source);
+    append_image_reads(destination);
+    if (copy_depth)
+        append_range(writes, destination.guest_address, destination.guest_size);
+    if (copy_stencil)
+        append_range(writes, destination.stencil_addr, destination.stencil_size);
+
     if (!contexts.empty()) {
-        const ResourceCache::Range target{destination.guest_address, destination.guest_size};
-        const ResourceCache::Range input{source.guest_address, source.guest_size};
-        auto& context = NextContext({&target, 1}, {&input, 1});
+        auto& context = NextContext(writes, reads);
         struct Scope {
             bool& active;
             ~Scope() {
@@ -910,7 +991,7 @@ void CommandRuntime::Resolve(const VideoCore::ImageInfo& source,
             }
         } scope{context.recording_context};
         context.recording_context = true;
-        context.Resolve(source, destination, source_layer, destination_layer, layers);
+        context.CopyDepthStencil(source, destination, base_layer, layers, copy_depth, copy_stencil);
         return;
     }
     DrainContexts();
@@ -918,21 +999,146 @@ void CommandRuntime::Resolve(const VideoCore::ImageInfo& source,
         throw std::runtime_error(
             "D3D12 command runtime requires recreation after recording failure");
     BeginImages();
-    const std::array<ResourceCache::Range, 2> access_ranges{
-        {{source.guest_address, source.guest_size},
-         {destination.guest_address, destination.guest_size}}};
+    SynchronizeImages(reads, true);
+    SynchronizeBuffers(reads, true);
+    const auto memory_access = acquire_memory ? acquire_memory(reads) : nullptr;
+    auto& input = images.GetImage(source, ConvertFormat(source.pixel_format),
+                                  D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, base_layer, layers);
+    auto& output = images.GetImage(destination, ConvertFormat(destination.pixel_format),
+                                   D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, base_layer, layers);
 
+    winrt::check_hresult(allocator->Reset());
+    winrt::check_hresult(commands->Reset(allocator.Get(), nullptr));
+    BeginGpuTiming();
+    RecordingGuard recording{*this};
+    images.CopyDepthStencil(input, output, commands.Get(), copy_depth, copy_stencil);
+    images.PrepareDownloads(commands.Get());
+    EndGpuTiming();
+    winrt::check_hresult(commands->Close());
+    ProfileSample(runtime_profile, "runtime_submit_wait", 128,
+                  [&] { device.Wait(SubmitCommands()); });
+    CompleteImages();
+    recording.completed = true;
+}
+void CommandRuntime::Resolve(const VideoCore::ImageInfo& source,
+                             const VideoCore::ImageInfo& destination, u32 source_layer,
+                             u32 destination_layer, u32 layers, const AmdGpu::ColorBuffer* fmask) {
+    auto lock = ProfileSample(runtime_profile, "runtime_lock", 512,
+                              [&] { return std::unique_lock{mutex}; });
+    if (failed)
+        throw std::runtime_error(
+            "D3D12 command runtime requires recreation after recording failure");
+    MaintainMemory();
+    const auto metadata = fmask ? std::optional{FmaskResolveLayout(*fmask, source)} : std::nullopt;
+    const ResourceCache::Range metadata_range{metadata ? metadata->guest_address : 0,
+                                              metadata ? metadata->guest_size : 0};
+    if (!contexts.empty()) {
+        const ResourceCache::Range target{destination.guest_address, destination.guest_size};
+        const std::array<ResourceCache::Range, 2> inputs{
+            {{source.guest_address, source.guest_size}, metadata_range}};
+        auto& context = NextContext({&target, 1}, std::span{inputs}.first(metadata ? 2 : 1));
+        struct Scope {
+            bool& active;
+            ~Scope() {
+                active = false;
+            }
+        } scope{context.recording_context};
+        context.recording_context = true;
+        context.Resolve(source, destination, source_layer, destination_layer, layers, fmask);
+        return;
+    }
+    DrainContexts();
+    if (failed)
+        throw std::runtime_error(
+            "D3D12 command runtime requires recreation after recording failure");
+    BeginImages();
+    const std::array<ResourceCache::Range, 3> access_ranges{
+        {{source.guest_address, source.guest_size},
+         {destination.guest_address, destination.guest_size},
+         metadata_range}};
+    const auto color_ranges = std::span{access_ranges}.first(2);
+    SynchronizeImages(color_ranges, true);
+    SynchronizeBuffers(color_ranges, true);
+    if (metadata) {
+        if (resources.Aliases(metadata_range.address, metadata_range.size, source.guest_address,
+                              source.guest_size) ||
+            resources.Aliases(metadata_range.address, metadata_range.size,
+                              destination.guest_address, destination.guest_size))
+            throw std::runtime_error("D3D12 FMASK resolve metadata overlaps color");
+        SynchronizeImages({&metadata_range, 1}, false);
+        SynchronizeBuffers({&metadata_range, 1}, false);
+    }
+    const auto memory_access =
+        acquire_memory ? acquire_memory(std::span{access_ranges}.first(metadata ? 3 : 2)) : nullptr;
     auto& input = images.GetImage(source, ConvertFormat(source.pixel_format),
                                   D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, source_layer, layers);
     auto& output =
         images.GetImage(destination, ConvertFormat(destination.pixel_format),
                         D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, destination_layer, layers);
-    const auto memory_access = acquire_memory ? acquire_memory(access_ranges) : nullptr;
+    if (metadata) {
+        if (input.base_layer > metadata->resources.layers ||
+            input.native_layers > metadata->resources.layers - input.base_layer)
+            throw std::runtime_error("D3D12 FMASK resolve layers exceed guest metadata");
+    }
+    D3D12Resource fmask_upload;
+    if (metadata) {
+        const u32 width = source.size.width, height = source.size.height;
+        const u64 entries = u64(width) * height * input.native_layers;
+        if (entries > (64ULL * 1024 * 1024) / sizeof(u32))
+            throw std::runtime_error("D3D12 FMASK resolve upload exceeds budget");
+        std::vector<u8> tiled(metadata->guest_size), linear(metadata->guest_size);
+        read(metadata_range.address, tiled);
+        VideoCore::ConvertTiling(tiled, linear, *metadata, false);
+        const u32 coverage_samples = 1u << fmask->attrib.num_samples_log2;
+        const u32 fragment_count = 1u << fmask->attrib.num_fragments_log2;
+        if (coverage_samples != source.num_samples || fragment_count != source.num_samples)
+            throw std::runtime_error(
+                "D3D12 FMASK resolve requires equal coverage and fragment counts");
+        const u32 sample_bits = coverage_samples == 8 ? 4 : coverage_samples == 4 ? 2 : 1;
+        const auto& mip = metadata->mips_layout[0];
+        const u32 metadata_bytes_per_pixel = metadata->num_bits / 8;
+        if (metadata_bytes_per_pixel != 1 && metadata_bytes_per_pixel != 4)
+            throw std::runtime_error("Unsupported D3D12 FMASK metadata element size");
+        std::vector<u32> maps;
+        maps.reserve(entries);
+        for (u32 layer = 0; layer < input.native_layers; ++layer)
+            for (u32 y = 0; y < height; ++y)
+                for (u32 x = 0; x < width; ++x) {
+                    const u64 metadata_layer = u64(input.base_layer) + layer;
+                    const u64 pixel = (metadata_layer * mip.height + y) * mip.pitch + x;
+                    const u64 offset = pixel * metadata_bytes_per_pixel;
+                    if (offset > linear.size() || metadata_bytes_per_pixel > linear.size() - offset)
+                        throw std::runtime_error("D3D12 FMASK sample map exceeds guest metadata");
+                    u32 raw{};
+                    std::memcpy(&raw, linear.data() + offset, metadata_bytes_per_pixel);
+                    u32 map{};
+                    for (u32 sample = 0; sample < coverage_samples; ++sample) {
+                        const u32 fragment =
+                            (raw >> (sample * sample_bits)) & ((1u << sample_bits) - 1);
+                        if (fragment >= fragment_count)
+                            throw std::runtime_error(
+                                "D3D12 FMASK resolve found an invalid fragment");
+                        map |= fragment << (sample * 4);
+                    }
+                    maps.push_back(map);
+                }
+        const u64 bytes = maps.size() * sizeof(u32);
+        fmask_upload = transfer_pool->Acquire(bytes, D3D12_HEAP_TYPE_UPLOAD);
+        void* mapped{};
+        const D3D12_RANGE empty{};
+        winrt::check_hresult(fmask_upload->Map(0, &empty, &mapped));
+        std::memcpy(mapped, maps.data(), bytes);
+        const D3D12_RANGE written{0, SIZE_T(bytes)};
+        fmask_upload->Unmap(0, &written);
+    }
     winrt::check_hresult(allocator->Reset());
     winrt::check_hresult(commands->Reset(allocator.Get(), nullptr));
     BeginGpuTiming();
     RecordingGuard recording{*this};
-    images.Resolve(input, output, commands.Get());
+    auto* fmask_resource = fmask_upload.Get();
+    if (fmask_resource)
+        input_resources.push_back(std::move(fmask_upload));
+    images.Resolve(input, output, commands.Get(), fmask_resource);
     images.PrepareDownloads(commands.Get());
     EndGpuTiming();
     winrt::check_hresult(commands->Close());

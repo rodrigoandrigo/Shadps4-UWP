@@ -8,9 +8,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <vector>
+#include "pager_pool.h"
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -25,8 +27,11 @@
 namespace Xbox {
 
 struct PagerCounters {
-	std::atomic<uint64_t> swept {0}, evicted {0}, aborted {0}, page_ins {0}, page_in_ns {0}, read_hits {0}, written {0}, read {0}, errors {0};
-	// a window that was written while it was copied out (caught, the eviction is dropped); a slot that came back different from what was written
+    std::atomic<uint64_t> pool_bytes{}, pool_raw{}, pool_hits{}, pool_misses{}, pool_dropped{},
+        pool_skipped{}, pool_bad{};
+    std::atomic<uint64_t> swept{0}, evicted{0}, aborted{0}, page_ins{0}, page_in_ns{0},
+        read_hits{0}, written{0}, read{0}, errors{0};
+    // a window that was written while it was copied out (caught, the eviction is dropped); a slot that came back different from what was written
 	std::atomic<uint64_t> torn {0}, corrupt {0};
 	// windows evicted on the spot because a commit failed (Regions::MakeRoom); they are in `evicted` too
 	std::atomic<uint64_t> emergency {0};
@@ -38,7 +43,14 @@ class PagerStore {
 public:
 	static constexpr uint64_t kSlotSize = uint64_t {64} * 1024;
 
-	~PagerStore() { Close(); }
+    ~PagerStore() {
+        Close();
+    }
+    void EnableCompression(bool enabled) {
+        pool.reset();
+        if (enabled)
+            pool = std::make_unique<PagerPool>(64ULL << 20);
+    }
 
 #if defined(_WIN32)
 	// Creates the file (deleted when the process ends). False when that fails.
@@ -81,8 +93,10 @@ public:
 		return m_next++;
 	}
 	void Free(uint32_t slot) {
-		std::lock_guard lock(m_mutex);
-		if (slot >= m_next || m_allocated[slot] == 0) {
+        if (pool)
+            pool->Drop(slot, counters);
+        std::lock_guard lock(m_mutex);
+        if (slot >= m_next || m_allocated[slot] == 0) {
 			counters.errors++;
 			return;
 		}
@@ -117,10 +131,36 @@ public:
 		return m_in_use;
 	}
 
-	bool Write(uint32_t slot, const void* data, uint64_t size) {
-		return Transfer(slot, 0, const_cast<void*>(data), size, true);
-	}
-	bool Read(uint32_t slot, uint64_t offset, void* data, uint64_t size) { return Transfer(slot, offset, data, size, false); }
+    bool Statistics(uint64_t& used, uint64_t& total) const {
+        std::unique_lock lock(m_mutex, std::try_to_lock);
+        if (!lock.owns_lock())
+            return false;
+        used = m_in_use * kSlotSize;
+        LARGE_INTEGER length{};
+        total =
+            IsOpen() && GetFileSizeEx(m_file, &length) ? static_cast<uint64_t>(length.QuadPart) : 0;
+        return true;
+    }
+
+    bool Write(uint32_t slot, const void* data, uint64_t size) {
+        const bool written = Transfer(slot, 0, const_cast<void*>(data), size, true);
+        if (written && pool)
+            pool->Put(slot, data, size, counters);
+        return written;
+    }
+    bool Read(uint32_t slot, uint64_t offset, void* data, uint64_t size) {
+        if (pool && offset == 0 && size == kSlotSize) {
+            if (pool->Read(slot, data, counters))
+                return true;
+            ++counters.pool_misses;
+        }
+        return Transfer(slot, offset, data, size, false);
+    }
+    bool ReadFromFile(uint32_t slot, void* data, uint64_t size) {
+        if (pool)
+            pool->Drop(slot, counters);
+        return Transfer(slot, 0, data, size, false);
+    }
 #endif
 
 	PagerCounters counters;
@@ -156,8 +196,9 @@ private:
 		return true;
 	}
 
-	HANDLE                m_file = INVALID_HANDLE_VALUE;
-	mutable std::mutex    m_mutex;
+    std::unique_ptr<PagerPool> pool;
+    HANDLE m_file = INVALID_HANDLE_VALUE;
+    mutable std::mutex    m_mutex;
 	std::vector<uint32_t> m_free;
 	std::vector<uint64_t> m_sums;
 	std::vector<uint8_t> m_allocated;

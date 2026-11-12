@@ -1465,11 +1465,12 @@ void ImageCache::PrepareDownloads(ID3D12GraphicsCommandList* commands) {
         }
     }
 }
-void ImageCache::Resolve(Image& source, Image& destination, ID3D12GraphicsCommandList* commands) {
+void ImageCache::Resolve(Image& source, Image& destination, ID3D12GraphicsCommandList* commands,
+                         ID3D12Resource* fmask) {
     const bool multisampled = bool(source.msaa);
-    if (destination.msaa || (multisampled && destination.info.props.is_volume) ||
-        source.info.props.is_depth || destination.info.props.is_depth ||
-        source.info.size.width != destination.info.size.width ||
+    if (destination.msaa || (fmask && !multisampled) ||
+        (multisampled && destination.info.props.is_volume) || source.info.props.is_depth ||
+        destination.info.props.is_depth || source.info.size.width != destination.info.size.width ||
         source.info.size.height != destination.info.size.height ||
         source.native_layers != destination.native_layers ||
         source.info.pixel_format != destination.info.pixel_format)
@@ -1479,12 +1480,20 @@ void ImageCache::Resolve(Image& source, Image& destination, ID3D12GraphicsComman
         D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
         winrt::check_hresult(device->Device()->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,
                                                                    &support, sizeof(support)));
-        if (!(support.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE))
+        const auto required = fmask ? D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD
+                                    : D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE;
+        if (!(support.Support1 & required))
             throw std::runtime_error("D3D12 format does not support multisample color resolve");
     }
     Upload(source, commands);
     Upload(destination, commands);
-    if (multisampled) {
+    if (fmask) {
+        Barrier(source, commands, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        Barrier(destination, commands, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        transfers.RecordResolve(commands, source.Native(), destination.Native(), *source.msaa,
+                                fmask, format, source.info.size.width, source.info.size.height,
+                                source.native_layers);
+    } else if (multisampled) {
         Barrier(source, commands, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
         Barrier(destination, commands, D3D12_RESOURCE_STATE_RESOLVE_DEST);
         for (u32 layer = 0; layer < source.native_layers; ++layer) {
@@ -1515,6 +1524,72 @@ void ImageCache::Resolve(Image& source, Image& destination, ID3D12GraphicsComman
         }
     }
     destination.written = true;
+}
+void ImageCache::CopyDepthStencil(Image& source, Image& destination,
+                                  ID3D12GraphicsCommandList* commands, bool copy_depth,
+                                  bool copy_stencil) {
+    if (!copy_depth && !copy_stencil)
+        return;
+    const auto source_desc = source.Native()->GetDesc();
+    const auto destination_desc = destination.Native()->GetDesc();
+    if (!source.info.props.is_depth || !destination.info.props.is_depth ||
+        source.info.pixel_format != destination.info.pixel_format ||
+        source.info.size.width != destination.info.size.width ||
+        source.info.size.height != destination.info.size.height ||
+        source.info.num_samples != destination.info.num_samples ||
+        source.info.resources.levels != destination.info.resources.levels ||
+        source.native_layers != destination.native_layers ||
+        source.base_layer != destination.base_layer || source.has_depth != destination.has_depth ||
+        source.has_stencil != destination.has_stencil ||
+        source_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        destination_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        source_desc.Width != destination_desc.Width ||
+        source_desc.Height != destination_desc.Height ||
+        source_desc.DepthOrArraySize != destination_desc.DepthOrArraySize ||
+        source_desc.MipLevels != destination_desc.MipLevels ||
+        source_desc.Format != destination_desc.Format ||
+        source_desc.SampleDesc.Count != destination_desc.SampleDesc.Count ||
+        source_desc.SampleDesc.Quality != destination_desc.SampleDesc.Quality)
+        throw std::runtime_error("Invalid D3D12 depth/stencil override copy source or destination");
+    if ((copy_depth && (!source.has_depth || !destination.has_depth)) ||
+        (copy_stencil && (!source.has_stencil || !destination.has_stencil)))
+        throw std::runtime_error("D3D12 depth/stencil override copy requires a missing plane");
+    if (source.Native() == destination.Native())
+        return;
+
+    Upload(source, commands);
+    Upload(destination, commands);
+    Barrier(source, commands, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Barrier(destination, commands, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    const auto copy_subresource = [&](u32 source_subresource, u32 destination_subresource) {
+        D3D12_TEXTURE_COPY_LOCATION source_location{};
+        source_location.pResource = source.Native();
+        source_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        source_location.SubresourceIndex = source_subresource;
+        D3D12_TEXTURE_COPY_LOCATION destination_location{};
+        destination_location.pResource = destination.Native();
+        destination_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        destination_location.SubresourceIndex = destination_subresource;
+        // Depth/stencil and MSAA copies must cover the entire subresource.
+        commands->CopyTextureRegion(&destination_location, 0, 0, 0, &source_location, nullptr);
+    };
+    for (u32 layer = 0; layer < source.native_layers; ++layer) {
+        if (copy_depth) {
+            copy_subresource(DepthSubresource(0, layer, source.info.resources.levels),
+                             DepthSubresource(0, layer, destination.info.resources.levels));
+        }
+        if (copy_stencil) {
+            copy_subresource(
+                StencilSubresource(0, layer, source.info.resources.levels, source.native_layers),
+                StencilSubresource(0, layer, destination.info.resources.levels,
+                                   destination.native_layers));
+        }
+    }
+    if (copy_depth)
+        destination.written = true;
+    if (copy_stencil)
+        destination.stencil_written = true;
 }
 void ImageCache::RetireUploads(u64 fence) {
     transfer_fence = fence;

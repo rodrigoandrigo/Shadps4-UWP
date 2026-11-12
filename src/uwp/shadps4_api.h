@@ -86,6 +86,33 @@ SHADPS4_API int32_t __cdecl shadps4_configure_native_temporal_jitter(
 SHADPS4_API int32_t __cdecl shadps4_get_native_temporal_jitter(
     ShadPS4TemporalJitterSample* sample, int32_t completed_frame);
 
+enum ShadPS4ShaderCompilationStage {
+    SHADPS4_SHADERS_IDLE,
+    SHADPS4_SHADERS_PREPARING,
+    SHADPS4_SHADERS_LOADING_CACHE,
+    SHADPS4_SHADERS_COMPILING,
+    SHADPS4_SHADERS_READY,
+    SHADPS4_SHADERS_FAILED,
+};
+
+typedef struct ShadPS4ShaderCompilationStatus {
+    uint32_t size;
+    uint32_t stage;
+    uint32_t processed;
+    uint32_t total;
+    uint32_t compiled;
+} ShadPS4ShaderCompilationStatus;
+
+SHADPS4_API int32_t __cdecl shadps4_get_shader_compilation_status(
+    ShadPS4ShaderCompilationStatus* status);
+
+typedef struct ShadPS4MemoryStats {
+    uint64_t ram_used;
+    uint64_t ram_total;
+    uint64_t swap_used;
+    uint64_t swap_total;
+} ShadPS4MemoryStats;
+SHADPS4_API int32_t __cdecl shadps4_get_memory_stats(ShadPS4MemoryStats* stats);
 SHADPS4_API uint64_t __cdecl shadps4_get_game_frame_count(void);
 SHADPS4_API int32_t __cdecl shadps4_request_presentation_capture(void);
 SHADPS4_API int32_t __cdecl shadps4_cheats_request(const char* request, char* response,

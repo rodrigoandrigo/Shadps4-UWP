@@ -68,18 +68,24 @@ void uwp_memory_set_log(void (*callback)(const char*)) {
 }
 
 int uwp_memory_init(uint64_t size, uint64_t direct, uintptr_t canonical, const char* path,
-                    int enabled) {
+                    int enabled, int compression, uint64_t ceiling) {
     return Guard([&] {
         if (MemoryState().load(std::memory_order_acquire)) {
             SetLastError(ERROR_ALREADY_INITIALIZED);
             return false;
         }
         auto current = std::make_shared<Core::Uwp::GuestMemory>(size, direct, canonical);
+        if (const auto* value = std::getenv("SHADPS4_UWP_APP_LIMIT_MB")) {
+            const auto configured = std::strtoull(value, nullptr, 10);
+            if (configured >= 512 && configured <= 4800)
+                ceiling = configured << 20;
+        }
+        current->SetCeiling(ceiling);
         const char* configured = std::getenv("SHADPS4_UWP_SWAP_FILE");
         if (configured && *configured)
             path = configured;
         const char* flag = std::getenv("SHADPS4_UWP_SWAP");
-        enabled = enabled && !(flag && *flag == '0');
+        enabled = ceiling || (enabled && !(flag && *flag == '0'));
         if (enabled) {
             const auto length =
                 MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, nullptr, 0);
@@ -90,6 +96,13 @@ int uwp_memory_init(uint64_t size, uint64_t direct, uintptr_t canonical, const c
                                      length) ||
                 !current->OpenStore(wide.data()))
                 return false;
+        }
+        if (enabled && compression) {
+            try {
+                current->EnableCompression(true);
+            } catch (const std::bad_alloc&) {
+                uwp_memory_log_diagnostic("[KytyMemory] LZ4 cache unavailable; using disk swap");
+            }
         }
         MemoryState().store(std::move(current), std::memory_order_release);
         return true;
@@ -233,6 +246,16 @@ uint64_t uwp_memory_reclaim(uint64_t bytes, int urgent) {
         return true;
     });
     return reclaimed;
+}
+
+int uwp_memory_swap_statistics(uint64_t* used, uint64_t* total) {
+    if (!used || !total)
+        return 0;
+    *used = *total = 0;
+    return Guard([&] {
+        auto current = MemoryState().load(std::memory_order_acquire);
+        return !current || current->SwapStatistics(*used, *total);
+    });
 }
 
 void uwp_memory_report(void) {

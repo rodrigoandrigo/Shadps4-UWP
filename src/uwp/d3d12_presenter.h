@@ -55,12 +55,14 @@ private:
     void WaitForFrameUse(const Frame& frame);
     void GetBuffers();
     void RenderFrame();
+    void RenderFrameCore();
     void ResizeBuffers(uint32_t width, uint32_t height, DXGI_FORMAT format);
     std::array<float, 1024> ColorComponents(const Frame& frame, bool floating_point) const;
     std::vector<u8> ConvertPixels(const Frame& frame, bool floating_point) const;
     std::shared_ptr<Frame> last_frame;
     std::shared_ptr<std::atomic<u64>> frame_bytes{std::make_shared<std::atomic<u64>>(0)};
     bool float_supported{};
+    bool occluded{};
     bool hdr_enabled{};
     float sdr_white_nits{80.0f};
     std::atomic_bool hdr_display{};

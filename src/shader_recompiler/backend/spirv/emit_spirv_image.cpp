@@ -192,7 +192,7 @@ Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id c
 }
 
 Id EmitImageSampleDrefImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id dref,
-                                  Id bias, const IR::Value& offset) {
+                                  Id bias, const IR::Value& offset, const IR::Value& lod_clamp) {
     RequireSampledReadOnly(ctx, handle);
     const auto& texture = ctx.images[handle & 0xFFFF];
     const Id image = ctx.OpLoad(texture.image_type, texture.id);
@@ -203,6 +203,12 @@ Id EmitImageSampleDrefImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, 
     ImageOperands operands;
     operands.Add(spv::ImageOperandsMask::Bias, bias);
     operands.AddOffset(ctx, texture.view_type, offset);
+    if (!lod_clamp.IsEmpty()) {
+        if (!ctx.profile.supports_image_sample_min_lod)
+            throw std::runtime_error("Image comparison LOD clamp is unsupported by this profile");
+        ctx.AddCapability(spv::Capability::MinLod);
+        operands.Add(spv::ImageOperandsMask::MinLod, ctx.Def(lod_clamp));
+    }
     const Id sample = ctx.OpImageSampleDrefImplicitLod(result_type, sampled_image, fixed_coords,
                                                        dref, operands.mask, operands.operands);
     const Id sample_typed = texture.is_integer ? ctx.OpBitcast(ctx.F32[1], sample) : sample;
@@ -314,22 +320,35 @@ Id EmitImageQueryLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, co
 }
 
 Id EmitImageGradient(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id derivatives_dx,
-                     Id derivatives_dy, const IR::Value& offset, const IR::Value& lod_clamp) {
+                     Id derivatives_dy, const IR::Value& offset, const IR::Value& depth_and_clamp) {
     RequireSampledReadOnly(ctx, handle);
     const auto& texture = ctx.images[handle & 0xFFFF];
+    const auto flags = inst->Flags<IR::TextureInstInfo>();
+    const bool comparison = flags.is_depth;
     const Id image = ctx.OpLoad(texture.image_type, texture.id);
-    const Id result_type = texture.data_types->Get(4);
+    const Id result_type = texture.data_types->Get(comparison ? 1 : 4);
     const Id sampler = ctx.OpLoad(ctx.sampler_type, ctx.samplers[handle >> 16]);
     const Id sampled_image = ctx.OpSampledImage(texture.sampled_type, image, sampler);
     const Id fixed_coords = FixImageCoords<true>(ctx, coords, texture.view_type);
     ImageOperands operands;
     operands.AddDerivatives(ctx, texture.view_type, derivatives_dx, derivatives_dy);
     operands.AddOffset(ctx, texture.view_type, offset);
-    if (!lod_clamp.IsEmpty()) {
+    if (flags.has_lod_clamp) {
         if (!ctx.profile.supports_image_sample_min_lod)
             throw std::runtime_error("Image gradient LOD clamp is unsupported by this profile");
         ctx.AddCapability(spv::Capability::MinLod);
-        operands.Add(spv::ImageOperandsMask::MinLod, ctx.Def(lod_clamp));
+        const Id clamp = comparison
+                             ? ctx.OpCompositeExtract(ctx.F32[1], ctx.Def(depth_and_clamp), 1)
+                             : ctx.Def(depth_and_clamp);
+        operands.Add(spv::ImageOperandsMask::MinLod, clamp);
+    }
+    if (comparison) {
+        const Id dref = ctx.OpCompositeExtract(ctx.F32[1], ctx.Def(depth_and_clamp), 0);
+        const Id sample = ctx.OpImageSampleDrefExplicitLod(result_type, sampled_image, fixed_coords,
+                                                           dref, operands.mask, operands.operands);
+        const Id value = texture.is_integer ? ctx.OpBitcast(ctx.F32[1], sample) : sample;
+        return ctx.OpCompositeConstruct(ctx.F32[4], value, ctx.f32_zero_value, ctx.f32_zero_value,
+                                        ctx.f32_zero_value);
     }
     const Id sample = ctx.OpImageSampleExplicitLod(result_type, sampled_image, fixed_coords,
                                                    operands.mask, operands.operands);

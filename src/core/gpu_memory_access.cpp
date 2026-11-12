@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include "common/alignment.h"
 #include "common/signal_context.h"
+#include "core/gpu_memory_watch.h"
 #include "core/memory.h"
 #include "core/signals.h"
 #include "video_core/gpu_memory_sink.h"
@@ -327,17 +328,24 @@ bool MemoryManager::HandleGpuAccessFault(void* context, VAddr address) {
         waited = true;
         gpu_access_cv.wait(lock);
     }
-    const bool image_fault = std::ranges::any_of(gpu_image_ranges, [&](const auto& watched) {
-        return address >= watched.range.address &&
-               address - watched.range.address < watched.range.size &&
-               (watched.dirty || Common::IsWriteError(context));
-    });
-    if (image_fault && rasterizer) {
-        const bool write = Common::IsWriteError(context);
+    const bool write = Common::IsWriteError(context);
+    const bool execute = Common::IsExecuteError(context);
+    std::vector<GpuImageWatch> image_page_faults;
+    for (const auto& watched : gpu_image_ranges) {
+        if (GpuMemoryWatch::ProtectionPageOverlapsRange(address, watched.range.address,
+                                                        watched.range.size) &&
+            (write || (watched.dirty && !execute))) {
+            image_page_faults.push_back({watched.range.address, watched.range.size, watched.dirty});
+        }
+    }
+    if (!image_page_faults.empty() && rasterizer) {
         lock.unlock();
-        const auto access = rasterizer->AcquireCpuAccess(Common::AlignDown(address, u64{4096}),
-                                                         4096, write);
-        return bool(access);
+        for (const auto& watched : image_page_faults) {
+            const auto access = rasterizer->AcquireCpuAccess(watched.address, watched.size, write);
+            if (!access)
+                return false;
+        }
+        return true;
     }
     if (waited)
         return true;

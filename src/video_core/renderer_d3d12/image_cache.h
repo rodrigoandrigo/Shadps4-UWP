@@ -4,6 +4,7 @@
 
 #include <map>
 #include <memory>
+#include "video_core/renderer_d3d12/descriptor_limits.h"
 #include "video_core/renderer_d3d12/msaa_transfer.h"
 #include "video_core/renderer_d3d12/resource_cache.h"
 #include "video_core/renderer_d3d12/tiling_runtime.h"
@@ -12,7 +13,7 @@
 namespace D3D12 {
 class ImageCache {
 public:
-    void SetAsyncRecording(bool enabled, u32 limit = 64) {
+    void SetAsyncRecording(bool enabled, u32 limit = MinImageCacheEntriesForMaxDraw) {
         async_recording = enabled;
         image_limit = limit;
     }
@@ -93,14 +94,17 @@ public:
     void PrepareDownloads(ID3D12GraphicsCommandList* commands);
     void CommitDownloads();
     void RetireUploads(u64 fence);
-    void Resolve(Image& source, Image& destination, ID3D12GraphicsCommandList* commands);
+    void Resolve(Image& source, Image& destination, ID3D12GraphicsCommandList* commands,
+                 ID3D12Resource* fmask = nullptr);
+    void CopyDepthStencil(Image& source, Image& destination, ID3D12GraphicsCommandList* commands,
+                          bool copy_depth, bool copy_stencil);
     const std::vector<u8>& MaskShader() const {
         return transfers.MaskShader();
     }
 
 private:
     bool async_recording{};
-    u32 image_limit{64};
+    u32 image_limit{MinImageCacheEntriesForMaxDraw};
     bool Overlaps(const Image& image, VAddr address, u64 size) const;
     void Synchronize(Image& image);
     bool persistent{};

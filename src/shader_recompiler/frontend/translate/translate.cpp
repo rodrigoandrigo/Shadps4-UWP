@@ -6,6 +6,11 @@
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
+#include "shader_recompiler/frontend/translate/dpp_subset.h"
+#include "shader_recompiler/frontend/translate/sdwa_f16.h"
+#include "shader_recompiler/frontend/translate/sdwa_selector.h"
+#include "shader_recompiler/frontend/translate/sdwa_vop1.h"
+#include "shader_recompiler/frontend/translate/sdwa_vopc.h"
 #include "shader_recompiler/frontend/translate/translate.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/attribute.h"
@@ -25,13 +30,181 @@ namespace Shader::Gcn {
 
 static std::pair<u32, u32> SdwaLayout(SdwaSelector selector) {
     const auto value = u32(selector);
-    if (value < 4)
-        return {value * 8, 8};
-    if (value < 6)
-        return {(value - 4) * 16, 16};
-    if (selector == SdwaSelector::Dword)
-        return {0, 32};
-    throw std::runtime_error("Invalid SDWA operand selector");
+    SdwaSelectorLayout::BitRange range{};
+    if (!SdwaSelectorLayout::TryGetBitRange(value, range))
+        throw std::runtime_error("Invalid SDWA operand selector");
+    return {range.offset, range.width};
+}
+
+static bool IsSdwaF16SubsetOpcode(Opcode opcode) {
+    switch (opcode) {
+    case Opcode::V_ADD_F16:
+    case Opcode::V_SUB_F16:
+    case Opcode::V_SUBREV_F16:
+    case Opcode::V_MUL_F16:
+    case Opcode::V_MAX_F16:
+    case Opcode::V_MIN_F16:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool HasSdwa(const GcnInst& inst) {
+    const auto is_sdwa = [](const InstOperand& operand) {
+        return operand.sdwa_present || operand.sdwa_sel != SdwaSelector::Invalid;
+    };
+    return std::ranges::any_of(inst.src, is_sdwa) || std::ranges::any_of(inst.dst, is_sdwa);
+}
+
+static void ValidateSdwaF16Subset(const GcnInst& inst, const Profile& profile) {
+    if (!profile.supports_sdwa_f16_subset) {
+        throw std::runtime_error("SDWA F16 lowering is disabled for this shader profile");
+    }
+    const auto valid_source = [](const InstOperand& operand) {
+        u32 unused_offset{};
+        const bool valid =
+            operand.sdwa_present && operand.field == OperandField::VectorGPR &&
+            SdwaF16::TryWordOffset(static_cast<u32>(operand.sdwa_sel), unused_offset) &&
+            !operand.input_modifier.sext;
+        (void)unused_offset;
+        return valid;
+    };
+    if (!valid_source(inst.src[0]) || !valid_source(inst.src[1]) || !inst.dst[0].sdwa_present ||
+        inst.dst[0].field != OperandField::VectorGPR) {
+        throw std::runtime_error("SDWA F16 requires two VGPR WORD sources and a VGPR destination");
+    }
+    for (size_t index = 2; index < inst.src.size(); ++index) {
+        if (inst.src[index].sdwa_present || inst.src[index].sdwa_sel != SdwaSelector::Invalid) {
+            throw std::runtime_error("SDWA F16 subset does not accept additional SDWA sources");
+        }
+    }
+    u32 unused_offset{};
+    SdwaF16::DestinationMode destination_mode{};
+    const bool valid_destination =
+        SdwaF16::TryWordOffset(static_cast<u32>(inst.dst[0].sdwa_sel), unused_offset) &&
+        SdwaF16::TryDestinationMode(static_cast<u32>(inst.dst[0].sdwa_dst), destination_mode) &&
+        inst.dst[0].output_modifier.multiplier == 0.0f;
+    (void)unused_offset;
+    (void)destination_mode;
+    if (!valid_destination) {
+        throw std::runtime_error("SDWA F16 supports WORD destinations with PAD/SEXT/PRESERVE only");
+    }
+}
+
+static bool HasSdwaInputModifier(const InstOperand& operand) {
+    return operand.input_modifier.abs || operand.input_modifier.neg ||
+           operand.input_modifier.neg_hi || operand.input_modifier.sext;
+}
+
+static void ValidateSdwaVop1Subset(const GcnInst& inst, const Profile& profile) {
+    if (!profile.supports_sdwa_vop1_subset) {
+        throw std::runtime_error("SDWA VOP1 lowering is disabled for this shader profile");
+    }
+    if (inst.encoding != InstEncoding::VOP1 || !SdwaVop1::IsSupportedOpcode(inst.opcode)) {
+        throw std::runtime_error("SDWA VOP1 opcode is outside the validated subset");
+    }
+
+    const auto& src0 = inst.src[0];
+    SdwaSelectorLayout::BitRange source_range{};
+    if (!src0.sdwa_present || src0.sdwa_reserved_bits || src0.field != OperandField::VectorGPR ||
+        src0.code > 255 || !SdwaSelectorLayout::TryGetBitRange(u32(src0.sdwa_sel), source_range) ||
+        src0.dpp || src0.input_modifier.neg_hi) {
+        throw std::runtime_error(
+            "SDWA VOP1 requires a VGPR src0, selector 0..6, and zero reserved bits");
+    }
+    if (!SdwaVop1::SupportsFloatInputModifiers(inst.opcode) &&
+        (src0.input_modifier.abs || src0.input_modifier.neg)) {
+        throw std::runtime_error("SDWA VOP1 ABS/NEG are limited to handlers consuming FP32 src0");
+    }
+
+    const auto& unused_src1 = inst.src[1];
+    if (!unused_src1.sdwa_present || unused_src1.field != OperandField::VectorGPR ||
+        unused_src1.sdwa_sel != SdwaSelector::Byte0 || HasSdwaInputModifier(unused_src1) ||
+        unused_src1.dpp) {
+        throw std::runtime_error("SDWA VOP1 has no src1; its encoded src1 fields must be zero");
+    }
+    for (size_t index = 2; index < inst.src.size(); ++index) {
+        if (inst.src[index].sdwa_present || inst.src[index].sdwa_sel != SdwaSelector::Invalid ||
+            inst.src[index].dpp) {
+            throw std::runtime_error("SDWA VOP1 subset does not accept additional sources");
+        }
+    }
+
+    const auto& dst = inst.dst[0];
+    const bool common_destination = dst.sdwa_present && dst.field == OperandField::VectorGPR &&
+                                    !dst.output_modifier.clamp &&
+                                    dst.output_modifier.multiplier == 0.0f;
+    bool valid_destination = common_destination && dst.sdwa_sel == SdwaSelector::Dword &&
+                             dst.sdwa_dst == SdwaDstUnused::Pad;
+    if (inst.opcode == Opcode::V_CVT_F16_F32) {
+        u32 unused_offset{};
+        SdwaF16::DestinationMode destination_mode{};
+        valid_destination =
+            common_destination && profile.supports_sdwa_f16_subset &&
+            SdwaF16::TryWordOffset(static_cast<u32>(dst.sdwa_sel), unused_offset) &&
+            SdwaF16::TryDestinationMode(static_cast<u32>(dst.sdwa_dst), destination_mode);
+        (void)unused_offset;
+        (void)destination_mode;
+    }
+    if (!valid_destination) {
+        throw std::runtime_error("Invalid SDWA VOP1 destination selection or modifier");
+    }
+    for (size_t index = 1; index < inst.dst.size(); ++index) {
+        if (inst.dst[index].sdwa_present || inst.dst[index].sdwa_sel != SdwaSelector::Invalid) {
+            throw std::runtime_error("SDWA VOP1 subset does not accept additional destinations");
+        }
+    }
+}
+
+static void ValidateSdwaVopcSubset(const GcnInst& inst, const Profile& profile) {
+    if (!profile.supports_sdwa_vopc_subset) {
+        throw std::runtime_error("SDWA VOPC/VCC lowering is disabled without D3D12 wave64");
+    }
+    if (inst.encoding != InstEncoding::VOPC || !SdwaVopcPolicy::IsSupportedOpcode(inst.opcode)) {
+        throw std::runtime_error("SDWA VOPC opcode is outside the validated 32-bit compare subset");
+    }
+
+    const auto& src0 = inst.src[0];
+    const auto& src1 = inst.src[1];
+    SdwaSelectorLayout::BitRange src0_range{};
+    SdwaSelectorLayout::BitRange src1_range{};
+    if (!src0.sdwa_present || src0.sdwa_reserved_bits || src0.field != OperandField::VectorGPR ||
+        src0.code > 255 || !SdwaSelectorLayout::TryGetBitRange(u32(src0.sdwa_sel), src0_range) ||
+        src0.dpp || src0.input_modifier.neg_hi) {
+        throw std::runtime_error(
+            "SDWA VOPC requires a VGPR src0, selector 0..6 and zero reserved bits");
+    }
+    if (!src1.sdwa_present || src1.field != OperandField::VectorGPR || src1.code > 255 ||
+        !SdwaSelectorLayout::TryGetBitRange(u32(src1.sdwa_sel), src1_range) || src1.dpp ||
+        src1.input_modifier.neg_hi) {
+        throw std::runtime_error("SDWA VOPC requires a VGPR src1 with selector 0..6");
+    }
+
+    if (SdwaVopcPolicy::IsFloatCompare(inst.opcode)) {
+        if (src0.input_modifier.sext || src1.input_modifier.sext) {
+            throw std::runtime_error("SDWA VOPC FP32 compares do not accept SEXT");
+        }
+    } else if (SdwaVopcPolicy::IsClassCompare(inst.opcode)) {
+        if (src0.input_modifier.sext || src1.input_modifier.abs || src1.input_modifier.neg) {
+            throw std::runtime_error(
+                "SDWA V_CMP_CLASS_F32 requires FP32 src0 and integer/raw class-mask src1");
+        }
+    } else if (src0.input_modifier.abs || src0.input_modifier.neg || src1.input_modifier.abs ||
+               src1.input_modifier.neg) {
+        throw std::runtime_error("SDWA VOPC integer compares accept SEXT, not FP ABS/NEG");
+    }
+
+    if (inst.dst[0].field != OperandField::VccLo || inst.dst[1].field != OperandField::VccLo ||
+        inst.dst[1].type != ScalarType::Uint64) {
+        throw std::runtime_error("SDWA VOPC subset requires the VCC destination (SD=0)");
+    }
+    for (size_t index = 2; index < inst.src.size(); ++index) {
+        if (inst.src[index].sdwa_present || inst.src[index].sdwa_sel != SdwaSelector::Invalid ||
+            inst.src[index].dpp) {
+            throw std::runtime_error("SDWA VOPC subset does not accept additional sources");
+        }
+    }
 }
 
 static IR::VectorReg IterateBarycentrics(const RuntimeInfo& runtime_info, auto&& set_attribute) {
@@ -482,6 +655,104 @@ T Translator::GetSrc(const InstOperand& operand, bool sgpr_oob_returns_sgpr0) {
         UNREACHABLE_MSG("Unexpected operand: {}", std::to_underlying(operand.field));
     }
 
+    if (operand.dpp) {
+        const auto& dpp = *operand.dpp;
+        if (!profile.supports_dpp_subset || !IsSupportedDppControl(dpp)) {
+            throw std::runtime_error("Unsupported DPP control reached operand lowering");
+        }
+        const IR::U32 lane_id{ir.LaneId()};
+        const auto [requested_source_lane, source_in_bounds] = [&] {
+            if (dpp.op == DppCtrl::DppQuadPerm) {
+                const IR::U32 quad_lane{ir.BitwiseAnd(lane_id, ir.Imm32(3U))};
+                const IR::U32 source_lane_in_quad{ir.BitwiseAnd(
+                    ir.ShiftRightLogical(ir.Imm32(dpp.value),
+                                         ir.ShiftLeftLogical(quad_lane, ir.Imm32(1U))),
+                    ir.Imm32(3U))};
+                const IR::U32 source_lane{
+                    ir.BitwiseOr(ir.BitwiseAnd(lane_id, ir.Imm32(~3U)), source_lane_in_quad)};
+                return std::pair{source_lane, ir.Imm1(true)};
+            }
+            const IR::U32 row_lane{ir.BitwiseAnd(lane_id, ir.Imm32(0xFU))};
+            const IR::U32 row_base{ir.BitwiseAnd(lane_id, ir.Imm32(~0xFU))};
+            const IR::U32 shift{ir.Imm32(dpp.value)};
+            const auto [source_row_lane, source_in_bounds] = [&]() {
+                switch (dpp.op) {
+                case DppCtrl::DppRowShl: {
+                    const IR::U1 in_bounds{
+                        ir.ILessThan(row_lane, ir.Imm32(16U - dpp.value), false)};
+                    return std::pair{ir.IAdd(row_lane, shift), in_bounds};
+                }
+                case DppCtrl::DppRowShr: {
+                    const IR::U1 in_bounds{ir.IGreaterThanEqual(row_lane, shift, false)};
+                    return std::pair{ir.ISub(row_lane, shift), in_bounds};
+                }
+                case DppCtrl::DppRowRor:
+                    return std::pair{ir.BitwiseAnd(ir.ISub(row_lane, shift), ir.Imm32(0xFU)),
+                                     ir.Imm1(true)};
+                case DppCtrl::DppRowMirror:
+                    return std::pair{ir.BitwiseXor(row_lane, ir.Imm32(0xFU)), ir.Imm1(true)};
+                case DppCtrl::DppRowHalfMirror:
+                    return std::pair{ir.BitwiseXor(row_lane, ir.Imm32(0x7U)), ir.Imm1(true)};
+                case DppCtrl::DppRowBcast15: {
+                    const IR::U1 write_lane{ir.IGreaterThanEqual(lane_id, ir.Imm32(16U), false)};
+                    return std::pair{ir.ISub(row_base, ir.Imm32(1U)), write_lane};
+                }
+                case DppCtrl::DppRowBcast31: {
+                    const IR::U1 write_lane{ir.IGreaterThanEqual(lane_id, ir.Imm32(32U), false)};
+                    return std::pair{IR::U32U64{ir.Imm32(31U)}, write_lane};
+                }
+                case DppCtrl::DppWaveShl: {
+                    const IR::U1 in_bounds{ir.ILessThan(lane_id, ir.Imm32(63U), false)};
+                    return std::pair{ir.IAdd(lane_id, ir.Imm32(1U)), in_bounds};
+                }
+                case DppCtrl::DppWaveShr: {
+                    const IR::U1 in_bounds{ir.IGreaterThanEqual(lane_id, ir.Imm32(1U), false)};
+                    return std::pair{ir.ISub(lane_id, ir.Imm32(1U)), in_bounds};
+                }
+                case DppCtrl::DppWaveRol:
+                    return std::pair{ir.BitwiseAnd(ir.IAdd(lane_id, ir.Imm32(1U)), ir.Imm32(0x3FU)),
+                                     ir.Imm1(true)};
+                case DppCtrl::DppWaveRor:
+                    return std::pair{ir.BitwiseAnd(ir.ISub(lane_id, ir.Imm32(1U)), ir.Imm32(0x3FU)),
+                                     ir.Imm1(true)};
+                default:
+                    throw std::runtime_error("Unsupported DPP lane permutation");
+                }
+            }();
+            const bool global_source_index =
+                dpp.op == DppCtrl::DppWaveShl || dpp.op == DppCtrl::DppWaveShr ||
+                dpp.op == DppCtrl::DppWaveRol || dpp.op == DppCtrl::DppWaveRor ||
+                dpp.op == DppCtrl::DppRowBcast15 || dpp.op == DppCtrl::DppRowBcast31;
+            const IR::U32 requested_source_lane{
+                global_source_index ? source_row_lane : ir.BitwiseOr(row_base, source_row_lane)};
+            return std::pair{requested_source_lane, source_in_bounds};
+        }();
+        // A select after WaveReadLaneAt cannot make a read from an inactive lane defined.
+        // Check EXEC first and use the current active lane as a safe source when the DPP
+        // source is out of bounds or inactive.
+        const IR::U32 ballot_source_lane{
+            ir.Select(source_in_bounds, requested_source_lane, lane_id)};
+        const IR::U64 active_lanes{ir.Ballot(ir.GetExec())};
+        const IR::U64 source_active_bit{ir.BitwiseAnd(
+            ir.ShiftRightLogical(active_lanes, ballot_source_lane), ir.Imm64(u64{1}))};
+        const IR::U1 source_active{ir.INotEqual(source_active_bit, ir.Imm64(u64{0}))};
+        const IR::U1 source_valid{ir.LogicalAnd(source_in_bounds, source_active)};
+        const IR::U32 safe_source_lane{ir.Select(source_valid, ballot_source_lane, lane_id)};
+        dpp_source_lane_valid = source_valid;
+        const IR::U32 source_bits = [&] {
+            if constexpr (is_float)
+                return ir.BitCast<IR::U32>(IR::F32{value});
+            else
+                return IR::U32{value};
+        }();
+        const IR::U32 shuffled{ir.Shuffle(source_bits, safe_source_lane)};
+        const IR::U32 selected{ir.Select(source_valid, shuffled, ir.Imm32(0U))};
+        if constexpr (is_float)
+            value = ir.BitCast<IR::F32>(selected);
+        else
+            value = selected;
+    }
+
     if (operand.sdwa_sel != SdwaSelector::Invalid) {
         const auto [offset, width] = SdwaLayout(operand.sdwa_sel);
         IR::U32 bits;
@@ -525,10 +796,35 @@ template IR::U32 Translator::GetSrc<IR::U32>(const InstOperand&, bool);
 template IR::F32 Translator::GetSrc<IR::F32>(const InstOperand&, bool);
 
 template <typename T, bool is_signed>
-T Translator::GetSrc16(const InstOperand& operand) {
-    if (operand.sdwa_sel != SdwaSelector::Invalid)
-        throw std::runtime_error("SDWA requires a validated lowering for this operand width");
+T Translator::GetSrc16(const InstOperand& operand, bool allow_sdwa) {
+    if (operand.dpp)
+        throw std::runtime_error("DPP requires a validated 32-bit lowering");
     constexpr bool is_float = std::is_same_v<T, IR::F32>;
+    const bool has_sdwa = operand.sdwa_present || operand.sdwa_sel != SdwaSelector::Invalid;
+    if (has_sdwa) {
+        if (!allow_sdwa)
+            throw std::runtime_error("SDWA requires a validated lowering for this operand width");
+        if (!profile.supports_sdwa_f16_subset)
+            throw std::runtime_error("SDWA F16 lowering is disabled for this shader profile");
+        if constexpr (!is_float) {
+            throw std::runtime_error("SDWA word selection is supported only for F16 arithmetic");
+        } else {
+            u32 offset{};
+            if (operand.field != OperandField::VectorGPR || operand.input_modifier.sext ||
+                !SdwaF16::TryWordOffset(static_cast<u32>(operand.sdwa_sel), offset)) {
+                throw std::runtime_error(
+                    "SDWA F16 source requires a VGPR WORD selector without SEXT");
+            }
+            const auto packed = ir.GetVectorReg<IR::U32>(IR::VectorReg(operand.code));
+            T selected = IR::F32{ir.CompositeExtract(
+                ir.Unpack2x16(AmdGpu::NumberFormat::Float, packed), offset / 16)};
+            if (operand.input_modifier.abs)
+                selected = ir.FPAbs(selected);
+            if (operand.input_modifier.neg)
+                selected = ir.FPNeg(selected);
+            return selected;
+        }
+    }
 
     const auto get_imm = [&](auto value) -> T {
         if constexpr (is_float) {
@@ -657,9 +953,9 @@ T Translator::GetSrc16(const InstOperand& operand) {
     return value;
 }
 
-template IR::U32 Translator::GetSrc16<IR::U32, false>(const InstOperand&);
-template IR::U32 Translator::GetSrc16<IR::U32, true>(const InstOperand&);
-template IR::F32 Translator::GetSrc16<IR::F32, false>(const InstOperand&);
+template IR::U32 Translator::GetSrc16<IR::U32, false>(const InstOperand&, bool);
+template IR::U32 Translator::GetSrc16<IR::U32, true>(const InstOperand&, bool);
+template IR::F32 Translator::GetSrc16<IR::F32, false>(const InstOperand&, bool);
 
 IR::F32 Translator::GetSrcMix(const InstOperand& operand) {
     const auto get_imm = [&](auto value) -> IR::F32 {
@@ -1040,6 +1336,50 @@ void Translator::SetDst(const InstOperand& operand, const IR::U32F32& value) {
         }
     }
 
+    if (dpp_operation) {
+        if (operand.field != OperandField::VectorGPR || operand.sdwa_sel != SdwaSelector::Invalid ||
+            operand.output_modifier.clamp || operand.output_modifier.multiplier != 0.0f ||
+            !dpp_source_lane_valid) {
+            throw std::runtime_error("DPP destination requires a validated 32-bit VGPR result");
+        }
+        const IR::VectorReg dst{operand.code};
+        const IR::U32 old_value{ir.GetVectorReg<IR::U32>(dst)};
+        const IR::U32 new_value{result.Type() == IR::Type::F32
+                                    ? ir.BitCast<IR::U32>(IR::F32{result})
+                                    : IR::U32{result}};
+        const auto& dpp = *dpp_operation;
+        const IR::U32 lane_id{ir.LaneId()};
+        const IR::U32 row_index{ir.ShiftRightLogical(lane_id, ir.Imm32(4U))};
+        const IR::U32 row_mask_bit{
+            ir.BitwiseAnd(ir.ShiftRightLogical(ir.Imm32(dpp.row_mask), row_index), ir.Imm32(1U))};
+        const IR::U1 row_mask_enabled{ir.INotEqual(row_mask_bit, ir.Imm32(0U))};
+        const IR::U32 bank_index{
+            ir.ShiftRightLogical(ir.BitwiseAnd(lane_id, ir.Imm32(0xFU)), ir.Imm32(2U))};
+        const IR::U32 bank_mask_bit{
+            ir.BitwiseAnd(ir.ShiftRightLogical(ir.Imm32(dpp.bank_mask), bank_index), ir.Imm32(1U))};
+        const IR::U1 bank_mask_enabled{ir.INotEqual(bank_mask_bit, ir.Imm32(0U))};
+        const IR::U1 dpp_updates_destination{[&] {
+            switch (dpp.op) {
+            case DppCtrl::DppRowBcast15:
+                return ir.IGreaterThanEqual(lane_id, ir.Imm32(16U), false);
+            case DppCtrl::DppRowBcast31:
+                return ir.IGreaterThanEqual(lane_id, ir.Imm32(32U), false);
+            default:
+                return ir.Imm1(true);
+            }
+        }()};
+        const IR::U1 bound_control_updates_destination{dpp.bc ? ir.Imm1(true)
+                                                              : dpp_source_lane_valid.value()};
+        const IR::U1 update_destination{ir.LogicalAnd(
+            ir.GetExec(),
+            ir.LogicalAnd(dpp_updates_destination,
+                          ir.LogicalAnd(row_mask_enabled,
+                                        ir.LogicalAnd(bank_mask_enabled,
+                                                      bound_control_updates_destination))))};
+        ir.SetVectorReg(dst, IR::U32{ir.Select(update_destination, new_value, old_value)});
+        return;
+    }
+
     if (operand.sdwa_sel != SdwaSelector::Invalid) {
         if (operand.field != OperandField::VectorGPR)
             throw std::runtime_error("SDWA output requires a vector register");
@@ -1085,9 +1425,24 @@ void Translator::SetDst(const InstOperand& operand, const IR::U32F32& value) {
 }
 
 template <bool is_signed>
-void Translator::SetDst16(const InstOperand& operand, const IR::U32F32& value) {
-    if (operand.sdwa_sel != SdwaSelector::Invalid)
+void Translator::SetDst16(const InstOperand& operand, const IR::U32F32& value, bool allow_sdwa) {
+    const bool has_sdwa = operand.sdwa_present || operand.sdwa_sel != SdwaSelector::Invalid;
+    if (has_sdwa && !allow_sdwa)
         throw std::runtime_error("SDWA requires a validated lowering for this operand width");
+    if (has_sdwa) {
+        u32 unused_offset{};
+        SdwaF16::DestinationMode destination_mode{};
+        const bool valid_destination =
+            profile.supports_sdwa_f16_subset && operand.field == OperandField::VectorGPR &&
+            SdwaF16::TryWordOffset(static_cast<u32>(operand.sdwa_sel), unused_offset) &&
+            SdwaF16::TryDestinationMode(static_cast<u32>(operand.sdwa_dst), destination_mode) &&
+            operand.output_modifier.multiplier == 0.0f;
+        (void)unused_offset;
+        (void)destination_mode;
+        if (!valid_destination) {
+            throw std::runtime_error("Unsupported SDWA F16 destination selection or modifier");
+        }
+    }
     IR::U32F32 result = value;
     if (value.Type() == IR::Type::F32) {
         if (operand.output_modifier.multiplier != 0.f) {
@@ -1120,6 +1475,12 @@ void Translator::SetDst16(const InstOperand& operand, const IR::U32F32& value) {
         }
     };
 
+    const auto result_16 = cast(result);
+    if (has_sdwa) {
+        SetDst(operand, result_16);
+        return;
+    }
+
     const auto op_sel = operand.op_sel.op_sel;
 
     switch (operand.field) {
@@ -1127,14 +1488,12 @@ void Translator::SetDst16(const InstOperand& operand, const IR::U32F32& value) {
         if (!IsScalarGprAllocated(operand.code))
             return;
         const auto prev_dst = ir.GetScalarReg<IR::U32>(IR::ScalarReg(operand.code));
-        const auto result_16 = cast(result);
         const auto new_dst =
             ir.BitFieldInsert(prev_dst, result_16, ir.Imm32(op_sel ? 16 : 0), ir.Imm32(16));
         return ir.SetScalarReg(IR::ScalarReg(operand.code), new_dst);
     }
     case OperandField::VectorGPR: {
         const auto prev_dst = ir.GetVectorReg<IR::U32>(IR::VectorReg(operand.code));
-        const auto result_16 = cast(result);
         const auto new_dst =
             ir.BitFieldInsert(prev_dst, result_16, ir.Imm32(op_sel ? 16 : 0), ir.Imm32(16));
         return ir.SetVectorReg(IR::VectorReg(operand.code), new_dst);
@@ -1144,8 +1503,8 @@ void Translator::SetDst16(const InstOperand& operand, const IR::U32F32& value) {
     }
 }
 
-template void Translator::SetDst16<false>(const InstOperand&, const IR::U32F32& value);
-template void Translator::SetDst16<true>(const InstOperand&, const IR::U32F32& value);
+template void Translator::SetDst16<false>(const InstOperand&, const IR::U32F32& value, bool);
+template void Translator::SetDst16<true>(const InstOperand&, const IR::U32F32& value, bool);
 
 void Translator::SetDst64(const InstOperand& operand, const IR::U64F64& value_raw) {
     if (operand.sdwa_sel != SdwaSelector::Invalid)
@@ -1260,7 +1619,7 @@ void Translator::EmitFetch(const GcnInst& inst) {
         }
         const auto* code = GetFetchShaderCode(info, code_sgpr_base);
         GcnCodeSlice slice(code, code + std::numeric_limits<u32>::max());
-        GcnDecodeContext decoder;
+        GcnDecodeContext decoder{profile.guest_isa_generation};
 
         // Decode and save instructions
         while (!slice.atEnd()) {
@@ -1342,8 +1701,59 @@ void Translator::Translate(IR::Block* block, u32 start_pc, IR::Condition cond,
 }
 
 void Translator::TranslateInstruction(const GcnInst& inst) {
-    if (std::ranges::any_of(inst.src, [](const auto& operand) { return operand.dpp.has_value(); }))
-        throw std::runtime_error("DPP instruction requires a validated cross-lane lowering");
+    dpp_source_lane_valid.reset();
+    dpp_operation.reset();
+    if (HasSdwa(inst) && IsSdwaF16SubsetOpcode(inst.opcode)) {
+        ValidateSdwaF16Subset(inst, profile);
+    }
+    if (HasSdwa(inst) && !IsSdwaF16SubsetOpcode(inst.opcode) &&
+        (profile.supports_sdwa_vop1_subset || profile.supports_sdwa_vopc_subset)) {
+        if (inst.encoding == InstEncoding::VOP1) {
+            ValidateSdwaVop1Subset(inst, profile);
+        } else if (inst.encoding == InstEncoding::VOPC) {
+            ValidateSdwaVopcSubset(inst, profile);
+        } else {
+            throw std::runtime_error("SDWA encoding is outside the validated D3D12 subsets");
+        }
+    }
+    const bool has_dpp =
+        std::ranges::any_of(inst.src, [](const auto& operand) { return operand.dpp.has_value(); });
+    if (has_dpp) {
+        if (!profile.supports_dpp_subset || info.hw_stage != HwStage::Compute) {
+            throw std::runtime_error("DPP requires the D3D12 compute wave64 capability profile");
+        }
+        const bool is_vop1 = inst.encoding == InstEncoding::VOP1;
+        const bool supported_opcode =
+            (is_vop1 && IsSupportedDppVop1Opcode(inst.opcode)) ||
+            (inst.encoding == InstEncoding::VOP2 && IsSupportedDppVop2Opcode(inst.opcode));
+        if (!supported_opcode || !inst.src[0].dpp || inst.src[1].dpp || inst.src[2].dpp ||
+            inst.src[3].dpp || (is_vop1 && inst.src[1].field != OperandField::Undefined) ||
+            inst.src[0].field != OperandField::VectorGPR ||
+            inst.src[0].sdwa_sel != SdwaSelector::Invalid ||
+            inst.dst[0].field != OperandField::VectorGPR ||
+            inst.dst[0].sdwa_sel != SdwaSelector::Invalid || inst.dst[0].output_modifier.clamp ||
+            inst.dst[0].output_modifier.multiplier != 0.0f) {
+            throw std::runtime_error("Unsupported DPP VOP1/VOP2 opcode or operand combination");
+        }
+        if (is_vop1 && HasDppInputModifier(inst.src[1])) {
+            throw std::runtime_error("DPP VOP1 has no src1 operand or src1 modifiers");
+        }
+        const bool supports_float_modifiers = is_vop1
+                                                  ? SupportsDppVop1FloatInputModifiers(inst.opcode)
+                                                  : SupportsDppFloatInputModifiers(inst.opcode);
+        if (!supports_float_modifiers &&
+            (HasDppInputModifier(inst.src[0]) || (!is_vop1 && HasDppInputModifier(inst.src[1])))) {
+            throw std::runtime_error(
+                "DPP ABS/NEG modifiers are enabled only for validated floating-point inputs");
+        }
+        const auto& dpp = *inst.src[0].dpp;
+        if (!IsSupportedDppControl(dpp)) {
+            throw std::runtime_error(
+                "DPP supports quad_perm, row_shl/row_shr/row_ror:1..15, row mirrors, "
+                "row_bcast, or wave shifts/rotates with 4-bit row/bank masks and FI=0");
+        }
+        dpp_operation = dpp;
+    }
     // Emit instructions for each category.
     switch (inst.category) {
     case InstCategory::DataShare:

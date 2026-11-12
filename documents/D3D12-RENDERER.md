@@ -1,5 +1,12 @@
 # Renderer D3D12: estado de implementação
 
+## Reference integration — 2026-11-12
+
+Integrated the production renderer changes from `Shadps4-UWP-D3d12`, together with the required fetch-descriptor, sampler-register, index-prefix, MSAA-transfer, and device-context dependencies from `Shadps4-UWP-UWP`. This includes stricter capability and guest-ISA gates, indirect draw-index forwarding, attachment/view validation, manual sampling and stencil policies, and controlled presentation/device-loss handling. SM6.4 remains supported where the device provides the required operations; wave64-dependent paths are checked rather than assumed. These changes do not establish complete emulation or Xbox validation.
+
+The shared command processor continues to omit GPU synchronization for `ACQUIRE_MEM` and `PFP_SYNC_ME`. Current Dozen loading, asynchronous Vulkan compilation, memory management, and RAM/swap statistics are preserved. The UWP startup compilation screen and optional shader-file precompilation are described in the [UWP README](../shadPS4-UWP/README.md#shader-preparation-at-game-startup).
+
+
 Integração de 24/10/2026: [melhorias do EXODUS](EXODUS-INTEGRATION.md).
 O recompilador compartilhado recebeu correções de fluxo, PHI, barreiras de memória,
 derivadas coarse e indefinidos de 64 bits. `fast_shader_math` é opcional e permanece

@@ -12,6 +12,7 @@
 #include <vector>
 #include "lazyCounters.h"
 #include "lazyRegions.h"
+#include "pagerRules.h"
 #include "pagerStore.h"
 
 namespace Core::Uwp {
@@ -25,6 +26,16 @@ public:
     ~GuestMemory() override;
 
     bool OpenStore(const wchar_t* path);
+    void EnableCompression(bool enabled) {
+        store.EnableCompression(enabled);
+    }
+    void SetCeiling(uint64_t bytes) {
+        app_ceiling = bytes;
+        UpdatePressure();
+    }
+    bool ReadStored(uint64_t window, uint32_t slot, void* data);
+    void NoteReturn(uint64_t window);
+    void NoteEviction(uint64_t window);
     bool Map(uintptr_t address, uint64_t size, uint64_t physical, int protection);
     bool Unmap(uintptr_t address, uint64_t size);
     bool ProtectRange(uintptr_t address, uint64_t size, int protection);
@@ -37,6 +48,13 @@ public:
     void Start();
     void Stop();
     void Report(void (*log)(const char*));
+    bool SwapStatistics(uint64_t& used, uint64_t& total) const {
+        return store.Statistics(used, total);
+    }
+
+    bool PreferEviction(uint64_t window) const override {
+        return window_history[window].shield_until <= GetTickCount64();
+    }
 
 private:
     struct VirtualPage {
@@ -169,6 +187,18 @@ private:
     uint64_t app_usage{};
     uint64_t app_limit{};
     uint64_t app_target{};
+    uint64_t app_ceiling{};
+    uint64_t sampled_resident{};
+    struct WindowHistory {
+        uint64_t left{};
+        uint64_t swept_at{};
+        uint64_t shield_until{};
+        uint8_t quick{};
+        uint8_t reads{};
+    };
+    std::vector<WindowHistory> window_history;
+    uint64_t quick_returns{};
+    Xbox::Pager::IdleTime idle_time;
     uint64_t budget{};
     uint64_t configured_budget{};
     bool budget_initialized{};

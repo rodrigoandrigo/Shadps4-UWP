@@ -381,6 +381,15 @@ U32U64 IREmitter::SharedAtomicXor(const U32& address, const U32U64& data, bool i
     }
 }
 
+U32 IREmitter::SharedAtomicSwap(const U32& address, const U32& value, bool is_gds) {
+    return Inst<U32>(Opcode::SharedAtomicSwap32, Flags{is_gds}, address, value);
+}
+
+U32 IREmitter::SharedAtomicMskor32(const U32& address, const U32& data0, const U32& data1,
+                                   bool is_gds) {
+    return Inst<U32>(Opcode::SharedAtomicMskor32, Flags{is_gds}, address, data0, data1);
+}
+
 U32U64 IREmitter::SharedAtomicISub(const U32& address, const U32U64& data, bool is_gds) {
     switch (data.Type()) {
     case Type::U32:
@@ -417,6 +426,14 @@ U64 IREmitter::SharedAtomicInc(const U32& address, bool is_gds) {
 template <>
 U32 IREmitter::SharedAtomicDec(const U32& address, bool is_gds) {
     return Inst<U32>(Opcode::SharedAtomicDec32, Flags{is_gds}, address);
+}
+
+U32 IREmitter::SharedAtomicIncLimit32(const U32& address, const U32& limit, bool is_gds) {
+    return Inst<U32>(Opcode::SharedAtomicIncLimit32, Flags{is_gds}, address, limit);
+}
+
+U32 IREmitter::SharedAtomicDecLimit32(const U32& address, const U32& limit, bool is_gds) {
+    return Inst<U32>(Opcode::SharedAtomicDecLimit32, Flags{is_gds}, address, limit);
 }
 
 template <>
@@ -631,6 +648,11 @@ Value IREmitter::BufferAtomicXor(const Value& handle, const Value& address, cons
 Value IREmitter::BufferAtomicSwap(const Value& handle, const Value& address, const Value& value,
                                   BufferInstInfo info) {
     return Inst(Opcode::BufferAtomicSwap32, Flags{info}, handle, address, value);
+}
+
+Value IREmitter::BufferAtomicMskor(const Value& handle, const Value& address, const Value& data0,
+                                   const Value& data1, BufferInstInfo info) {
+    return Inst(Opcode::BufferAtomicMskor32, Flags{info}, handle, address, data0, data1);
 }
 
 Value IREmitter::BufferAtomicCmpSwap(const Value& handle, const Value& address, const Value& vdata,
@@ -2148,9 +2170,9 @@ Value IREmitter::ImageSampleExplicitLod(const Value& handle, const Value& coords
 
 Value IREmitter::ImageSampleDrefImplicitLod(const Value& handle, const Value& coords,
                                             const F32& dref, const F32& bias, const Value& offset,
-                                            TextureInstInfo info) {
-    return Inst(Opcode::ImageSampleDrefImplicitLod, Flags{info}, handle, coords, dref, bias,
-                offset);
+                                            TextureInstInfo info, const F32& lod_clamp) {
+    return Inst(Opcode::ImageSampleDrefImplicitLod, Flags{info}, handle, coords, dref, bias, offset,
+                lod_clamp);
 }
 
 Value IREmitter::ImageSampleDrefExplicitLod(const Value& handle, const Value& coords,
@@ -2182,9 +2204,13 @@ Value IREmitter::ImageQueryLod(const Value& handle, const Value& coords, const V
 
 Value IREmitter::ImageGradient(const Value& handle, const Value& coords,
                                const Value& derivatives_dx, const Value& derivatives_dy,
-                               const Value& offset, const F32& lod_clamp, TextureInstInfo info) {
+                               const Value& offset, const F32& lod_clamp, const F32& dref,
+                               TextureInstInfo info) {
+    const Value depth_and_clamp =
+        dref.IsEmpty() ? Value{lod_clamp}
+                       : CompositeConstruct(dref, lod_clamp.IsEmpty() ? Imm32(0.f) : lod_clamp);
     return Inst(Opcode::ImageGradient, Flags{info}, handle, coords, derivatives_dx, derivatives_dy,
-                offset, lod_clamp);
+                offset, depth_and_clamp);
 }
 
 Value IREmitter::ImageRead(const Value& handle, const Value& coords, const U32& lod,

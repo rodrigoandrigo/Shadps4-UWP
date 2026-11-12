@@ -1,5 +1,3 @@
-#include "video_core/renderer_d3d12/resource_bindings.h"
-
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -8,7 +6,11 @@
 #include <map>
 #include <stdexcept>
 #include <winrt/base.h>
+#include "core/uwp/memory_pressure.h"
+#include "video_core/renderer_d3d12/attachment_feedback.h"
 #include "video_core/renderer_d3d12/image_buffer_alias.h"
+#include "video_core/renderer_d3d12/resource_bindings.h"
+#include "video_core/renderer_d3d12/sampler_filter_policy.h"
 
 namespace D3D12 {
 namespace {
@@ -83,22 +85,62 @@ ResourceBindings::ResourceBindings(D3D12DeviceContext& context, ResourceCache& b
                                    ImageCache& image_cache, std::span<CompiledShader*> shaders,
                                    std::span<const StreamOutSlot> strmout_slots,
                                    D3D12DescriptorArena* resource_heap,
-                                   D3D12DescriptorArena* sampler_heap, bool fence_safe)
+                                   D3D12DescriptorArena* sampler_heap, bool fence_safe,
+                                   DescriptorBindingTier descriptor_tier,
+                                   bool feature_level_11_1_or_higher)
     : device{context}, buffers{buffer_cache}, images{image_cache},
       resources{resource_heap ? *resource_heap : owned_resources},
       samplers{sampler_heap ? *sampler_heap : owned_samplers} {
     if (!fence_safe && (resource_heap || sampler_heap))
         device.Wait(device.LastSignaledValue());
     u32 resource_count{}, sampler_count{}, strmout_used{};
+    std::array<StageDescriptorUsage, Shader::MaxStageTypes> descriptor_usage{};
     for (auto* shader : shaders) {
+        const u32 stage = static_cast<u32>(shader->info.sw_stage);
+        if (stage >= descriptor_usage.size())
+            throw std::runtime_error("Invalid D3D12 guest shader stage");
+        auto& stage_usage = descriptor_usage[stage];
         for (const auto& binding : shader->binary->bindings) {
             if (binding.binding < shader->start_bindings.unified)
                 throw std::runtime_error("Invalid guest shader binding base");
+            if (binding.space != stage + 1)
+                throw std::runtime_error(
+                    "Guest shader descriptor register space does not match stage");
+            const bool class_matches_type = (binding.kind == ResourceKind::Buffer &&
+                                             binding.type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV) ||
+                                            (binding.kind == ResourceKind::Constants &&
+                                             binding.type == D3D12_DESCRIPTOR_RANGE_TYPE_CBV) ||
+                                            (binding.kind == ResourceKind::Image &&
+                                             (binding.type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV ||
+                                              binding.type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV)) ||
+                                            (binding.kind == ResourceKind::Sampler &&
+                                             binding.type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER);
+            if (!class_matches_type)
+                throw std::runtime_error("Guest shader descriptor class/type mismatch");
+            switch (binding.type) {
+            case D3D12_DESCRIPTOR_RANGE_TYPE_CBV:
+                stage_usage.cbv += binding.count;
+                break;
+            case D3D12_DESCRIPTOR_RANGE_TYPE_SRV:
+                stage_usage.srv += binding.count;
+                break;
+            case D3D12_DESCRIPTOR_RANGE_TYPE_UAV:
+                stage_usage.uav += binding.count;
+                break;
+            case D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER:
+                stage_usage.sampler += binding.count;
+                break;
+            default:
+                throw std::runtime_error("Invalid guest shader descriptor type");
+            }
             u32 index = binding.binding - shader->start_bindings.unified;
             if (binding.kind == ResourceKind::Buffer) {
                 if (index >= shader->info.buffers.size() || binding.count != 1)
                     throw std::runtime_error("Invalid guest buffer descriptor mapping");
             } else {
+                if (binding.kind == ResourceKind::Constants)
+                    throw std::runtime_error(
+                        "D3D12 guest uniform-buffer CBV bindings are not implemented");
                 if (index < shader->info.buffers.size())
                     throw std::runtime_error("Guest shader resource class mismatch");
                 index -= shader->info.buffers.size();
@@ -120,9 +162,14 @@ ResourceBindings::ResourceBindings(D3D12DeviceContext& context, ResourceCache& b
                            index >= shader->info.samplers.size() || binding.count != 1)
                     throw std::runtime_error("Invalid guest sampler descriptor mapping");
             }
+            if (!binding.count)
+                throw std::runtime_error("Guest shader descriptor range is empty");
             const bool sampler = binding.kind == ResourceKind::Sampler;
             auto& count = sampler ? sampler_count : resource_count;
             auto& ranges = sampler ? sampler_ranges : resource_ranges;
+            const u32 capacity = sampler ? MaxSamplerDescriptorCount : MaxResourceDescriptorCount;
+            if (!CanAppendDescriptorCount(count, binding.count, capacity))
+                throw std::runtime_error("Guest shader descriptor budget exceeded");
             ranges.push_back({binding.type, binding.count, binding.binding, binding.space, count});
             for (u32 element = 0; element < binding.count; ++element) {
                 entries.push_back({shader, binding, index, element, count++});
@@ -157,8 +204,12 @@ ResourceBindings::ResourceBindings(D3D12DeviceContext& context, ResourceCache& b
             }
         }
     }
-    if (resource_count > 512 || sampler_count > 128)
+    if (!FitsDescriptorBindingTier(descriptor_tier, feature_level_11_1_or_higher, descriptor_usage))
+        throw std::runtime_error(
+            "Guest shader descriptors exceed the device ResourceBindingTier limits");
+    if (!FitsDescriptorHeapUsage(resource_count, sampler_count))
         throw std::runtime_error("Guest shader descriptor budget exceeded");
+    feedback_resource_views.resize(entries.size());
     if (!resource_heap) {
         resources.Initialize(device.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
                              std::max(1u, resource_count), true);
@@ -239,7 +290,8 @@ void ResourceBindings::ValidateInputRange(VAddr address, u64 size) const {
         }
     }
 }
-void ResourceBindings::ValidateTargetRange(VAddr address, u64 size, bool written) const {
+void ResourceBindings::ValidateTargetRange(VAddr address, u64 size, bool written,
+                                           bool allow_sampled_attachment_feedback) const {
     if (address > UINT64_MAX - size)
         throw std::runtime_error("Guest render target range overflow");
     for (u32 i = 0; i < entries.size(); ++i) {
@@ -258,7 +310,12 @@ void ResourceBindings::ValidateTargetRange(VAddr address, u64 size, bool written
                 const auto info = ShaderImageLayout(sharp, resource);
                 const bool overlap = Aliases(address, size, info.guest_address, info.guest_size) ||
                                      Aliases(address, size, info.stencil_addr, info.stencil_size);
-                if (overlap && (written || resource.is_written))
+                const bool sampled_feedback = allow_sampled_attachment_feedback && written &&
+                                              !resource.is_written && !resource.is_feedback &&
+                                              !resource.is_atomic &&
+                                              entry.binding.type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+                if (overlap && !sampled_feedback &&
+                    (written || resource.is_written || !allow_sampled_attachment_feedback))
                     throw std::runtime_error(
                         "D3D12 writable attachment/image feedback requires ordered access");
             }
@@ -318,6 +375,159 @@ void ResourceBindings::PrepareImages() {
                                  : D3D12_RESOURCE_FLAG_NONE,
                         array ? 0 : sharp.base_array, array ? 0 : 1);
     }
+}
+void ResourceBindings::SnapshotAttachmentFeedback(std::span<ImageCache::Image*> attachments,
+                                                  std::span<const bool> attachment_writes,
+                                                  bool writes_only_first_layer,
+                                                  ID3D12GraphicsCommandList* commands) {
+    constexpr u64 MaxSnapshotBytes = 32ULL * 1024 * 1024;
+    if (attachment_writes.size() != attachments.size())
+        throw std::runtime_error("D3D12 attachment feedback write-mask count is invalid");
+    feedback_resource_views.assign(entries.size(), nullptr);
+    feedback_snapshot_bytes = 0;
+    std::vector<ImageCache::Image*> source_targets(entries.size());
+    const auto same_backing = [&](VAddr first, u64 first_size, VAddr second, u64 second_size) {
+        if (first_size != second_size)
+            return false;
+        const auto a = buffers.Canonicalize(first, first_size);
+        const auto b = buffers.Canonicalize(second, second_size);
+        return a.address == b.address && a.physical == b.physical;
+    };
+    for (u32 i = 0; i < entries.size(); ++i) {
+        const auto& entry = entries[i];
+        if (entry.binding.kind != ResourceKind::Image)
+            continue;
+        const auto& resource = entry.shader->info.images[entry.index];
+        const auto sharp = resource.GetSharp(entry.shader->info);
+        if (!sharp)
+            continue;
+        const auto info = ShaderImageLayout(sharp, resource);
+        ImageCache::Image* target{};
+        u32 target_slot{};
+        for (u32 slot = 0; slot < attachments.size(); ++slot) {
+            auto* attachment = attachments[slot];
+            if (!attachment || !Aliases(attachment->info.guest_address, attachment->info.guest_size,
+                                        info.guest_address, info.guest_size))
+                continue;
+            if (target)
+                throw std::runtime_error(
+                    "D3D12 attachment feedback aliases multiple color targets");
+            target = attachment;
+            target_slot = slot;
+        }
+        if (!target)
+            continue;
+        if (entry.binding.type != D3D12_DESCRIPTOR_RANGE_TYPE_SRV || resource.is_written ||
+            resource.is_feedback || resource.is_atomic)
+            throw std::runtime_error(
+                "D3D12 attachment feedback supports sampled reads only; ordered storage "
+                "access is unsupported");
+        const auto view_type = sharp.GetViewType(resource.is_array);
+        const bool multisampled = info.num_samples > 1;
+        const bool array_view = view_type == AmdGpu::ImageType::Color2DArray ||
+                                view_type == AmdGpu::ImageType::Color2DMsaaArray;
+        const bool supported_dimension = multisampled
+                                             ? (view_type == AmdGpu::ImageType::Color2DMsaa ||
+                                                view_type == AmdGpu::ImageType::Color2DMsaaArray)
+                                             : (view_type == AmdGpu::ImageType::Color2D ||
+                                                view_type == AmdGpu::ImageType::Color2DArray);
+        const u32 view_layers = sharp.NumViewLayers(resource.is_array);
+        const bool supported_array_view =
+            array_view && AttachmentFeedback::IsSafeArrayReadRange(
+                              sharp.base_array, view_layers, info.resources.layers,
+                              attachment_writes[target_slot], writes_only_first_layer);
+        const bool supported_2d_view = !attachment_writes[target_slot] && !array_view &&
+                                       sharp.base_array == 0 &&
+                                       view_layers == info.resources.layers;
+        const bool supported_view =
+            supported_dimension && sharp.base_level == 0 &&
+            sharp.NumViewLevels(resource.is_array) == 1 &&
+            (supported_array_view || supported_2d_view) && sharp.NumSamples() == info.num_samples &&
+            resource.mip_fallback_mode == Shader::MipStorageFallbackMode::None;
+        const bool matching_layout =
+            !resource.is_depth && !info.props.is_depth && !info.props.is_block &&
+            !info.props.is_volume && !target->info.props.is_depth && !target->info.props.is_block &&
+            !target->info.props.is_volume && !target->has_stencil && !target->logic_op &&
+            target->base_layer == 0 && target->native_layers == target->info.resources.layers &&
+            target->info.resources.levels == 1 && info.resources.levels == 1 &&
+            target->info.resources.layers == info.resources.layers &&
+            target->info.num_samples == info.num_samples &&
+            info.pixel_format == target->info.pixel_format &&
+            info.guest_size == target->info.guest_size &&
+            info.size.width == target->info.size.width &&
+            info.size.height == target->info.size.height && info.pitch == target->info.pitch &&
+            info.num_bits == target->info.num_bits && info.tile_mode == target->info.tile_mode &&
+            info.bank_swizzle == target->info.bank_swizzle &&
+            info.alt_tile == target->info.alt_tile;
+        if (!supported_view || !matching_layout ||
+            !same_backing(info.guest_address, info.guest_size, target->info.guest_address,
+                          target->info.guest_size))
+            throw std::runtime_error(
+                "D3D12 attachment feedback requires a contained single-mip 2D color view; "
+                "writable targets need a disjoint array slice and a proven first-layer draw");
+        source_targets[i] = target;
+    }
+
+    std::map<ImageCache::Image*, ID3D12Resource*> snapshots;
+    u64 snapshot_bytes{};
+    for (u32 i = 0; i < source_targets.size(); ++i) {
+        auto* target = source_targets[i];
+        if (!target)
+            continue;
+        if (const auto found = snapshots.find(target); found != snapshots.end()) {
+            feedback_resource_views[i] = found->second;
+            continue;
+        }
+        auto description = target->Native()->GetDesc();
+        if (description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+            description.DepthOrArraySize != target->native_layers || description.MipLevels != 1 ||
+            description.SampleDesc.Count != target->info.num_samples ||
+            description.Format != ConvertFormat(target->info.pixel_format))
+            throw std::runtime_error(
+                "D3D12 attachment feedback target has an unsupported native resource shape");
+        if (description.SampleDesc.Count > 1) {
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT format_support{description.Format};
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality{description.Format,
+                                                                  description.SampleDesc.Count};
+            if (FAILED(device.Device()->CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT, &format_support, sizeof(format_support))) ||
+                !(format_support.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD) ||
+                FAILED(device.Device()->CheckFeatureSupport(
+                    D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality, sizeof(quality))) ||
+                description.SampleDesc.Quality >= quality.NumQualityLevels)
+                throw std::runtime_error(
+                    "D3D12 attachment feedback format lacks the required multisample shader load");
+        }
+        description.Flags = D3D12_RESOURCE_FLAG_NONE;
+        const auto allocation = device.Device()->GetResourceAllocationInfo(0, 1, &description);
+        if (allocation.SizeInBytes == UINT64_MAX ||
+            allocation.SizeInBytes > MaxSnapshotBytes - snapshot_bytes)
+            throw std::runtime_error(
+                "D3D12 attachment feedback snapshots exceed the 32 MiB per-draw budget");
+        snapshot_bytes += allocation.SizeInBytes;
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        feedback_snapshots.emplace_back();
+        auto& snapshot = feedback_snapshots.back();
+        winrt::check_hresult(Core::Uwp::AllocateMemory([&] {
+            return device.Device()->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &description, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                IID_PPV_ARGS(&snapshot));
+        }));
+        images.Barrier(*target, commands, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        commands->CopyResource(snapshot.Get(), target->Native());
+        images.Barrier(*target, commands, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition = {snapshot.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                              D3D12_RESOURCE_STATE_COPY_DEST,
+                              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+        commands->ResourceBarrier(1, &barrier);
+        snapshots.emplace(target, snapshot.Get());
+        feedback_resource_views[i] = snapshot.Get();
+    }
+    feedback_snapshot_bytes = snapshot_bytes;
 }
 void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushData& push,
                               std::span<const float, 24> clip_planes, VAddr border_colors,
@@ -461,7 +671,7 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
                     CheckWrapMode(sharp.clamp_y);
                     CheckWrapMode(sharp.clamp_z);
                     const u32 xy_linear = sharp.xy_min_filter == AmdGpu::Filter::Bilinear ? 1U : 0U;
-                    const u32 z_linear = sharp.z_filter.Value() == 1U ? 1U : 0U;
+                    const u32 z_linear = sharp.z_filter == AmdGpu::ZFilter::Linear ? 1U : 0U;
                     u32 border = 0;
                     std::array<float, 4> border_float{};
                     switch (sharp.border_color_type.Value()) {
@@ -546,9 +756,18 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
                                    : sharp.filter_mode.Value() == AmdGpu::FilterMode::Max
                                        ? D3D12_FILTER_REDUCTION_TYPE_MAXIMUM
                                        : D3D12_FILTER_REDUCTION_TYPE_STANDARD;
+            const bool point_mip_aniso = SamplerFilterPolicy::UseAnisotropicPointMip(
+                aniso, device.AnisoFilterWithPointMipSupported(), sharp.mip_filter.Value());
+            const D3D12_FILTER anisotropic_filter =
+                point_mip_aniso ? static_cast<D3D12_FILTER>(
+                                      D3D12_ANISOTROPIC_FILTERING_BIT |
+                                      D3D12_ENCODE_BASIC_FILTER(D3D12_FILTER_TYPE_LINEAR,
+                                                                D3D12_FILTER_TYPE_LINEAR,
+                                                                D3D12_FILTER_TYPE_POINT, reduction))
+                                : D3D12_ENCODE_ANISOTROPIC_FILTER(reduction);
             descriptor.Filter =
                 aniso
-                    ? D3D12_ENCODE_ANISOTROPIC_FILTER(reduction)
+                    ? anisotropic_filter
                     : D3D12_ENCODE_BASIC_FILTER(
                           sharp.xy_min_filter == AmdGpu::Filter::Bilinear ? D3D12_FILTER_TYPE_LINEAR
                                                                           : D3D12_FILTER_TYPE_POINT,
@@ -642,7 +861,8 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
                         throw std::runtime_error(
                             "D3D12 overlapping texture layouts require shared image views");
                 bound_images.push_back({image_ranges, writable, image});
-                if (std::ranges::find(uploaded_images, image) == uploaded_images.end()) {
+                if (!feedback_resource_views[i] &&
+                    std::ranges::find(uploaded_images, image) == uploaded_images.end()) {
                     images.Upload(*image, commands);
                     uploaded_images.push_back(image);
                 }
@@ -659,10 +879,11 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
                             "D3D12 depth/stencil image has no compatible sampled view format");
                     }
                 }
-                images.Barrier(*image, commands,
-                               writable ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-                                        : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
-                                              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                if (!feedback_resource_views[i])
+                    images.Barrier(*image, commands,
+                                   writable ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                                            : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 image->written |= resource.is_written;
             }
             const u32 mip =
@@ -729,8 +950,10 @@ void ResourceBindings::Upload(ID3D12GraphicsCommandList* commands, Shader::PushD
                 else
                     descriptor.Texture2D = {mip, sharp.NumViewLevels(resource.is_array), 0,
                                             float(sharp.min_lod) / 256};
-                device.Device()->CreateShaderResourceView(image ? image->Native() : nullptr,
-                                                          &descriptor,
+                ID3D12Resource* resource_view = feedback_resource_views[i];
+                if (!resource_view && image)
+                    resource_view = image->Native();
+                device.Device()->CreateShaderResourceView(resource_view, &descriptor,
                                                           resources.Cpu(entry.heap_index));
             }
         }

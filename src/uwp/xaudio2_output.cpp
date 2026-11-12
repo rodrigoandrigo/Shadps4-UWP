@@ -159,8 +159,8 @@ bool XAudio2Output::Submit(std::span<const float> samples) {
             winrt::throw_hresult(result);
         }
         ++submitted;
-        if (now - previous_report >= 5000 || (gap > 100 && now - previous_report >= 1000))
-            ReportQueue(gap > 100 ? "supply_gap" : "periodic", now);
+        if (gap > 100 && now - previous_report >= 1000)
+            ReportQueue("supply_gap", now);
         return true;
     }
     ++rejected;

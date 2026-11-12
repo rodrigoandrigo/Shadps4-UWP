@@ -215,6 +215,7 @@ struct GeneralSettings {
     Setting<bool> show_fps_counter{false};
 #endif
     Setting<bool> memory_swap_enabled{DefaultMemorySwapEnabled()};
+    Setting<bool> memory_swap_compression{false};
     Setting<int> console_language{1};
     Setting<int> big_picture_scale{1000};
     Setting<int> big_picture_folder_depth{2};
@@ -222,6 +223,8 @@ struct GeneralSettings {
     // return a vector of override descriptors (runtime, but tiny)
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
+            make_override<GeneralSettings>("memory_swap_compression",
+                                           &GeneralSettings::memory_swap_compression),
             make_override<GeneralSettings>("volume_slider", &GeneralSettings::volume_slider),
             make_override<GeneralSettings>("neo_mode", &GeneralSettings::neo_mode),
             make_override<GeneralSettings>("dev_kit_mode", &GeneralSettings::dev_kit_mode),
@@ -245,9 +248,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GeneralSettings, install_dirs, addon_install_
                                    sys_modules_dir, font_dir, volume_slider, neo_mode, dev_kit_mode,
                                    extra_dmem_in_mbytes, extra_fmem_in_mbytes,
                                    trophy_popup_disabled, trophy_notification_duration, show_splash,
-                                   trophy_notification_side, discord_rpc_enabled, show_fps_counter, memory_swap_enabled,
-                                   console_language, big_picture_scale, big_picture_folder_depth,
-                                   redzone_patches)
+                                   trophy_notification_side, discord_rpc_enabled, show_fps_counter,
+                                   memory_swap_enabled, memory_swap_compression, console_language,
+                                   big_picture_scale, big_picture_folder_depth, redzone_patches)
 
 // -------------------------------
 // Network settings
@@ -899,6 +902,7 @@ struct VulkanSettings {
     Setting<bool> vkguest_markers{false};
     Setting<bool> pipeline_cache_enabled{true};
     Setting<bool> pipeline_cache_archived{false};
+    Setting<bool> pipeline_cache_precompile_archives{false};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -920,6 +924,8 @@ struct VulkanSettings {
                                           &VulkanSettings::pipeline_cache_enabled),
             make_override<VulkanSettings>("pipeline_cache_archived",
                                           &VulkanSettings::pipeline_cache_archived),
+            make_override<VulkanSettings>("pipeline_cache_precompile_archives",
+                                          &VulkanSettings::pipeline_cache_precompile_archives),
         };
     }
 };
@@ -927,7 +933,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(VulkanSettings, gpu_id, renderdoc_enabled, vk
                                    vkvalidation_core_enabled, vkvalidation_sync_enabled,
                                    vkvalidation_gpu_enabled, vkcrash_diagnostic_enabled,
                                    vkhost_markers, vkguest_markers, pipeline_cache_enabled,
-                                   pipeline_cache_archived)
+                                   pipeline_cache_archived, pipeline_cache_precompile_archives)
 
 // -------------------------------
 // Main manager
@@ -1154,6 +1160,7 @@ public:
     SETTING_FORWARD_BOOL(m_general, DiscordRPCEnabled, discord_rpc_enabled)
     SETTING_FORWARD_BOOL(m_general, ShowFpsCounter, show_fps_counter)
     SETTING_FORWARD_BOOL(m_general, MemorySwapEnabled, memory_swap_enabled)
+    SETTING_FORWARD_BOOL(m_general, MemorySwapCompression, memory_swap_compression)
     SETTING_FORWARD(m_general, ConsoleLanguage, console_language)
     SETTING_FORWARD(m_general, BigPictureScale, big_picture_scale)
     SETTING_FORWARD(m_general, BigPictureFolderDepth, big_picture_folder_depth)
@@ -1345,6 +1352,8 @@ public:
     SETTING_FORWARD_BOOL(m_vulkan, VkGuestMarkersEnabled, vkguest_markers)
     SETTING_FORWARD_BOOL(m_vulkan, PipelineCacheEnabled, pipeline_cache_enabled)
     SETTING_FORWARD_BOOL(m_vulkan, PipelineCacheArchived, pipeline_cache_archived)
+    SETTING_FORWARD_BOOL(m_vulkan, PipelineCachePrecompileArchives,
+                         pipeline_cache_precompile_archives)
 
 #undef SETTING_FORWARD
 #undef SETTING_FORWARD_BOOL

@@ -294,9 +294,13 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
     }
 
     // Patch image instruction if image is FMask.
-    if (AmdGpu::IsFmask(image.GetDataFmt())) {
-        if (is_written && profile.reject_approximate_fmask_access)
-            throw std::runtime_error("Guest FMASK storage is not implemented for this backend");
+    const bool is_fmask = AmdGpu::IsFmask(image.GetDataFmt());
+    const bool fmask_storage_write = is_fmask && profile.supports_fmask_storage_lowering &&
+                                     inst.GetOpcode() == IR::Opcode::ImageWrite;
+    if (is_fmask && is_written && !fmask_storage_write)
+        throw std::runtime_error("Guest FMASK storage is not implemented for this backend");
+    if (is_fmask && !fmask_storage_write &&
+        !(profile.reject_approximate_fmask_access && inst.GetOpcode() == IR::Opcode::ImageRead)) {
         ASSERT_MSG(!is_written, "FMask storage instructions are not supported");
 
         IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
@@ -457,6 +461,24 @@ static void RemoveAppendBufferLaneOffset(IR::Inst& vx) {
     }
 }
 
+static IR::U32 LowerD3D12DataShareWaveOperation(IR::Inst& inst, IR::IREmitter& ir, u32 binding) {
+    const IR::U1 exec{inst.Arg(1)};
+    const IR::U64 active_lanes{ir.Ballot(exec)};
+    const IR::U32 active_count{ir.BitCount(active_lanes)};
+    const IR::U1 has_active_lanes{ir.LogicalNot(ir.IEqual(active_count, ir.Imm32(0u)))};
+    const IR::U32 first_exec_lane{ir.BallotFindLsb(active_lanes)};
+    const IR::U32 lane_id{ir.LaneId()};
+    const IR::U32 first_wave_lane{ir.ReadFirstLane(lane_id)};
+    const IR::U32 leader_lane{ir.Select(has_active_lanes, first_exec_lane, first_wave_lane)};
+    const IR::U1 leader{ir.LogicalAnd(exec, ir.IEqual(lane_id, leader_lane))};
+    const IR::U32 amount{ir.Select(leader, active_count, ir.Imm32(0u))};
+    const IR::U32 address{ir.Select(has_active_lanes, IR::U32{inst.Arg(0)}, ir.Imm32(0u))};
+    const IR::Value previous = inst.GetOpcode() == IR::Opcode::DataAppend
+                                   ? ir.BufferAtomicIAdd(ir.Imm32(binding), address, amount, {})
+                                   : ir.BufferAtomicISub(ir.Imm32(binding), address, amount, {});
+    return ir.ReadLane(IR::U32{previous}, leader_lane);
+}
+
 void PatchGlobalDataShareAccess(IR::Inst& inst, Info& info, Descriptors& descriptors,
                                 const Profile& profile) {
     const u32 binding = descriptors.Add(BufferResource{
@@ -468,11 +490,25 @@ void PatchGlobalDataShareAccess(IR::Inst& inst, Info& info, Descriptors& descrip
     IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
 
     if (inst.GetOpcode() == IR::Opcode::DataAppend || inst.GetOpcode() == IR::Opcode::DataConsume) {
-        RemoveAppendBufferLaneOffset(inst);
+        const bool supports_wave64 = info.hw_stage == HwStage::Compute
+                                         ? profile.supports_d3d12_data_share_compute
+                                         : profile.supports_d3d12_data_share_graphics;
+        if (profile.is_d3d12_profile && !supports_wave64) {
+            throw std::runtime_error(
+                "D3D12 DS_APPEND/DS_CONSUME requires WaveOps, Int64ShaderOps, and wave64; "
+                "compute needs SM6.6 WaveSize(64) unless the device has fixed wave64");
+        }
         const IR::Value replacement =
-            inst.GetOpcode() == IR::Opcode::DataAppend
-                ? ir.BufferAtomicIAdd(ir.Imm32(binding), inst.Arg(0), ir.Imm32(1u), {})
-                : ir.BufferAtomicISub(ir.Imm32(binding), inst.Arg(0), ir.Imm32(1u), {});
+            profile.is_d3d12_profile
+                ? IR::Value{LowerD3D12DataShareWaveOperation(inst, ir, binding)}
+                : [&] {
+                      RemoveAppendBufferLaneOffset(inst);
+                      return inst.GetOpcode() == IR::Opcode::DataAppend
+                                 ? ir.BufferAtomicIAdd(ir.Imm32(binding), inst.Arg(0), ir.Imm32(1u),
+                                                       {})
+                                 : ir.BufferAtomicISub(ir.Imm32(binding), inst.Arg(0), ir.Imm32(1u),
+                                                       {});
+                  }();
         inst.ReplaceUsesWithAndRemove(replacement);
         return;
     }
@@ -514,6 +550,12 @@ void PatchGlobalDataShareAccess(IR::Inst& inst, Info& info, Descriptors& descrip
     case IR::Opcode::SharedAtomicDec32:
         inst.ReplaceUsesWith(ir.BufferAtomicDec(handle, address_dwords, {}));
         break;
+    case IR::Opcode::SharedAtomicIncLimit32:
+        inst.ReplaceUsesWith(ir.BufferAtomicInc(handle, address_dwords, inst.Arg(1), {}));
+        break;
+    case IR::Opcode::SharedAtomicDecLimit32:
+        inst.ReplaceUsesWith(ir.BufferAtomicDec(handle, address_dwords, inst.Arg(1), {}));
+        break;
     case IR::Opcode::SharedAtomicAnd32:
         inst.ReplaceUsesWith(ir.BufferAtomicAnd(handle, address_dwords, inst.Arg(1), {}));
         break;
@@ -522,6 +564,13 @@ void PatchGlobalDataShareAccess(IR::Inst& inst, Info& info, Descriptors& descrip
         break;
     case IR::Opcode::SharedAtomicXor32:
         inst.ReplaceUsesWith(ir.BufferAtomicXor(handle, address_dwords, inst.Arg(1), {}));
+        break;
+    case IR::Opcode::SharedAtomicSwap32:
+        inst.ReplaceUsesWith(ir.BufferAtomicSwap(handle, address_dwords, inst.Arg(1), {}));
+        break;
+    case IR::Opcode::SharedAtomicMskor32:
+        inst.ReplaceUsesWith(
+            ir.BufferAtomicMskor(handle, address_dwords, inst.Arg(1), inst.Arg(2), {}));
         break;
     case IR::Opcode::SharedAtomicCmpSwap32:
         // Args are (address, value, cmp_value)
@@ -814,7 +863,9 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
 
     auto texel = [&] -> IR::Value {
         if (is_msaa) {
-            return ir.ImageRead(handle, coords, {}, ir.Imm32(0U), inst_info);
+            auto sample_info = inst_info;
+            sample_info.is_sampled_read.Assign(true);
+            return ir.ImageRead(handle, coords, {}, ir.Imm32(0U), sample_info);
         }
         if (inst_info.is_gather) {
             if (inst_info.is_depth) {
@@ -826,13 +877,14 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
         }
         if (inst_info.has_derivatives) {
             return ir.ImageGradient(handle, coords, derivatives_dx, derivatives_dy, offset,
-                                    lod_clamp, inst_info);
+                                    lod_clamp, dref, inst_info);
         }
         if (inst_info.is_depth) {
             if (explicit_lod) {
                 return ir.ImageSampleDrefExplicitLod(handle, coords, dref, lod, offset, inst_info);
             }
-            return ir.ImageSampleDrefImplicitLod(handle, coords, dref, bias, offset, inst_info);
+            return ir.ImageSampleDrefImplicitLod(handle, coords, dref, bias, offset, inst_info,
+                                                 lod_clamp);
         }
         if (explicit_lod) {
             return ir.ImageSampleExplicitLod(handle, coords, lod, offset, inst_info);

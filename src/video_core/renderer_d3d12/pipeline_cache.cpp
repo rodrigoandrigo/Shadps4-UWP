@@ -41,6 +41,9 @@ CommandRuntime::Pipeline& CommandRuntime::GetPipeline(
         created.state.Reset();
         result = create(created.root.Get(), created.state.ReleaseAndGetAddressOf(), {});
     }
+    // Preserve the recoverable HRESULT; CheckResult reports failures as runtime_error.
+    if (result == E_OUTOFMEMORY)
+        winrt::throw_hresult(result);
     device.CheckResult(result, L"Native D3D12 pipeline creation");
     device.CheckResult(device.Device()->GetDeviceRemovedReason(),
                        L"Native D3D12 device after pipeline creation");

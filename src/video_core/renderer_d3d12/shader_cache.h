@@ -11,7 +11,9 @@
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
+#include "video_core/renderer_d3d12/descriptor_limits.h"
 #include "video_core/renderer_d3d12/image_buffer_alias.h"
+#include "video_core/renderer_d3d12/native_capabilities_query.h"
 #include "video_core/renderer_d3d12/persistent_cache.h"
 
 namespace D3D12 {
@@ -50,6 +52,7 @@ struct TranslatedShader {
     std::optional<Shader::IR::Program> program;
     std::shared_ptr<ShaderVariant> variant;
     std::optional<Shader::ShaderParams> params;
+    Shader::Profile guest_profile;
 };
 struct PreparedShader {
     CompiledShader shader;
@@ -61,6 +64,7 @@ public:
     struct StageOutput {
         std::string semantic;
         u32 index, components;
+        u8 component_mask;
         bool integer, signed_integer;
     };
     std::vector<StageOutput> StageOutputs(const ShaderBinary& binary);
@@ -69,6 +73,15 @@ public:
                     D3D_SHADER_MODEL maximum_model = D3D_SHADER_MODEL_6_6);
     D3D_SHADER_MODEL ShaderModel() const {
         return shader_model;
+    }
+    DescriptorBindingTier DescriptorTier() const {
+        return descriptor_tier;
+    }
+    bool FeatureLevel11_1OrHigher() const {
+        return feature_level_11_1_or_higher;
+    }
+    bool SupportsViewportIndexFromAnyShaderWithoutGSEmulation() const {
+        return viewport_index_from_any_shader_without_gs;
     }
     std::unique_ptr<TranslatedShader> Translate(Shader::ShaderParams params,
                                                 Shader::RuntimeInfo runtime);
@@ -112,8 +125,8 @@ public:
                                                        std::span<const std::wstring> defines);
     std::shared_ptr<const ShaderBinary> CompileHelperHlsl(const std::string& hlsl,
                                                           Shader::SwStage stage);
-    std::shared_ptr<const ShaderBinary> CompileConstantAlphaBlend(const ShaderBinary& fragment,
-                                                                  float alpha);
+    std::shared_ptr<const ShaderBinary> CompileConstantAlphaBlend(
+        const ShaderBinary& fragment, float alpha, const StageOutput& primary_output);
     std::shared_ptr<const ShaderBinary> CompileFaceFragment(const ShaderBinary& fragment,
                                                             bool front);
     u64 MemoryBytes() const {
@@ -136,6 +149,7 @@ public:
 private:
     std::unique_ptr<TranslatedShader> TranslateUncached(Shader::ShaderParams params,
                                                         Shader::RuntimeInfo runtime);
+    Shader::Profile GuestShaderProfile() const;
     std::vector<std::shared_ptr<ShaderVariant>> variants;
     size_t variant_bytes{};
     u64 variant_age{};
@@ -151,6 +165,9 @@ private:
     bool fixed_graphics_wave64{};
     bool native_float64{};
     D3D_SHADER_MODEL shader_model{D3D_SHADER_MODEL_6_4};
+    DescriptorBindingTier descriptor_tier{DescriptorBindingTier::Tier1};
+    bool feature_level_11_1_or_higher{};
+    bool viewport_index_from_any_shader_without_gs{};
     const ResourceCache* resources{};
     ID3D12Device* native_device{};
     void CompileHlsl(ShaderBinary& binary, Shader::SwStage stage);

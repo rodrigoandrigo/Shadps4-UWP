@@ -124,9 +124,13 @@ public:
 	// A view becomes private memory with the same contents and protections (before an unmap cuts through the window and keeps a part of it).
 	virtual bool MakePrivate(uint64_t /*address*/, uint64_t /*size*/) { return false; }
 	virtual void FreeSlot(uint32_t /*slot*/) {}
-	// Copies a window (read-only, nobody can write it) to a new slot of the store; false when that did not work. The slot is the window's if the
-	// call returns true. For MakeRoom, which evicts without the pager thread.
-	virtual bool Spill(uint64_t /*window*/, uint64_t /*address*/, uint64_t /*size*/, uint32_t& /*slot*/) { return false; }
+    virtual bool PreferEviction(uint64_t) const {
+        return true;
+    }
+    // Copies a window (read-only, nobody can write it) to a new slot of the store; false when that
+    // did not work. The slot is the window's if the call returns true. For MakeRoom, which evicts
+    // without the pager thread.
+    virtual bool Spill(uint64_t /*window*/, uint64_t /*address*/, uint64_t /*size*/, uint32_t& /*slot*/) { return false; }
 	// The app is close to its limit of memory: a commit of `size` bytes now would leave less than a hard headroom. The commit makes room first, instead of
 	// waiting for a failure (which the GPU and the heap, that cannot make room, may hit before the guest does).
 	virtual bool Tight(uint64_t /*size*/) { return false; }
@@ -665,11 +669,13 @@ public:
 					if ((f & kFull) == 0 || (f & (kProt | kNoAccess | kEvicting)) != 0 || IsPinned(w)) {
 						return false;
 					}
-					if (pass == 0 && (f & (kSwept | kTouched)) == kTouched) {
-						m_flags.And(w, static_cast<uint8_t>(~kTouched)); // used lately: it gets its chance on the second pass
+                    if (pass == 0 && !host.PreferEviction(w))
+                        return false;
+                    if (pass == 0 && (f & (kSwept | kTouched)) == kTouched) {
+                        m_flags.And(w, static_cast<uint8_t>(~kTouched)); // used lately: it gets its chance on the second pass
 						return false;
-					}
-					if (EvictNow(w, host)) {
+                    }
+                    if (EvictNow(w, host)) {
 						++done;
 						failures = 0;
 					} else if (++failures >= 16) {

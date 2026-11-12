@@ -4,6 +4,7 @@
 #pragma once
 
 #include "shader_recompiler/frontend/instruction.h"
+#include "shader_recompiler/profile.h"
 
 namespace Shader::Gcn {
 
@@ -55,6 +56,10 @@ private:
 
 class GcnDecodeContext {
 public:
+    explicit GcnDecodeContext(
+        GuestIsaGeneration guest_isa_generation = GuestIsaGeneration::Unknown) noexcept
+        : m_guest_isa_generation{guest_isa_generation} {}
+
     GcnInst decodeInstruction(GcnCodeSlice& code);
 
 private:
@@ -95,6 +100,7 @@ private:
 
 private:
     GcnInst m_instruction;
+    GuestIsaGeneration m_guest_isa_generation{GuestIsaGeneration::Unknown};
 };
 
 } // namespace Shader::Gcn

@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/scope_exit.h"
 #include "common/serdes.h"
+#ifdef SHADPS4_UWP
+#include "uwp/session.h"
+#include "uwp/shadps4_api.h"
+#endif
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
@@ -13,8 +18,8 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 23u;
-static constexpr u32 ShaderMetaVersion = 16u;
+static constexpr u32 ShaderBinaryVersion = 24u;
+static constexpr u32 ShaderMetaVersion = 17u;
 static constexpr u32 PipelineKeyVersion = 6u;
 } // namespace Serialization
 
@@ -139,7 +144,12 @@ bool ComputePipeline::SerializationSupport::Deserialize(Serialization::Archive& 
 }
 
 bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
+    infos.fill(nullptr);
+    modules.fill({});
+    runtime_infos = {};
     compute_key.Deserialize(ar);
+    if (const auto found = compute_pipelines.find(compute_key); found != compute_pipelines.end())
+        return found->second != nullptr;
 
     ComputePipeline::SerializationSupport sdata{};
     sdata.Deserialize(ar);
@@ -211,7 +221,12 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
 }
 
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
+    infos.fill(nullptr);
+    modules.fill({});
+    runtime_infos = {};
     graphics_key.Deserialize(ar);
+    if (const auto found = graphics_pipelines.find(graphics_key); found != graphics_pipelines.end())
+        return found->second != nullptr;
 
     GraphicsPipeline::SerializationSupport sdata{};
     sdata.Deserialize(ar);
@@ -326,6 +341,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
             module = CompileSPV(spv, instance.GetDevice());
         }
     }
+    runtime_infos[stage] = spec.runtime_info;
     it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
 
     infos[stage] = &it_pgm.value()->info;
@@ -335,7 +351,37 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
 }
 
 void PipelineCache::WarmUp() {
+    u32 processed{}, total{}, ready{};
+#ifdef SHADPS4_UWP
+    bool completed{};
+    Core::Uwp::UpdateShaderCompilation(SHADPS4_SHADERS_LOADING_CACHE);
+    SCOPE_EXIT {
+        Core::Uwp::UpdateShaderCompilation(
+            completed ? SHADPS4_SHADERS_READY : SHADPS4_SHADERS_FAILED, processed, total, ready);
+    };
+#endif
+    const auto finish = [&] {
+        if (EmulatorSettings.IsPipelineCacheEnabled() &&
+            EmulatorSettings.IsPipelineCachePrecompileArchives()) {
+            const u32 previous_done = processed, previous_total = total, previous_ready = ready;
+            PrecompileShaderFiles([&](u32 done, u32 count, u32 compiled) {
+                processed = previous_done + done;
+                total = previous_total + count;
+                ready = previous_ready + compiled;
+#ifdef SHADPS4_UWP
+                Core::Uwp::UpdateShaderCompilation(SHADPS4_SHADERS_COMPILING, processed, total,
+                                                   ready);
+#endif
+            });
+        }
+#ifdef SHADPS4_UWP
+        if (Core::Uwp::StopRequested())
+            throw std::runtime_error("Shader compilation canceled");
+        completed = true;
+#endif
+    };
     if (!EmulatorSettings.IsPipelineCacheEnabled()) {
+        finish();
         return;
     }
 
@@ -351,6 +397,7 @@ void PipelineCache::WarmUp() {
         std::memcpy(profile_data.data(), &profile, sizeof(profile));
         Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
                                            std::move(profile_data));
+        finish();
         return;
     }
     Shader::Profile cached_profile{};
@@ -365,6 +412,7 @@ void PipelineCache::WarmUp() {
         std::memcpy(profile_data.data(), &profile, sizeof(profile));
         Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
                                            std::move(profile_data));
+        finish();
         return;
     }
 
@@ -372,9 +420,26 @@ void PipelineCache::WarmUp() {
     u32 num_pipelines{};
     u32 num_total_pipelines{};
 
+    total = Storage::DataBase::Instance().CountBlobs(Storage::BlobType::PipelineKey);
+#ifdef SHADPS4_UWP
+    Core::Uwp::UpdateShaderCompilation(SHADPS4_SHADERS_COMPILING, 0, total, 0);
+#endif
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
             ++num_total_pipelines;
+            SCOPE_EXIT {
+                ++processed;
+                ready = num_pipelines;
+#ifdef SHADPS4_UWP
+                Core::Uwp::UpdateShaderCompilation(SHADPS4_SHADERS_COMPILING, processed, total,
+                                                   ready);
+#endif
+            };
+#ifdef SHADPS4_UWP
+            if (Core::Uwp::StopRequested()) {
+                throw std::runtime_error("Shader compilation canceled");
+            }
+#endif
 
             Serialization::Archive ar{std::move(data)};
             Serialization::Reader pldata{ar};
@@ -408,6 +473,7 @@ void PipelineCache::WarmUp() {
 
     Storage::DataBase::Instance().FinishPreload();
     SaveDriverCache();
+    finish();
 }
 
 void PipelineCache::Sync() {

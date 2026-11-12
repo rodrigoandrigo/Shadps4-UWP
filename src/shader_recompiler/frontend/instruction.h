@@ -65,8 +65,14 @@ enum class DppCtrl : u16 {
     DppRowShl = 0x101,
     DppRowShr = 0x111,
     DppRowRor = 0x121,
+    DppWaveShl = 0x130,
+    DppWaveRol = 0x134,
+    DppWaveShr = 0x138,
+    DppWaveRor = 0x13C,
     DppRowMirror = 0x140,
     DppRowHalfMirror = 0x141,
+    DppRowBcast15 = 0x142,
+    DppRowBcast31 = 0x143,
 };
 
 struct DppOperation {
@@ -75,6 +81,7 @@ struct DppOperation {
     bool bc;
     u8 row_mask;
     u8 bank_mask;
+    bool fi;
 };
 
 struct InstOperand {
@@ -84,6 +91,8 @@ struct InstOperand {
     OutputModifiers output_modifier = {};
     // only valid for packed 16bit operations
     OperandSelection op_sel = {};
+    bool sdwa_present = false;
+    bool sdwa_reserved_bits = false;
     SdwaDstUnused sdwa_dst = SdwaDstUnused::Invalid;
     SdwaSelector sdwa_sel = SdwaSelector::Invalid;
     std::optional<DppOperation> dpp = {};
@@ -270,14 +279,14 @@ struct SdwaVop12 {
     u32 src0_sext : 1;
     u32 src0_neg : 1;
     u32 src0_abs : 1;
-    u32 : 1;
+    u32 reserved0 : 1;
     u32 s0 : 1;
 
     u32 src1_sel : 3;
     u32 src1_sext : 1;
     u32 src1_neg : 1;
     u32 src1_abs : 1;
-    u32 : 1;
+    u32 reserved1 : 1;
     u32 s1 : 1;
 };
 
@@ -289,14 +298,14 @@ struct SdwaVopc {
     u32 src0_sext : 1;
     u32 src0_neg : 1;
     u32 src0_abs : 1;
-    u32 : 1;
+    u32 reserved0 : 1;
     u32 s0 : 1;
 
     u32 src1_sel : 3;
     u32 src1_sext : 1;
     u32 src1_neg : 1;
     u32 src1_abs : 1;
-    u32 : 1;
+    u32 reserved1 : 1;
     u32 s1 : 1;
 };
 
@@ -320,18 +329,33 @@ struct Dpp {
 
     DppOperation GetOperation() const {
         if (dpp_ctrl >= u32(DppCtrl::DppQuadPerm) && dpp_ctrl < 0x100) {
-            return {DppCtrl::DppQuadPerm, u16(dpp_ctrl & 0xFF), bool(bc), u8(row_mask),
-                    u8(bank_mask)};
+            return {DppCtrl::DppQuadPerm, u16(dpp_ctrl & 0xFF), bool(bc),
+                    u8(row_mask),         u8(bank_mask),        bool(fi)};
         } else if (dpp_ctrl >= u32(DppCtrl::DppRowShl) && dpp_ctrl < 0x110) {
-            return {DppCtrl::DppRowShl, u16(dpp_ctrl & 0xF), bool(bc), u8(row_mask), u8(bank_mask)};
+            return {DppCtrl::DppRowShl, u16(dpp_ctrl & 0xF), bool(bc),
+                    u8(row_mask),       u8(bank_mask),       bool(fi)};
         } else if (dpp_ctrl >= u32(DppCtrl::DppRowShr) && dpp_ctrl < 0x120) {
-            return {DppCtrl::DppRowShr, u16(dpp_ctrl & 0xF), bool(bc), u8(row_mask), u8(bank_mask)};
+            return {DppCtrl::DppRowShr, u16(dpp_ctrl & 0xF), bool(bc),
+                    u8(row_mask),       u8(bank_mask),       bool(fi)};
         } else if (dpp_ctrl >= u32(DppCtrl::DppRowRor) && dpp_ctrl < 0x130) {
-            return {DppCtrl::DppRowRor, u16(dpp_ctrl & 0xF), bool(bc), u8(row_mask), u8(bank_mask)};
+            return {DppCtrl::DppRowRor, u16(dpp_ctrl & 0xF), bool(bc),
+                    u8(row_mask),       u8(bank_mask),       bool(fi)};
+        } else if (dpp_ctrl == u32(DppCtrl::DppWaveShl)) {
+            return {DppCtrl::DppWaveShl, 0, bool(bc), u8(row_mask), u8(bank_mask), bool(fi)};
+        } else if (dpp_ctrl == u32(DppCtrl::DppWaveRol)) {
+            return {DppCtrl::DppWaveRol, 0, bool(bc), u8(row_mask), u8(bank_mask), bool(fi)};
+        } else if (dpp_ctrl == u32(DppCtrl::DppWaveShr)) {
+            return {DppCtrl::DppWaveShr, 0, bool(bc), u8(row_mask), u8(bank_mask), bool(fi)};
+        } else if (dpp_ctrl == u32(DppCtrl::DppWaveRor)) {
+            return {DppCtrl::DppWaveRor, 0, bool(bc), u8(row_mask), u8(bank_mask), bool(fi)};
         } else if (dpp_ctrl == u32(DppCtrl::DppRowMirror)) {
-            return {DppCtrl::DppRowMirror, 0, bool(bc), u8(row_mask), u8(bank_mask)};
+            return {DppCtrl::DppRowMirror, 0, bool(bc), u8(row_mask), u8(bank_mask), bool(fi)};
         } else if (dpp_ctrl == u32(DppCtrl::DppRowHalfMirror)) {
-            return {DppCtrl::DppRowHalfMirror, 0, bool(bc), u8(row_mask), u8(bank_mask)};
+            return {DppCtrl::DppRowHalfMirror, 0, bool(bc), u8(row_mask), u8(bank_mask), bool(fi)};
+        } else if (dpp_ctrl == u32(DppCtrl::DppRowBcast15)) {
+            return {DppCtrl::DppRowBcast15, 0, bool(bc), u8(row_mask), u8(bank_mask), bool(fi)};
+        } else if (dpp_ctrl == u32(DppCtrl::DppRowBcast31)) {
+            return {DppCtrl::DppRowBcast31, 0, bool(bc), u8(row_mask), u8(bank_mask), bool(fi)};
         } else {
             UNREACHABLE_MSG("malformed dpp_ctrl");
         }

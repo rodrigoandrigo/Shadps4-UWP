@@ -169,6 +169,15 @@ void FrontendRenderer::BeginFrame(float delta) {
     frame_index = swapchain ? swapchain->GetCurrentBackBufferIndex() : frame_number % frames.size();
     auto& frame = frames[frame_index];
     context.Wait(frame.ticket);
+    const auto complete = context.CompletedValue();
+    for (auto image = images.begin(); image != images.end();) {
+        if (image->second.retired && image->second.ticket <= complete) {
+            free_descriptors.push_back(image->second.descriptor);
+            image = images.erase(image);
+        } else {
+            ++image;
+        }
+    }
     frame.uploads.clear();
     Check(frame.allocator->Reset());
     Check(commands->Reset(frame.allocator.Get(), nullptr));
@@ -199,7 +208,8 @@ bool FrontendRenderer::Evict() {
 bool FrontendRenderer::Upload(const ThumbnailPixels& pixels) {
     if (images.find(pixels.key) != images.end())
         return true;
-    if (!pixels.width || !pixels.height || pixels.width > 256 || pixels.height > 256 ||
+    const uint32_t maximum = pixels.key.compare(0, 8, "startup:") == 0 ? 1024 : 256;
+    if (!pixels.width || !pixels.height || pixels.width > maximum || pixels.height > maximum ||
         pixels.pixels.size() != static_cast<size_t>(pixels.width) * pixels.height * 4)
         return false;
     if (free_descriptors.empty() && !Evict())
@@ -266,6 +276,11 @@ uintptr_t FrontendRenderer::Image(const std::string& key) {
     found->second.last_frame = frame_number;
     return Gpu(found->second.descriptor).ptr;
 }
+void FrontendRenderer::ReleaseImage(const std::string& key) {
+    if (const auto image = images.find(key); image != images.end())
+        image->second.retired = true;
+}
+
 size_t FrontendRenderer::ImageCount() const {
     return images.size();
 }

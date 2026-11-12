@@ -676,7 +676,11 @@ set(FIBER_LIB src/core/libraries/fiber/fiber_context.cpp
               src/core/libraries/fiber/fiber_error.h
 )
 
-set(VDEC_LIB src/core/libraries/videodec/video_utils.cpp
+set(VDEC_LIB src/core/libraries/videodec/vdeccore.cpp
+             src/core/libraries/videodec/vdeccore.h
+             src/core/libraries/videodec/videocore_server.cpp
+             src/core/libraries/videodec/videocore_server.h
+             src/core/libraries/videodec/video_utils.cpp
              src/core/libraries/videodec/video_utils.h
              src/core/libraries/videodec/vdecsw.cpp
              src/core/libraries/videodec/vdecsw.h
@@ -961,6 +965,8 @@ set(NET_LIB   src/core/libraries/net/net.cpp
               src/core/libraries/net/net_translate.cpp
               src/core/libraries/net/net_translate.h
               src/core/libraries/net/net_types.h
+              src/core/libraries/net/net_discovery.cpp
+              src/core/libraries/net/net_discovery.h
               src/core/libraries/net/net_util.cpp
               src/core/libraries/net/net_util.h
               src/core/libraries/net/net_upnp.cpp
@@ -1260,6 +1266,7 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_pipeline_common.cpp
                src/video_core/renderer_vulkan/vk_pipeline_common.h
                src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+    src/video_core/renderer_vulkan/vk_shader_precompile.cpp
                src/video_core/renderer_vulkan/vk_pipeline_serialization.h
                src/video_core/renderer_vulkan/vk_platform.cpp
                src/video_core/renderer_vulkan/vk_platform.h
@@ -1584,6 +1591,7 @@ set_property(SOURCE
     src/video_core/texture_cache/texture_cache.cpp
     src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
     src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+    src/video_core/renderer_vulkan/vk_shader_precompile.cpp
     src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
     src/video_core/renderer_d3d12/persistent_cache.cpp
     APPEND PROPERTY COMPILE_DEFINITIONS XXH_INLINE_ALL)
@@ -1621,7 +1629,10 @@ cmrc_add_resource_library(embedded-resources
         src/resources/amd_rsqrt_index_table.bin.zstd)
 target_link_libraries(shadps4 PRIVATE res::embedded)
 if(SHADPS4_UWP)
-    target_sources(shadps4 PRIVATE src/core/uwp/guest_memory.c)
+    target_sources(shadps4 PRIVATE
+        src/core/uwp/kyty/pager_pool.cpp
+        src/core/uwp/kyty/memory_api.cpp
+        src/core/uwp/kyty/memory_backend.cpp)
     add_custom_command(TARGET shadps4 POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADPS4_UWP_OUTPUT_DIR}"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:shadps4>" "${SHADPS4_UWP_OUTPUT_DIR}"

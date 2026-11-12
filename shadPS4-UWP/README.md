@@ -161,3 +161,9 @@ Select a game and open **Cheats / Patches > Manage selected game...**. The tabs 
 **Memory swap** is enabled by default on Xbox and disabled by default on PC. The global `General.memory_swap_enabled` setting preserves an explicit choice. The backing uses on-demand 16 KiB private pages, promoted to shared sections when aliases are created. The pager moves cold pages to compressed records in temporary files under `cache/swap`, with compressed RAM fallback, second-chance eviction, and leases for host/CPU/GPU accesses. The policy and integration are described in [UWP-MEMORY.md](../documents/UWP-MEMORY.md).
 
 Vulkan/Dozen graphics pipelines are compiled in the background. **Synchronous pipeline budget (ms)** controls how long a draw waits for its pipeline before being skipped; the default is 50 ms, and a value of 0 avoids this wait. Photo captures use a minimum wait of 700 ms. This option can be adjusted globally or per game. **Readback on copy queue** is enabled by default, and older settings are migrated when this version is first opened.
+
+## Shader preparation at game startup
+
+Starting a game displays its icon across the screen while the Vulkan/Dozen pipeline cache is prepared. The progress reports cache loading, processed pipelines, and ready items. The overlay stays visible until preparation finishes and the first game frame is presented; stopping or failing the session dismisses it.
+
+**Precompile shaders from game files (Dozen)** is an optional global or per-game setting (`Vulkan.pipeline_cache_precompile_archives`), disabled by default. With pipeline caching enabled, it scans supported shader binaries and containers before guest execution, translates supported stages, and warms the driver cache. A compatibility manifest reuses completed work. Unsupported variants remain subject to runtime compilation because their actual render state is only known during execution. Native D3D12 uses its own shader and PSO caches.

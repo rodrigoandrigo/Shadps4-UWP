@@ -207,6 +207,11 @@ void StagingBufferPool::DiagnoseExpansion(const char* path, u64 size, MemoryType
     const u64 headroom = Core::AddressSpace::MemoryHeadroom();
     if (headroom >= 640_MB)
         return;
+    static thread_local u64 last_report{};
+    const auto now = GetTickCount64();
+    if (last_report && now - last_report < 5000)
+        return;
+    last_report = now;
     const u64 current = scheduler.CurrentTick();
     LOG_WARNING(Render_Vulkan,
                 "[StagingPressure] expansion path={} requested_bytes={} allocation_bytes={} "

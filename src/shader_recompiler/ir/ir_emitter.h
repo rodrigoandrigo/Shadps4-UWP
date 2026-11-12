@@ -105,6 +105,9 @@ public:
     [[nodiscard]] U32U64 SharedAtomicAnd(const U32& address, const U32U64& data, bool is_gds);
     [[nodiscard]] U32U64 SharedAtomicOr(const U32& address, const U32U64& data, bool is_gds);
     [[nodiscard]] U32U64 SharedAtomicXor(const U32& address, const U32U64& data, bool is_gds);
+    [[nodiscard]] U32 SharedAtomicSwap(const U32& address, const U32& value, bool is_gds);
+    [[nodiscard]] U32 SharedAtomicMskor32(const U32& address, const U32& data0, const U32& data1,
+                                          bool is_gds);
     [[nodiscard]] U32U64 SharedAtomicCmpSwap(const U32& address, const U32U64& value,
                                              const U32U64& cmp_value, bool is_gds);
 
@@ -112,6 +115,8 @@ public:
     [[nodiscard]] T SharedAtomicInc(const U32& address, bool is_gds);
     template <typename T = U32>
     [[nodiscard]] T SharedAtomicDec(const U32& address, bool is_gds);
+    [[nodiscard]] U32 SharedAtomicIncLimit32(const U32& address, const U32& limit, bool is_gds);
+    [[nodiscard]] U32 SharedAtomicDecLimit32(const U32& address, const U32& limit, bool is_gds);
 
     [[nodiscard]] U32 ReadConst(const Value& base, const U32& offset);
     [[nodiscard]] U32 ReadConstBuffer(const Value& handle, const U32& index, BufferInstInfo info);
@@ -166,6 +171,9 @@ public:
                                         const Value& value, BufferInstInfo info);
     [[nodiscard]] Value BufferAtomicSwap(const Value& handle, const Value& address,
                                          const Value& value, BufferInstInfo info);
+    [[nodiscard]] Value BufferAtomicMskor(const Value& handle, const Value& address,
+                                          const Value& data0, const Value& data1,
+                                          BufferInstInfo info);
     [[nodiscard]] Value BufferAtomicCmpSwap(const Value& handle, const Value& address,
                                             const Value& value, const Value& cmp_value,
                                             BufferInstInfo info);
@@ -395,7 +403,8 @@ public:
 
     [[nodiscard]] Value ImageSampleDrefImplicitLod(const Value& handle, const Value& body,
                                                    const F32& dref, const F32& bias,
-                                                   const Value& offset, TextureInstInfo info);
+                                                   const Value& offset, TextureInstInfo info,
+                                                   const F32& lod_clamp);
 
     [[nodiscard]] Value ImageSampleDrefExplicitLod(const Value& handle, const Value& body,
                                                    const F32& dref, const F32& lod,
@@ -414,7 +423,7 @@ public:
                                         const F32& lod = {}, const F32& lod_clamp = {});
     [[nodiscard]] Value ImageGradient(const Value& handle, const Value& coords,
                                       const Value& derivatives_dx, const Value& derivatives_dy,
-                                      const Value& offset, const F32& lod_clamp,
+                                      const Value& offset, const F32& lod_clamp, const F32& dref,
                                       TextureInstInfo info);
     [[nodiscard]] Value ImageRead(const Value& handle, const Value& coords, const U32& lod,
                                   const U32& multisampling, TextureInstInfo info);

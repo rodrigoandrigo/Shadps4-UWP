@@ -14,7 +14,7 @@ Profile runtime_profile;
 u64 CommandRuntime::LocalMemoryBytes() const {
     u64 bytes = resources.MemoryBytes() + inputs.MemoryBytes() + images.MemoryBytes() +
                 shaders.MemoryBytes() + gpu_commands.MemoryBytes() + pipeline_bytes +
-                pipelines.size() * 65536;
+                pipelines.size() * 65536 + pending_feedback_snapshot_bytes;
     if (transfer_pool)
         bytes += transfer_pool->ResourceStatistics().live_bytes;
     return bytes;
@@ -65,7 +65,9 @@ void CommandRuntime::MaintainMemory(bool force) {
     } scope{trimming_memory};
     trimming_memory = true;
     DrainContexts();
-    device.WaitForGpu();
+    // DrainContexts submits ready workers and waits each exact queue fence.
+    // Synchronous runtime submissions already wait their own tickets; do not
+    // append a second global signal/wait before reclaiming these caches.
     if (trim_external_memory)
         trim_external_memory();
     for (u32 pass = 0; pass < 3; ++pass) {
@@ -137,7 +139,7 @@ void CommandRuntime::EnableAsync(ResourceCache::ResolveBacking backing, AcquireM
         context->inputs.SetBackingResolver(backing);
         context->inputs.SetAsyncRecording(true);
         context->resources.SetAsyncRecording(true);
-        context->images.SetAsyncRecording(true, 16);
+        context->images.SetAsyncRecording(true, MinImageCacheEntriesForMaxDraw);
         auto* worker = context.get();
         context->SetMemoryAccess([this, worker,
                                   acquire](std::span<const ResourceCache::Range> ranges) {
@@ -231,7 +233,8 @@ void CommandRuntime::PrepareContext(std::span<CompiledShader*> stages) {
 }
 void CommandRuntime::FinishRecording(std::shared_ptr<void> lease, ResourceCache::Buffer* gds_buffer,
                                      std::vector<ResourceCache::Range> cpu_ranges,
-                                     ResourceCache::Buffer* strmout_counter, bool mapping_stable) {
+                                     ResourceCache::Buffer* strmout_counter, bool mapping_stable,
+                                     u64 feedback_snapshot_bytes) {
     const auto commit = [this, lease, gds_buffer, strmout_counter, mapping_stable,
                          cpu_ranges = std::move(cpu_ranges)] {
         resources.CommitDownloads(mapping_stable);
@@ -251,6 +254,7 @@ void CommandRuntime::FinishRecording(std::shared_ptr<void> lease, ResourceCache:
         commit();
         return;
     }
+    pending_feedback_snapshot_bytes = feedback_snapshot_bytes;
     pending_lease = std::move(lease);
     completion = commit;
     ready = true;
@@ -310,6 +314,7 @@ void CommandRuntime::CompleteContext() {
         completion();
         completion = {};
         pending_lease.reset();
+        pending_feedback_snapshot_bytes = 0;
         pending_ranges.clear();
         pending_fence = 0;
         completing = false;

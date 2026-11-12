@@ -106,6 +106,8 @@ Id EmitBufferAtomicAnd32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id addres
 Id EmitBufferAtomicOr32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value);
 Id EmitBufferAtomicXor32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value);
 Id EmitBufferAtomicSwap32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value);
+Id EmitBufferAtomicMskor32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id data0,
+                           Id data1);
 Id EmitBufferAtomicCmpSwap32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value,
                              Id cmp_value);
 Id EmitBufferAtomicFCmpSwap32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value,
@@ -156,10 +158,14 @@ Id EmitSharedAtomicOr32(EmitContext& ctx, Id offset, Id value);
 Id EmitSharedAtomicOr64(EmitContext& ctx, Id offset, Id value);
 Id EmitSharedAtomicXor32(EmitContext& ctx, Id offset, Id value);
 Id EmitSharedAtomicXor64(EmitContext& ctx, Id offset, Id value);
+Id EmitSharedAtomicSwap32(EmitContext& ctx, Id offset, Id value);
+Id EmitSharedAtomicMskor32(EmitContext& ctx, Id offset, Id data0, Id data1);
 Id EmitSharedAtomicInc32(EmitContext& ctx, Id offset);
 Id EmitSharedAtomicInc64(EmitContext& ctx, Id offset);
 Id EmitSharedAtomicDec32(EmitContext& ctx, Id offset);
 Id EmitSharedAtomicDec64(EmitContext& ctx, Id offset);
+Id EmitSharedAtomicIncLimit32(EmitContext& ctx, Id offset, Id limit);
+Id EmitSharedAtomicDecLimit32(EmitContext& ctx, Id offset, Id limit);
 Id EmitSharedAtomicISub32(EmitContext& ctx, Id offset, Id value);
 Id EmitSharedAtomicISub64(EmitContext& ctx, Id offset, Id value);
 Id EmitSharedAtomicCmpSwap32(EmitContext& ctx, Id offset, Id value, Id cmp_value);
@@ -441,7 +447,7 @@ Id EmitImageSampleImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id c
 Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod,
                               const IR::Value& offset);
 Id EmitImageSampleDrefImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id dref,
-                                  Id bias, const IR::Value& offset);
+                                  Id bias, const IR::Value& offset, const IR::Value& lod_clamp);
 Id EmitImageSampleDrefExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id dref,
                                   Id lod, const IR::Value& offset);
 Id EmitImageGather(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, const IR::Value& offset,
@@ -452,7 +458,7 @@ Id EmitImageGatherDref(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords,
 Id EmitImageQueryDimensions(EmitContext& ctx, IR::Inst* inst, u32 handle, Id lod, bool skip_mips);
 Id EmitImageQueryLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, const IR::Value&);
 Id EmitImageGradient(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id derivatives_dx,
-                     Id derivatives_dy, const IR::Value& offset, const IR::Value& lod_clamp);
+                     Id derivatives_dy, const IR::Value& offset, const IR::Value& depth_and_clamp);
 Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod, Id ms);
 void EmitImageWrite(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod, Id ms,
                     Id color);

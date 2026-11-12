@@ -44,8 +44,8 @@ bool GuestMemory::ValidRange(uint64_t address, uint64_t bytes) {
 
 GuestMemory::GuestMemory(uint64_t bytes, uint64_t direct, uintptr_t base)
     : size{bytes}, direct_size{direct}, canonical{base}, physical_pages(bytes / PageSize),
-      window_sections(bytes / WindowSize),
-      discard_windows(bytes / WindowSize, UINT32_MAX) {
+      window_sections(bytes / WindowSize), discard_windows(bytes / WindowSize, UINT32_MAX),
+      window_history(bytes / WindowSize + 1) {
     free_sections.reserve(128);
     if (!bytes || bytes % WindowSize || direct > bytes || base % WindowSize ||
         !ValidRange(base, bytes) || !regions.Map(Logical(0), bytes)) {
@@ -294,8 +294,12 @@ bool GuestMemory::ApplyProtection(VirtualPage& page) {
         last_address = page.address;
         last_protection = WindowsProtection(page.protection[0]);
         DWORD previous{};
-        return VirtualProtectFromApp(reinterpret_cast<void*>(page.address), PageSize,
-                                     last_protection, &previous);
+        if (VirtualProtectFromApp(reinterpret_cast<void*>(page.address), PageSize, last_protection,
+                                  &previous))
+            return true;
+        const auto error = GetLastError();
+        if (error != ERROR_INVALID_ADDRESS && error != ERROR_INVALID_PARAMETER)
+            return AllocationFailed("VirtualProtectFromApp.page", page.address, nullptr);
     }
     for (size_t i = 0; i < page.protection.size(); ++i) {
         last_operation = "protect_page";
@@ -332,6 +336,13 @@ bool GuestMemory::Commit(uint64_t address, uint64_t bytes) {
         Decommit(address, bytes, false);
         SetLastError(error);
     });
+    if (app_ceiling && Tight(bytes)) {
+        UpdatePressure();
+        if (app_usage >= app_ceiling || bytes > app_ceiling - app_usage) {
+            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return false;
+        }
+    }
     const auto first = Physical(address);
     uint64_t done{};
     for (; done < bytes; done += PageSize) {
@@ -470,20 +481,59 @@ bool GuestMemory::Spill(uint64_t window, uint64_t address, uint64_t bytes, uint3
     }
     store.SetChecksum(allocated, checksum ^ (window * 0x9E3779B97F4A7C15ULL));
     slot = allocated;
+    NoteEviction(window);
     ++store.counters.evicted;
     ++store.counters.emergency;
     return true;
 }
 
+bool GuestMemory::ReadStored(uint64_t window, uint32_t slot, void* data) {
+    if (!store.Read(slot, 0, data, WindowSize))
+        return false;
+    auto valid = [&] {
+        return store.CheckChecksum(slot, Xbox::PagerStore::Checksum(data, WindowSize) ^
+                                             (window * 0x9E3779B97F4A7C15ULL));
+    };
+    if (valid())
+        return true;
+    ++store.counters.pool_bad;
+    if (store.ReadFromFile(slot, data, WindowSize) && valid())
+        return true;
+    ++store.counters.corrupt;
+    SetLastError(ERROR_CRC);
+    return false;
+}
+
+void GuestMemory::NoteEviction(uint64_t window) {
+    auto& entry = window_history[window];
+    entry.left = GetTickCount64();
+    entry.reads = 0;
+}
+
+void GuestMemory::NoteReturn(uint64_t window) {
+    auto& entry = window_history[window];
+    const auto now = GetTickCount64();
+    if (entry.left && now - entry.left < 5000) {
+        entry.quick = std::min<unsigned>(entry.quick + 1, 8);
+        entry.shield_until = now + std::min<uint64_t>(15000ULL << (entry.quick - 1), 240000);
+        ++quick_returns;
+    } else if (entry.left && now - entry.left > 20000) {
+        entry.quick >>= 1;
+    }
+    entry.left = 0;
+    entry.reads = 0;
+}
+
 bool GuestMemory::CommitFromStore(uint64_t window, uint64_t address, uint64_t bytes,
                                   uint32_t slot) {
-    if (bytes != WindowSize || !store.Read(slot, 0, transfer.data(), bytes))
+    if (bytes != WindowSize || !ReadStored(window, slot, transfer.data()))
         return false;
-    const auto checksum = Xbox::PagerStore::Checksum(transfer.data(), bytes);
-    if (!store.CheckChecksum(slot, checksum ^ (window * 0x9E3779B97F4A7C15ULL))) {
-        ++store.counters.corrupt;
-        SetLastError(ERROR_CRC);
-        return false;
+    if (app_ceiling && Tight(bytes)) {
+        UpdatePressure();
+        if (app_usage >= app_ceiling || bytes > app_ceiling - app_usage) {
+            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return false;
+        }
     }
     const auto first = Physical(address);
     auto rollback = ::detail::MakeScopeGuard([&] {
@@ -526,6 +576,7 @@ bool GuestMemory::CommitFromStore(uint64_t window, uint64_t address, uint64_t by
     rollback.Cancel();
     ++commit_epoch;
     ++store.counters.page_ins;
+    NoteReturn(window);
     return true;
 }
 
@@ -534,8 +585,9 @@ void GuestMemory::FreeSlot(uint32_t slot) {
 }
 
 bool GuestMemory::Tight(uint64_t bytes) {
+    const auto growth = Resident() - std::min(Resident(), sampled_resident);
     return store.IsOpen() && app_target &&
-           (bytes >= app_target || app_usage > app_target - bytes);
+           (bytes >= app_target || app_usage + growth > app_target - bytes);
 }
 
 uint64_t GuestMemory::Resident() const {
@@ -876,14 +928,8 @@ bool GuestMemory::CopyPhysical(uint64_t physical, void* data, uint64_t bytes, bo
     const auto window = Logical(start) / WindowSize;
     uint32_t slot{};
     if (regions.EvictedSlot(window, slot)) {
-        if (!store.Read(slot, 0, transfer.data(), WindowSize))
+        if (!ReadStored(window, slot, transfer.data()))
             return false;
-        const auto checksum = Xbox::PagerStore::Checksum(transfer.data(), WindowSize);
-        if (!store.CheckChecksum(slot, checksum ^ (window * 0x9E3779B97F4A7C15ULL))) {
-            ++store.counters.corrupt;
-            SetLastError(ERROR_CRC);
-            return false;
-        }
         if (!write) {
             std::memcpy(data, transfer.data() + physical - start, bytes);
             ++store.counters.read_hits;
@@ -960,12 +1006,9 @@ bool GuestMemory::CopyPhysical(uint64_t physical, void* data, uint64_t bytes, bo
                 std::memcpy(target + done, memory, count);
         }
         const auto error = GetLastError();
-        while (changed) {
-            --changed;
-            DWORD ignored{};
-            if (!VirtualProtectFromApp(reinterpret_cast<void*>(owner.address + changed * 4096),
-                                       4096, previous[changed], &ignored))
-                std::terminate();
+        if (changed && !ApplyProtection(owner)) {
+            AllocationFailed("VirtualProtectFromApp.restore_copy", owner.address, nullptr);
+            std::terminate();
         }
         if (!copied) {
             SetLastError(error);
@@ -1293,7 +1336,9 @@ void GuestMemory::UpdatePressure() {
     std::lock_guard lock{mutex};
     app_usage = usage;
     app_limit = limit;
-    app_target = limit - std::min(limit / 16, uint64_t{220} << 20);
+    const auto ceiling = app_ceiling ? std::min(limit, app_ceiling) : limit;
+    app_target = ceiling - std::min(ceiling / 32, uint64_t{128} << 20);
+    sampled_resident = Resident();
     if (!budget_initialized) {
         const auto* views = std::getenv("SHADPS4_UWP_GUEST_VIEW_LIMIT");
         const auto configured_views = views ? std::strtoull(views, nullptr, 10) : 0;
@@ -1326,16 +1371,28 @@ uint64_t GuestMemory::Reclaim(uint64_t bytes, bool urgent) {
     if (urgent)
         return regions.MakeRoom((bytes + WindowSize - 1) / WindowSize, *this) * WindowSize;
     const auto now = GetTickCount64();
-    size_t visited{};
+    const bool pressure = (configured_budget || app_target) && Resident() > budget;
+    if (!pressure && (Resident() < budget && budget - Resident() > (256ULL << 20)))
+        return 0;
+    const size_t target =
+        pressure ? std::min<uint64_t>((Resident() - budget) / WindowSize + 64, 2048) : 64;
+    if (!pressure && swept.size() >= 1024)
+        return 0;
+    size_t visited{}, selected{};
     regions.ForEachFullWindow(hand, [&](uint64_t window) {
         hand = window + 1;
+        if ((!pressure && window_history[window].shield_until > now)) {
+            return ++visited >= 2048;
+        }
         if (regions.SweepIfCold(window, *this)) {
             swept.push_back({window, now});
+            window_history[window].swept_at = now;
+            ++selected;
             ++store.counters.swept;
         }
-        return ++visited >= 2048;
+        return ++visited >= 2048 || selected >= target;
     });
-    if (visited < 2048)
+    if (visited < 2048 && selected < target)
         hand = 0;
     return 0;
 }
@@ -1351,7 +1408,7 @@ void GuestMemory::PagerLoop(std::stop_token stop) {
             MemoryDiagnostics::Scope diagnostic{"pager"};
             diagnostic.Stage("update_pressure");
             UpdatePressure();
-            if (GetTickCount64() - last_report >= 5000) {
+            if (GetTickCount64() - last_report >= 60000) {
                 {
                     std::lock_guard lock{mutex};
                     char message[512]{};
@@ -1377,23 +1434,28 @@ void GuestMemory::PagerLoop(std::stop_token stop) {
                 std::lock_guard lock{mutex};
                 pressure = (configured_budget || app_target) && Resident() > budget;
             }
-            if (pressure)
-                Reclaim(0, false);
+            Reclaim(0, false);
+            uint64_t minimum_idle{};
+            {
+                std::lock_guard lock{mutex};
+                minimum_idle = idle_time.Update(GetTickCount64(), quick_returns, pressure);
+            }
             PruneViews();
             for (size_t batch = 0; batch < 128 && !stop.stop_requested(); ++batch) {
                 diagnostic.Stage("wait_copy_mutex");
                 std::shared_lock copy_lock{copy_mutex};
                 diagnostic.Stage("wait_memory_mutex");
                 std::unique_lock lock{mutex};
-                if (swept.empty() || GetTickCount64() - swept.front().since < 1000)
+                while (!swept.empty() &&
+                       (window_history[swept.front().window].swept_at != swept.front().since ||
+                        !(regions.FlagsOf(swept.front().window * WindowSize) & Xbox::Lazy::kSwept)))
+                    swept.pop_front();
+                if (swept.empty() || GetTickCount64() - swept.front().since < minimum_idle)
+                    break;
+                if (!pressure || Resident() <= budget - budget / 16)
                     break;
                 const auto window = swept.front().window;
                 swept.pop_front();
-                pressure = pressure && Resident() > budget;
-                if (!pressure) {
-                    regions.Touch(window, *this);
-                    continue;
-                }
                 if (!regions.BeginEvict(window, *this))
                     continue;
                 uint32_t slot{UINT32_MAX};
@@ -1430,6 +1492,7 @@ void GuestMemory::PagerLoop(std::stop_token stop) {
                 }
                 if (evicted) {
                     cancel.Cancel();
+                    NoteEviction(window);
                     ++store.counters.evicted;
                 }
             }
@@ -1494,6 +1557,16 @@ void GuestMemory::Stop() {
 void GuestMemory::Report(void (*log)(const char*)) {
     if (!log)
         return;
+    if (store.counters.pool_raw.load()) {
+        char cache[384]{};
+        std::snprintf(
+            cache, sizeof(cache),
+            "[SwapCache] compressed_bytes=%llu raw_bytes=%llu hits=%llu misses=%llu bad=%llu",
+            store.counters.pool_bytes.load(), store.counters.pool_raw.load(),
+            store.counters.pool_hits.load(), store.counters.pool_misses.load(),
+            store.counters.pool_bad.load());
+        log(cache);
+    }
     char message[2048]{};
     {
         std::lock_guard lock{mutex};

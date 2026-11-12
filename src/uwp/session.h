@@ -5,6 +5,8 @@
 #include <stop_token>
 
 namespace Core::Uwp {
+void UpdateShaderCompilation(std::uint32_t stage, std::uint32_t processed = 0,
+                             std::uint32_t total = 0, std::uint32_t compiled = 0);
 bool StopRequested();
 bool PauseRequested();
 std::stop_token GuestStopToken();

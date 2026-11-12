@@ -1100,10 +1100,11 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
             }
             if (rasterizer) {
                 marked("DrawIndirectCountMulti", header, [&] {
-                    rasterizer->DrawIndirect(false, indirect_args_addr, offset,
-                                             draw_indirect->stride, draw_indirect->count,
-                                             draw_indirect->count_addr, draw_indirect->base_vtx_loc,
-                                             draw_indirect->start_inst_loc);
+                    rasterizer->DrawIndirectWithDrawIndex(
+                        false, indirect_args_addr, offset, draw_indirect->stride,
+                        draw_indirect->count, draw_indirect->count_addr,
+                        draw_indirect->base_vtx_loc, draw_indirect->start_inst_loc,
+                        draw_indirect->draw_index_loc, draw_indirect->draw_index_enable.Value());
                 });
             }
             break;
@@ -1174,13 +1175,15 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
             }
             if (rasterizer) {
                 marked("DrawIndexIndirectCountMulti", header, [&] {
-                    rasterizer->DrawIndirect(
+                    rasterizer->DrawIndirectWithDrawIndex(
                         true, indirect_args_addr, offset, draw_index_indirect->stride,
                         draw_index_indirect->count,
                         draw_index_indirect->count_indirect_enable.Value()
                             ? draw_index_indirect->count_addr
                             : 0,
-                        draw_index_indirect->base_vtx_loc, draw_index_indirect->start_inst_loc);
+                        draw_index_indirect->base_vtx_loc, draw_index_indirect->start_inst_loc,
+                        draw_index_indirect->draw_index_loc,
+                        draw_index_indirect->draw_index_enable.Value());
                 });
             }
             break;

@@ -11,6 +11,7 @@
 
 namespace {
 constexpr size_t AllocationSize = 8 * 1024 * 1024;
+constexpr uint32_t PrecisionStart = 27;
 struct ShaderBinaryInfo {
   char signature[7];
   uint8_t version;
@@ -30,19 +31,34 @@ struct Commands {
 };
 bool Measure(uint8_t *bytes, uint32_t kind, uint32_t variant, bool shared,
              uint32_t &hash) {
+  const bool precision = variant >= PrecisionStart && kind < 3;
+  const uint32_t probe = precision ? variant - PrecisionStart : 0;
+  const bool lod_probe = precision && (kind == 2 || (kind == 0 && probe < 32));
+  const bool weight_probe = precision && kind == 0 && !lod_probe;
+  const bool anisotropy_probe = precision && kind == 1;
+  const uint32_t bytes_per_pixel = precision ? 16 : 4;
+  constexpr uint32_t TargetPitch = 64;
   auto *target = bytes + 0x200000;
   auto *texture = bytes + 0x400000;
-  std::memset(target, 0, 4096);
+  std::memset(target, 0, TargetPitch * 16 * bytes_per_pixel);
   std::memset(texture, 0, 16384);
   const uint32_t offsets[]{0, 1024, 1280, 1536, 1792};
   for (uint32_t mip = 0; mip < 4; ++mip)
     for (uint32_t i = offsets[mip]; i < offsets[mip + 1]; i += 4) {
-      texture[i] = variant >= 5 && variant <= 8 ? ((i / 4) & 1 ? 255 : 0)
+      const bool stripes = (variant >= 5 && variant <= 8) ||
+                           (kind == 0 && variant >= 21 && variant <= 24);
+      texture[i] = stripes                        ? ((i / 4) & 1 ? 255 : 0)
                    : mip == 0                   ? 0
                    : mip == 1                   ? 128
                                                 : 255;
       texture[i + 1] = uint8_t(mip * 40);
       texture[i + 3] = 255;
+      if (weight_probe || anisotropy_probe) {
+        const uint32_t texel = (i - offsets[mip]) / 4;
+        texture[i] = uint8_t((texel * 71 + mip * 53) & 255);
+        texture[i + 1] = uint8_t((texel * 113 + mip * 19) & 255);
+        texture[i + 2] = uint8_t((texel * 29 + mip * 41) & 255);
+      }
     }
   if (kind >= 5 && kind <= 7) {
     const uint32_t modes[]{0,  1, 2, 6,  10, 14, 18, 22, 26,
@@ -110,8 +126,10 @@ bool Measure(uint8_t *bytes, uint32_t kind, uint32_t variant, bool shared,
                       : variant == 2 ? 0.75f
                       : variant == 7 ? -1.f
                       : variant == 4 ? 0.f
+                      : variant == 18 || variant == 19 ? 0.25f
                                      : 0.5f;
-  const float scale = variant >= 9 && variant <= 12 ? 0.5f : 0.125f;
+  const bool anisotropic = (variant >= 9 && variant <= 12) || variant == 20;
+  const float scale = anisotropic ? 0.5f : 0.125f;
   if (shared)
     pixel.insert(pixel.end(), {vop1(1, 20, 255), 16380, vop1(1, 21, 128),
                                0xe0701000, 0x80031514, 0xbf8c0f70});
@@ -120,13 +138,26 @@ bool Measure(uint8_t *bytes, uint32_t kind, uint32_t variant, bool shared,
     scalar(0, variant == 8 ? 0.46875f : 0.5f);
     scalar(1, 0.5f);
     scalar(2, level);
+    if (variant >= 21 && variant <= 24) {
+      scalar(0, variant <= 22 ? (1.f - 1.f / 256.f) / 16.f : 1.25f / 16.f);
+      scalar(1, 0.5f / 16.f);
+      scalar(2, 0.f);
+    }
+    if (lod_probe) {
+      scalar(2, 1.f);
+    } else if (weight_probe) {
+      const float fraction = float((probe - 32) / 2 + 1) / 512.f;
+      scalar(0, (3.5f + fraction) / 16.f);
+      scalar(1, 2.5f / 16.f);
+      scalar(2, 0.f);
+    }
   }
   if (kind == 1) {
     opcode = 34;
     output = 8;
     scalar(0, 0);
     scalar(1, scale);
-    scalar(2, variant >= 9 && variant <= 12 ? 0.0625f : scale);
+    scalar(2, anisotropic ? 0.0625f : scale);
     scalar(3, 0);
     scalar(4, 0.5f);
     scalar(5, 0.5f);
@@ -135,6 +166,13 @@ bool Measure(uint8_t *bytes, uint32_t kind, uint32_t variant, bool shared,
     if (variant == 13) {
       opcode = 35;
       scalar(6, 2.f);
+    }
+    if (anisotropy_probe) {
+      const float major = 1.5f + float(probe / 16) * 1.25f;
+      scalar(1, major / 16.f);
+      scalar(2, 1.f / 16.f);
+      scalar(4, 5.25f / 16.f);
+      scalar(5, 7.75f / 16.f);
     }
   }
   if (kind == 2) {
@@ -153,6 +191,26 @@ bool Measure(uint8_t *bytes, uint32_t kind, uint32_t variant, bool shared,
       pixel.push_back(vop1(1, 10, 257));
       scalar(11, 2.f);
     }
+    if (variant == 25) {
+      opcode = 41;
+      address = 8;
+      scalar(8, 0.75f);
+      pixel.push_back(vop1(1, 9, 256));
+      pixel.push_back(vop1(1, 10, 257));
+      scalar(11, 2.f);
+    }
+  }
+  if (kind == 1 && variant == 26) {
+    opcode = 43;
+    address = 12;
+    scalar(12, 0.75f);
+    scalar(13, 0.f);
+    scalar(14, scale);
+    scalar(15, scale);
+    scalar(16, 0.f);
+    scalar(17, 0.5f);
+    scalar(18, 0.5f);
+    scalar(19, 2.f);
   }
   if (kind == 3 || kind == 4) {
     opcode = kind == 3 ? 64 : 96;
@@ -178,7 +236,11 @@ bool Measure(uint8_t *bytes, uint32_t kind, uint32_t variant, bool shared,
                                  vop2(3, axis, 255, axis), bits(-2.f)});
     scalar(2, 0);
   }
-  const uint32_t mask = kind == 3 ? 1u << variant : kind == 4 ? 3u : 15u;
+  const bool comparison = (kind == 2 && variant == 25) || (kind == 1 && variant == 26);
+  if (comparison)
+    for (uint32_t i = 1; i < 4; ++i)
+      scalar(output + i, 0.f);
+  const uint32_t mask = kind == 3 ? 1u << variant : kind == 4 ? 3u : comparison ? 1u : 15u;
   pixel.insert(pixel.end(), {0xf0000000 | (mask << 8) | (opcode << 18),
                              0x00400000 | (output << 8) | address, 0xf800180f,
                              (output + 3) << 24 | (output + 2) << 16 |
@@ -223,19 +285,49 @@ bool Measure(uint8_t *bytes, uint32_t kind, uint32_t variant, bool shared,
     }
   }
   std::memcpy(ps_user, image, sizeof(image));
-  const uint64_t mag = variant == 7 ? 0 : 1;
-  const uint64_t min = variant >= 9 && variant <= 12 ? 3 : variant == 8 ? 0 : 1;
-  const uint64_t mip = variant == 2 ? 1 : 2;
+  if (lod_probe)
+    ps_user[2] |= (probe % 8) << 28;
+  const uint64_t mag = variant == 7 || variant == 17 || variant == 20 ? 0 : 1;
+  const uint64_t min = anisotropic ? 3 : variant == 8 ? 0 : 1;
+  const uint64_t mip = variant == 17 ? 0 : variant == 2 || variant == 18 || variant == 19 ? 1 : 2;
   const uint64_t reduction = variant == 5 ? 1 : variant == 6 ? 2 : 0;
   uint64_t sampler[2]{
       2 | (uint64_t(2) << 3) | (reduction << 29) | (uint64_t(0xfff) << 44) |
-          (uint64_t(variant >= 9 && variant <= 12 ? variant - 8 : 0) << 9),
+          (uint64_t(variant == 20 ? 4 : anisotropic ? variant - 8 : 0) << 9),
       (mag << 20) | (min << 22) | (mip << 26)};
   if (variant == 3)
     sampler[1] |= 256;
   if (variant == 4) {
     sampler[0] &= ~((uint64_t(0xfff) << 32) | (uint64_t(0xfff) << 44));
     sampler[0] |= (uint64_t(256) << 32) | (uint64_t(384) << 44);
+  }
+  if (variant == 18 || variant == 19) {
+    sampler[0] &= ~(uint64_t(0xfff) << 44);
+    sampler[0] |= uint64_t(192) << 44;
+    if (variant == 19)
+      sampler[1] |= uint64_t(1) << 28;
+  }
+  if (kind == 0 && variant >= 21 && variant <= 24) {
+    sampler[0] |= variant == 22 ? uint64_t(1) << 27 : 0;
+    sampler[0] |= variant == 24 ? uint64_t(1) << 19 : 0;
+    sampler[1] = variant <= 22 ? 0 : (uint64_t(1) << 20) | (uint64_t(1) << 22);
+  }
+  if (comparison) {
+    sampler[0] |= uint64_t(1) << 12;
+    sampler[1] = uint64_t(1) << 26;
+  }
+  if (lod_probe) {
+    constexpr uint64_t secondary_bias[]{0, 8, 16, 56};
+    sampler[1] = (uint64_t(2) << 26) | (secondary_bias[probe / 8] << 14);
+  } else if (weight_probe) {
+    sampler[1] = (uint64_t(1) << 20) | (uint64_t(1) << 22) |
+                 (uint64_t(probe & 1) << 29);
+  } else if (anisotropy_probe) {
+    constexpr uint64_t bias[]{0, 1, 2, 4, 8, 16, 32, 63};
+    const uint32_t control = probe % 16;
+    sampler[0] |= (uint64_t(4) << 9) |
+                  (control < 8 ? uint64_t(control) << 16 : bias[control - 8] << 21);
+    sampler[1] = (uint64_t(1) << 20) | (uint64_t(3) << 22) | (uint64_t(2) << 26);
   }
   if (kind >= 5) {
     sampler[0] = 2 | (uint64_t(2) << 3) | (uint64_t(0xfff) << 44);
@@ -312,7 +404,7 @@ bool Measure(uint8_t *bytes, uint32_t kind, uint32_t variant, bool shared,
   context(0xa319, 7);
   context(0xa31a, 15);
   context(0xa31b, 0);
-  context(0xa31c, 0x8028);
+  context(0xa31c, precision ? (1u << 16) | (7u << 8) | (14u << 2) : 0x8028);
   context(0xa31d, 8);
   context(0xa2f8, 0);
   context(0xa201, 0);
@@ -342,8 +434,18 @@ bool Measure(uint8_t *bytes, uint32_t kind, uint32_t variant, bool shared,
   hash = 2166136261;
   for (uint32_t y = 0; y < 16; ++y)
     for (uint32_t x = 0; x < 16; ++x)
-      for (uint32_t c = 0; c < 4; ++c)
-        hash = (hash ^ target[(y * 64 + x) * 4 + c]) * 16777619;
+      for (uint32_t c = 0; c < bytes_per_pixel; ++c)
+        hash = (hash ^ target[(y * TargetPitch + x) * bytes_per_pixel + c]) * 16777619;
+  if (precision) {
+    uint32_t rgba[4]{};
+    std::memcpy(rgba, target, sizeof(rgba));
+    std::printf("SAMPLER_PRECISION kind=%u probe=%u shared=%u sampler=%016llx/%016llx "
+                "perf=%u rgba=%08x/%08x/%08x/%08x hash=%08x submit=%08x\n",
+                kind, probe, shared, static_cast<unsigned long long>(sampler[0]),
+                static_cast<unsigned long long>(sampler[1]), lod_probe ? probe % 8 : 0,
+                rgba[0], rgba[1], rgba[2], rgba[3], hash, uint32_t(rc));
+    return rc >= 0;
+  }
   std::printf("SAMPLING kind=%u variant=%u shared=%u rgba=%02x%02x%02x%02x "
               "hash=%08x submit=%08x\n",
               kind, variant, shared, target[0], target[1], target[2], target[3],
@@ -372,12 +474,17 @@ int main() {
                                           : kind == 6 || kind == 7 ? 18u
                                           : kind == 8              ? 6u
                                           : kind >= 9              ? 16u
-                                                                   : 17u);
+                                                                   : 27u);
          ++variant) {
       if (((kind == 3 || kind == 4) && variant >= 4) ||
           (kind < 3 && ((variant == 13 && kind != 1) ||
                         ((variant == 14 || variant == 15) && kind != 2) ||
-                        (variant == 16 && kind != 1))))
+                        (variant == 16 && kind != 1) ||
+                        ((variant == 18 || variant == 19) && kind != 0) ||
+                        (variant == 20 && kind != 1) ||
+                        (variant >= 21 && variant <= 24 && kind != 0) ||
+                        (variant == 25 && kind != 2) ||
+                        (variant == 26 && kind != 1))))
         continue;
       uint32_t normal{}, shared{};
       if (!Measure(bytes, kind, variant, false, normal) ||
@@ -385,6 +492,17 @@ int main() {
         return 1;
       pass &= normal == shared;
     }
+  for (uint32_t kind : {0u, 1u, 2u}) {
+    constexpr uint32_t counts[]{48, 96, 32};
+    const uint32_t count = counts[kind];
+    for (uint32_t probe = 0; probe < count; ++probe) {
+      uint32_t normal{}, shared{};
+      if (!Measure(bytes, kind, PrecisionStart + probe, false, normal) ||
+          !Measure(bytes, kind, PrecisionStart + probe, true, shared))
+        return 1;
+      pass &= normal == shared;
+    }
+  }
   std::printf("SAMPLING_RESULT %s\n", pass ? "PASS" : "FAIL");
   sceKernelMunmap(memory, AllocationSize);
   sceKernelReleaseDirectMemory(physical, AllocationSize);

@@ -76,9 +76,9 @@ class ImGuiFrontend : public std::enable_shared_from_this<ImGuiFrontend> {
     std::function<void()> ready;
     std::function<void()> toggle_fullscreen;
     std::function<void(bool)> set_pointer_mode;
-    std::function<void(bool, float)> set_game_fps;
+    std::function<void(bool, float, ShadPS4MemoryStats)> set_game_fps;
 
-  private:
+private:
     struct Setting {
         std::string group;
         std::string key;
@@ -118,6 +118,7 @@ class ImGuiFrontend : public std::enable_shared_from_this<ImGuiFrontend> {
     void RequestImage(const std::string& key, const std::string& path);
     void Draw();
     void DrawLibrary();
+    void DrawShaderCompilation();
     void DrawSettings();
     void DrawSetting(Setting& setting);
     void DrawLogs();
@@ -171,6 +172,11 @@ class ImGuiFrontend : public std::enable_shared_from_this<ImGuiFrontend> {
     float log_height{140.0f};
     std::string launcher_layout;
     std::string active_game_path;
+    bool shader_startup_visible{};
+    uint64_t shader_startup_frame{};
+    std::string shader_startup_image, shader_startup_fallback, shader_startup_title;
+    ShadPS4ShaderCompilationStatus shader_startup_status{sizeof(ShadPS4ShaderCompilationStatus)};
+    decltype(&shadps4_get_shader_compilation_status) get_shader_compilation_status{};
     bool restart_requested{};
     std::string requested_settings_group;
     std::map<std::pair<std::string, std::string>, nlohmann::json> settings_changes;
@@ -179,6 +185,7 @@ class ImGuiFrontend : public std::enable_shared_from_this<ImGuiFrontend> {
     float ui_scale{1.0f};
     bool show_fps{true};
     decltype(&shadps4_get_game_frame_count) get_game_frame_count{};
+    decltype(&shadps4_get_memory_stats) get_memory_stats{};
     decltype(&shadps4_request_presentation_capture) request_presentation_capture{};
     decltype(&shadps4_cheats_request) cheats_request{};
     bool cheats_open{}, cheats_busy{};

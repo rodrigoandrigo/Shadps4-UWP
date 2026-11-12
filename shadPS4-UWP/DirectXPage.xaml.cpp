@@ -46,16 +46,21 @@ void DirectXPage::OnLoaded(Object ^, RoutedEventArgs ^) {
     frontend = std::make_shared<ImGuiFrontend>(swapChainPanel, gameSwapChainPanel);
     WeakReference weak(this);
     const auto dispatch = Dispatcher;
-    frontend->set_game_fps = [weak, dispatch](bool visible, float fps) {
-        dispatch->RunAsync(CoreDispatcherPriority::Low, ref new DispatchedHandler([weak, visible, fps] {
-            if (auto page = weak.Resolve<DirectXPage>()) {
-                page->fpsOverlay->Visibility = visible ? Windows::UI::Xaml::Visibility::Visible
-                                                      : Windows::UI::Xaml::Visibility::Collapsed;
-                wchar_t text[40]{};
-                swprintf_s(text, L"%.1f FPS", fps);
-                page->fpsText->Text = ref new Platform::String(text);
-            }
-        }));
+    frontend->set_game_fps = [weak, dispatch](bool visible, float fps, ShadPS4MemoryStats memory) {
+        dispatch->RunAsync(
+            CoreDispatcherPriority::Low, ref new DispatchedHandler([weak, visible, fps, memory] {
+                if (auto page = weak.Resolve<DirectXPage>()) {
+                    page->fpsOverlay->Visibility = visible
+                                                       ? Windows::UI::Xaml::Visibility::Visible
+                                                       : Windows::UI::Xaml::Visibility::Collapsed;
+                    wchar_t text[192]{};
+                    constexpr double MiB = 1024.0 * 1024.0;
+                    swprintf_s(text, L"%.1f FPS\nRAM: %.1f / %.1f MiB\nSwap: %.1f / %.1f MiB", fps,
+                               memory.ram_used / MiB, memory.ram_total / MiB,
+                               memory.swap_used / MiB, memory.swap_total / MiB);
+                    page->fpsText->Text = ref new Platform::String(text);
+                }
+            }));
     };
     frontend->set_pointer_mode = [weak, dispatch](bool visible) {
         dispatch->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([weak, visible] {

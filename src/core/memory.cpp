@@ -166,12 +166,23 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     while (size) {
         const u64 page = virtual_addr >> GUEST_PAGE_BITS;
         const u64 offset_in_page = virtual_addr % GUEST_PAGE_SIZE;
-        const u64 copy_size = std::min<u64>(GUEST_PAGE_SIZE - offset_in_page, size);
-        if (auto* entry = backing_pages.find(page); entry && *entry) {
+        u64 copy_size = std::min<u64>(GUEST_PAGE_SIZE - offset_in_page, size);
+        const auto* entry = backing_pages.find(page);
+        u8* backing = entry ? *entry : nullptr;
+        while (copy_size < size) {
+            const auto next_page = (virtual_addr + copy_size) >> GUEST_PAGE_BITS;
+            const auto* next_entry = backing_pages.find(next_page);
+            const auto* next_backing = next_entry ? *next_entry : nullptr;
+            if (backing ? next_backing != backing + offset_in_page + copy_size
+                        : next_backing != nullptr)
+                break;
+            copy_size += std::min<u64>(GUEST_PAGE_SIZE, size - copy_size);
+        }
+        if (backing) {
 #ifdef SHADPS4_UWP
-            if (!AddressSpace::CopyBacking(dest, *entry + offset_in_page, copy_size))
+            if (!AddressSpace::CopyBacking(dest, backing + offset_in_page, copy_size))
 #endif
-                std::memcpy(dest, *entry + offset_in_page, copy_size);
+                std::memcpy(dest, backing + offset_in_page, copy_size);
         } else {
             std::memset(dest, 0, copy_size);
         }

@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "core/libraries/kernel/process.h"
 #include "shader_recompiler/frontend/decode.h"
+#include "shader_recompiler/frontend/vop3_encoding.h"
 
 #include <magic_enum/magic_enum.hpp>
 
@@ -100,12 +101,54 @@ bool HasAdditionalLiteral(InstEncoding encoding, Opcode opcode) {
     }
 }
 
-bool IsVop3BEncoding(Opcode opcode) {
-    return opcode == Opcode::V_ADD_I32 || opcode == Opcode::V_ADDC_U32 ||
-           opcode == Opcode::V_SUB_I32 || opcode == Opcode::V_SUBB_U32 ||
-           opcode == Opcode::V_SUBREV_I32 || opcode == Opcode::V_SUBBREV_U32 ||
-           opcode == Opcode::V_DIV_SCALE_F32 || opcode == Opcode::V_DIV_SCALE_F64 ||
-           opcode == Opcode::V_MAD_U64_U32 || opcode == Opcode::V_MAD_I64_I32;
+enum class Vop3ScalarDestinationFormat : u8 {
+    None,
+    VOP3B,
+    VOP3SD,
+};
+
+Vop3ScalarDestinationFormat GetVop3ScalarDestinationFormat(
+    Opcode opcode, GuestIsaGeneration guest_isa_generation) {
+    if (guest_isa_generation == GuestIsaGeneration::Gcn2SeaIslands &&
+        (opcode == Opcode::V_MAD_U64_U32 || opcode == Opcode::V_MAD_I64_I32)) {
+        // Sea Islands defines both MAD64 instructions as VOP3a with implicit VCC_OUT.
+        return Vop3ScalarDestinationFormat::None;
+    }
+    switch (opcode) {
+    // The guest opcode table used here is RDNA2/GCN: its 783/784 forms are VOP3B.
+    // VOP3SD is a later name/encoding variant and has no separate opcode in this table.
+    case Opcode::V_ADD_I32:
+    case Opcode::V_ADDC_U32:
+    case Opcode::V_SUB_I32:
+    case Opcode::V_SUBB_U32:
+    case Opcode::V_SUBREV_I32:
+    case Opcode::V_SUBBREV_U32:
+    case Opcode::V_ADD_CO_U32:
+    case Opcode::V_SUB_CO_U32:
+    case Opcode::V_SUBREV_CO_U32:
+    case Opcode::V_DIV_SCALE_F32:
+    case Opcode::V_DIV_SCALE_F64:
+    case Opcode::V_MAD_U64_U32:
+    case Opcode::V_MAD_I64_I32:
+        return Vop3ScalarDestinationFormat::VOP3B;
+    default:
+        return Vop3ScalarDestinationFormat::None;
+    }
+}
+
+bool IsVop3BEncoding(Opcode opcode, GuestIsaGeneration guest_isa_generation) {
+    return GetVop3ScalarDestinationFormat(opcode, guest_isa_generation) ==
+           Vop3ScalarDestinationFormat::VOP3B;
+}
+
+bool IsVop3SDEncoding(Opcode opcode, GuestIsaGeneration guest_isa_generation) {
+    return GetVop3ScalarDestinationFormat(opcode, guest_isa_generation) ==
+           Vop3ScalarDestinationFormat::VOP3SD;
+}
+
+bool HasVop3ScalarDestination(Opcode opcode, GuestIsaGeneration guest_isa_generation) {
+    return IsVop3BEncoding(opcode, guest_isa_generation) ||
+           IsVop3SDEncoding(opcode, guest_isa_generation);
 }
 
 GcnInst GcnDecodeContext::decodeInstruction(GcnCodeSlice& code) {
@@ -290,8 +333,7 @@ void GcnDecodeContext::updateInstructionMeta(InstEncoding encoding) {
     switch (m_instruction.dst_count) {
     case 2: {
         if (m_instruction.dst[1].type == ScalarType::Undefined) {
-            // Only VOP3B has an additional sdst operand,
-            // and it must be Uint64
+            // Additional scalar/mask destinations (including implicit VCC_OUT) are Uint64.
             m_instruction.dst[1].type = ScalarType::Uint64;
         }
     }
@@ -316,7 +358,18 @@ void GcnDecodeContext::repairOperandType() {
     case Opcode::V_MAD_I64_I32:
         m_instruction.src[2].type = ScalarType::Sint64;
         break;
+    case Opcode::V_QSAD_U8:
+    case Opcode::V_MQSAD_U8:
+        m_instruction.src[1].type = ScalarType::Uint32;
+        break;
+    case Opcode::V_MQSAD_U32_U8:
+        m_instruction.src[1].type = ScalarType::Uint32;
+        // The B128 source is consumed as four contiguous U32 dwords by its dedicated lowering.
+        m_instruction.src[2].type = ScalarType::Uint32;
+        break;
     case Opcode::V_ADDC_U32:
+    case Opcode::V_SUBB_U32:
+    case Opcode::V_SUBBREV_U32:
         m_instruction.src[2].type = ScalarType::Uint64;
         break;
     case Opcode::IMAGE_GATHER4_C:
@@ -438,21 +491,22 @@ void GcnDecodeContext::decodeSubDwordAddressing(InstEncoding encoding, GcnCodeSl
     if (m_instruction.src[0].field == OperandField::Sdwa) {
         m_instruction.src[0].code = code.readu32();
         m_instruction.length += sizeof(u32);
+        m_instruction.src[0].sdwa_present = true;
 
         if (encoding == InstEncoding::VOPC) {
             SdwaVopc sdwa = *reinterpret_cast<SdwaVopc*>(&m_instruction.src[0].code);
-
+            m_instruction.src[0].sdwa_reserved_bits = sdwa.reserved0 || sdwa.reserved1;
             m_instruction.src[0].field =
                 sdwa.s0 == 0 ? OperandField::VectorGPR : getOperandField(sdwa.src0);
             m_instruction.src[0].code = sdwa.src0;
             m_instruction.src[0].sdwa_sel = SdwaSelector(sdwa.src0_sel);
-
             m_instruction.src[0].input_modifier.neg = sdwa.src0_neg;
             m_instruction.src[0].input_modifier.abs = sdwa.src0_abs;
             m_instruction.src[0].input_modifier.sext = sdwa.src0_sext;
 
             m_instruction.src[1].field =
                 sdwa.s1 == 0 ? OperandField::VectorGPR : getOperandField(m_instruction.src[1].code);
+            m_instruction.src[1].sdwa_present = true;
             m_instruction.src[1].sdwa_sel = SdwaSelector(sdwa.src1_sel);
 
             m_instruction.src[1].input_modifier.neg = sdwa.src1_neg;
@@ -464,6 +518,7 @@ void GcnDecodeContext::decodeSubDwordAddressing(InstEncoding encoding, GcnCodeSl
 
         } else if (encoding == InstEncoding::VOP1 || encoding == InstEncoding::VOP2) {
             SdwaVop12 sdwa = *reinterpret_cast<SdwaVop12*>(&m_instruction.src[0].code);
+            m_instruction.src[0].sdwa_reserved_bits = sdwa.reserved0 || sdwa.reserved1;
 
             m_instruction.src[0].field =
                 sdwa.s0 == 0 ? OperandField::VectorGPR : getOperandField(sdwa.src0);
@@ -476,12 +531,14 @@ void GcnDecodeContext::decodeSubDwordAddressing(InstEncoding encoding, GcnCodeSl
 
             m_instruction.src[1].field =
                 sdwa.s1 == 0 ? OperandField::VectorGPR : getOperandField(m_instruction.src[1].code);
+            m_instruction.src[1].sdwa_present = true;
             m_instruction.src[1].sdwa_sel = SdwaSelector(sdwa.src1_sel);
 
             m_instruction.src[1].input_modifier.neg = sdwa.src1_neg;
             m_instruction.src[1].input_modifier.abs = sdwa.src1_abs;
             m_instruction.src[1].input_modifier.sext = sdwa.src1_sext;
 
+            m_instruction.dst[0].sdwa_present = true;
             m_instruction.dst[0].sdwa_sel = SdwaSelector(sdwa.dst_sel);
             m_instruction.dst[0].sdwa_dst = SdwaDstUnused(sdwa.dst_u);
             m_instruction.dst[0].output_modifier.clamp = sdwa.clamp;
@@ -531,11 +588,11 @@ void GcnDecodeContext::decodeDataParallelPrimitive(InstEncoding encoding, GcnCod
         }
 
         auto op = dpp.GetOperation();
-        LOG_ERROR(
-            Render_Recompiler,
-            "unhandled DPP operation: {} ({:#x}), value {}, bc {}, row_mask {:#b}, bank_mask {:#b}",
-            magic_enum::enum_name(op.op), u32(op.op), op.value, bool(dpp.bc), u8(dpp.row_mask),
-            u8(dpp.bank_mask));
+        LOG_DEBUG(Render_Recompiler,
+                  "decoded DPP operation: {} ({:#x}), value {}, bc {}, row_mask {:#b}, bank_mask "
+                  "{:#b}, fi {}",
+                  magic_enum::enum_name(op.op), u32(op.op), op.value, bool(dpp.bc),
+                  u8(dpp.row_mask), u8(dpp.bank_mask), op.fi);
 
         m_instruction.src[0].dpp = op;
     }
@@ -674,7 +731,7 @@ void GcnDecodeContext::decodeInstructionVOP2(u32 hexInstruction) {
     } else if (vop2Op == OpcodeVOP2::V_WRITELANE_B32) {
         m_instruction.src[1].field = getOperandField(vsrc1);
         // dst is vgpr, as normal
-    } else if (IsVop3BEncoding(m_instruction.opcode)) {
+    } else if (IsVop3BEncoding(m_instruction.opcode, m_guest_isa_generation)) {
         m_instruction.dst[1].field = OperandField::VccLo;
         m_instruction.dst[1].type = ScalarType::Uint64;
         m_instruction.dst[1].code = static_cast<u32>(OperandField::VccLo);
@@ -728,14 +785,12 @@ void GcnDecodeContext::decodeInstructionVINTRP(u32 hexInstruction) {
 }
 
 void GcnDecodeContext::decodeInstructionVOP3(uint64_t hexInstruction) {
-    u32 vdst = bit::extract(hexInstruction, 7, 0);
-    u32 sdst = bit::extract(hexInstruction, 14, 8); // For VOP3B
-    u32 op = bit::extract(hexInstruction, 25, 17);
-    u32 op_msb = bit::extract(hexInstruction, 16, 16);
-    op = op + op_msb * (1 << 9);
-    u32 src0 = bit::extract(hexInstruction, 40, 32);
-    u32 src1 = bit::extract(hexInstruction, 49, 41);
-    u32 src2 = bit::extract(hexInstruction, 58, 50);
+    const auto fields = DecodeVop3CommonFields(hexInstruction, m_guest_isa_generation);
+    const u32 vdst = fields.vdst;
+    const u32 op = fields.dispatch_opcode;
+    const u32 src0 = fields.src0;
+    const u32 src1 = fields.src1;
+    const u32 src2 = fields.src2;
 
     if (op >= static_cast<u32>(OpcodeVOP3::V_CMP_F_F32) &&
         op <= static_cast<u32>(OpcodeVOP3::V_CMPX_T_U64)) {
@@ -773,12 +828,22 @@ void GcnDecodeContext::decodeInstructionVOP3(uint64_t hexInstruction) {
     m_instruction.dst[0].code = vdst;
 
     OpcodeVOP3 vop3Op = static_cast<OpcodeVOP3>(op);
-    if (IsVop3BEncoding(m_instruction.opcode)) {
-        m_instruction.dst[1].field = getOperandField(sdst);
+    const bool has_scalar_destination =
+        HasVop3ScalarDestination(m_instruction.opcode, m_guest_isa_generation);
+    const bool gcn2_vop3a_mad64 = IsGcn2Vop3aMad64(m_guest_isa_generation, fields.raw_opcode);
+    const auto vop3a_control = DecodeVop3aControl(hexInstruction);
+    if (has_scalar_destination) {
+        const auto vop3b_control = DecodeVop3bControl(hexInstruction);
+        m_instruction.dst[1].field = getOperandField(vop3b_control.sdst);
         m_instruction.dst[1].type = ScalarType::Uint64;
-        m_instruction.dst[1].code = sdst;
+        m_instruction.dst[1].code = vop3b_control.sdst;
+        m_instruction.dst[0].output_modifier.clamp = vop3b_control.clamp;
     } else {
-        if (vop3Op >= OpcodeVOP3::V_CMP_F_F32 && vop3Op <= OpcodeVOP3::V_CMPX_T_U64) {
+        if (gcn2_vop3a_mad64) {
+            m_instruction.dst[1].field = OperandField::VccLo;
+            m_instruction.dst[1].type = ScalarType::Uint64;
+            m_instruction.dst[1].code = static_cast<u32>(OperandField::VccLo);
+        } else if (vop3Op >= OpcodeVOP3::V_CMP_F_F32 && vop3Op <= OpcodeVOP3::V_CMPX_T_U64) {
             m_instruction.dst[1].field = getOperandField(vdst);
             m_instruction.dst[1].type = ScalarType::Uint64;
             m_instruction.dst[1].code = vdst;
@@ -788,11 +853,19 @@ void GcnDecodeContext::decodeInstructionVOP3(uint64_t hexInstruction) {
             m_instruction.dst[0].type = ScalarType::Uint32;
             // WRITELANE can be decoded like other VOP3's
         }
+        for (u32 i = 0; i != 3; ++i) {
+            if (vop3a_control.abs & (1u << i)) {
+                m_instruction.src[i].input_modifier.abs = true;
+            }
+            if (vop3a_control.op_sel & (1u << i)) {
+                m_instruction.src[i].op_sel.op_sel = true;
+            }
+        }
+        m_instruction.dst[0].op_sel.op_sel = (vop3a_control.op_sel & (1u << 3)) != 0;
+        m_instruction.dst[0].output_modifier.clamp = vop3a_control.clamp;
     }
 
-    if (op >= static_cast<u32>(OpcodeVOP3::V_ADD_I32) &&
-        op <= static_cast<u32>(OpcodeVOP3::V_DIV_SCALE_F64)) {
-        // VOP3B has a sdst operand.
+    if (has_scalar_destination || gcn2_vop3a_mad64) {
         m_instruction.dst_count = 2;
     } else {
         m_instruction.dst_count = 1;
@@ -800,33 +873,14 @@ void GcnDecodeContext::decodeInstructionVOP3(uint64_t hexInstruction) {
 
     m_instruction.control.vop3 = *reinterpret_cast<InstControlVOP3*>(&hexInstruction);
 
-    // update input modifier
-    auto& control = m_instruction.control.vop3;
-
-    // update output modifier
     auto& outputMod = m_instruction.dst[0].output_modifier;
-
-    if (!IsVop3BEncoding(m_instruction.opcode)) {
-        for (u32 i = 0; i != 3; ++i) {
-            if (control.abs & (1u << i)) {
-                m_instruction.src[i].input_modifier.abs = true;
-            }
-        }
-        outputMod.clamp = static_cast<bool>(control.clmp);
-    }
     for (u32 i = 0; i != 3; ++i) {
-        if (control.neg & (1u << i)) {
+        if (fields.neg & (1u << i)) {
             m_instruction.src[i].input_modifier.neg = true;
         }
-
-        if (control.op_sel & (1u << i)) {
-            m_instruction.src[i].op_sel.op_sel = true;
-        }
     }
 
-    m_instruction.dst[0].op_sel.op_sel = control.op_sel & (1u << 3);
-
-    switch (control.omod) {
+    switch (fields.omod) {
     case 0:
         outputMod.multiplier = 0.f;
         break;

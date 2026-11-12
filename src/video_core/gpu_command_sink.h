@@ -21,6 +21,12 @@ public:
             throw std::runtime_error("Indirect SGPR offsets are not supported by this renderer");
         DrawIndirect(indexed, address, offset, stride, count, count_address);
     }
+    virtual void DrawIndirectWithDrawIndex(bool indexed, VAddr address, u32 offset, u32 stride,
+                                           u32 count, VAddr count_address, u16 vertex_sgpr,
+                                           u16 instance_sgpr, u16, bool) {
+        DrawIndirect(indexed, address, offset, stride, count, count_address, vertex_sgpr,
+                     instance_sgpr);
+    }
     virtual void DispatchDirect() = 0;
     virtual void DispatchIndirect(VAddr address, u32 offset, u32 size) = 0;
     virtual void FillBuffer(VAddr address, u32 size, u32 value, bool gds) = 0;

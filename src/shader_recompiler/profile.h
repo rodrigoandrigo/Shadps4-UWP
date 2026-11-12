@@ -6,6 +6,10 @@
 #include "common/types.h"
 
 namespace Shader {
+enum class GuestIsaGeneration : u8 {
+    Unknown,
+    Gcn2SeaIslands,
+};
 
 struct Profile {
     u32 max_viewport_width{};
@@ -14,12 +18,38 @@ struct Profile {
     u32 supported_spirv{0x00010000};
     u32 subgroup_size{};
     u32 sparse_page_shift{};
+    GuestIsaGeneration guest_isa_generation{GuestIsaGeneration::Unknown};
     bool support_int8{};
     bool support_int16{};
     bool support_int64{};
     bool support_bda{};
     bool support_float16{};
     bool support_float64{};
+    // D3D12 wave64 gate for VOP3B unsigned add/sub with explicit carry/borrow masks.
+    bool supports_vop3_co_u32_subset{};
+    // D3D12 gate for GCN2 VOP3a MAD64 with implicit VCC_OUT, requiring Int64ShaderOps and wave64
+    // ballot.
+    bool supports_vop3_mad64_subset{};
+    // D3D12-only GCN2 VOP3a V_LERP_U8 lowering using baseline U32 arithmetic.
+    bool supports_vop3_lerp_u8_subset{};
+    // D3D12-only exact VOP3 SAD byte/short expansion using baseline U32 arithmetic.
+    bool supports_vop3_sad_subset{};
+    // D3D12-only QSAD/MQSAD expansion with B64 S0 reads; requires device Int64ShaderOps.
+    bool supports_vop3_sad_packed_subset{};
+    // Narrow D3D12 compute wave64 DPP gate: SM6.4 with fixed wave64 or SM6.6 with WaveSize.
+    bool supports_dpp_subset{};
+    // Narrow D3D12-only gate for exact signed/unsigned 24-bit multiply-high lowering.
+    bool supports_mul_hi_24_subset{};
+    // Narrow D3D12-only gate for SDWA WORD_0/WORD_1 F16 VOP2 lowering.
+    bool supports_sdwa_f16_subset{};
+    // Narrow D3D12-only gate for validated 32-bit SDWA VOP1 source lowering.
+    bool supports_sdwa_vop1_subset{};
+    // Narrow D3D12-only gate for VOPC SDWAB with VCC destination and wave64.
+    bool supports_sdwa_vopc_subset{};
+    // D3D12-only wave64 gates for correct GCN DS_APPEND/DS_CONSUME lowering.
+    bool is_d3d12_profile{};
+    bool supports_d3d12_data_share_compute{};
+    bool supports_d3d12_data_share_graphics{};
     bool allow_fp64_to_fp32_lowering{true};
     bool supports_denorm_behavior_independence{};
     bool supports_rounding_mode_independence{};
@@ -62,6 +92,7 @@ struct Profile {
     bool needs_unified_buffer_types{};
     bool fast_shader_math{};
     bool reject_approximate_fmask_access{};
+    bool supports_fmask_storage_lowering{};
 
     bool operator==(const Profile&) const = default;
 };

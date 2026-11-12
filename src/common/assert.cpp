@@ -4,6 +4,7 @@
 #include <fmt/format.h>
 #include "common/arch.h"
 #include "common/assert.h"
+#include "common/scoped_assert.h"
 #include "core/signals.h"
 #include "emulator.h"
 
@@ -16,6 +17,8 @@
 #endif
 
 void assert_fail_impl() {
+    if (Common::assertion_exceptions_enabled)
+        throw std::runtime_error("Speculative compilation assertion failed");
 #ifdef SHADPS4_UWP
     throw std::runtime_error("Embedded core assertion failed");
 #else
@@ -27,6 +30,9 @@ void assert_fail_impl() {
 
 void assert_fail_msg(const char* file, int line, const char* func, fmt::string_view format,
                      fmt::format_args args) {
+    if (Common::assertion_exceptions_enabled)
+        throw std::runtime_error(
+            fmt::format("{}:{} {}: {}", file, line, func, fmt::vformat(format, args)));
 #ifdef SHADPS4_UWP
     Common::Log::Flush();
     throw std::runtime_error(

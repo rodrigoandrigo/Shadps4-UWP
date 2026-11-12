@@ -28,6 +28,7 @@ public:
     void SetTransparent(bool value) { transparent = value; }
     bool Upload(const ThumbnailPixels& pixels);
     uintptr_t Image(const std::string& key);
+    void ReleaseImage(const std::string& key);
     size_t ImageCount() const;
     std::vector<uint8_t> Readback();
 
@@ -45,6 +46,7 @@ private:
         uint32_t descriptor{};
         uint64_t last_frame{};
         uint64_t ticket{};
+        bool retired{};
     };
     void Check(HRESULT result, const wchar_t* operation = L"Frontend D3D12") const;
     void GetTargets();

@@ -97,20 +97,20 @@ inline void Report(void (*log)(const char*)) {
     if (!log)
         return;
     std::array<Operation, 129> operations{};
-    uint64_t completed{}, dropped{};
+    uint64_t dropped{};
     {
         auto& state = State();
         std::lock_guard lock{state.mutex};
         std::copy(state.active.begin(), state.active.end(), operations.begin());
         operations.back() = state.last_private;
-        completed = state.completed;
         dropped = state.dropped;
     }
     const auto now = GetTickCount64();
     char message[512];
-    std::snprintf(message, sizeof(message), "[MemoryWatch] heartbeat completed=%llu dropped=%llu",
-                  completed, dropped);
-    log(message);
+    if (dropped) {
+        std::snprintf(message, sizeof(message), "[MemoryWatch] dropped=%llu", dropped);
+        log(message);
+    }
     for (size_t index = 0; index < operations.size(); ++index) {
         const auto& op = operations[index];
         const bool last = index == operations.size() - 1;

@@ -114,7 +114,9 @@ struct AddressSpace::Impl {
                                       1_MB,
                               reinterpret_cast<uintptr_t>(backing_base),
                               reinterpret_cast<const char*>(utf8.c_str()),
-                              EmulatorSettings.IsMemorySwapEnabled()),
+                              EmulatorSettings.IsMemorySwapEnabled() || DefaultMemorySwapEnabled(),
+                              EmulatorSettings.IsMemorySwapCompression(),
+                              DefaultMemorySwapEnabled() ? 4800_MB : 0),
               "initialize guest memory");
         active_backing.store(this, std::memory_order_release);
         LOG_INFO(Core, "UWP memory: Kyty demand paging, 64 KiB residency windows, "

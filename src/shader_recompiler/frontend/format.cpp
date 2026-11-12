@@ -1642,14 +1642,16 @@ constexpr std::array<InstFormat, 883> InstructionFormatVOP3 = {
      {InstClass::VectorIntGraph, InstCategory::VectorALU, 3, 1, ScalarType::Uint32,
       ScalarType::Uint32},
      // 370 = V_QSAD_U8
-     {InstClass::Undefined, InstCategory::Undefined, 3, 1, ScalarType::Uint32, ScalarType::Uint32},
+     {InstClass::VectorIntGraph, InstCategory::VectorALU, 3, 1, ScalarType::Uint64,
+      ScalarType::Uint64},
      // 371 = V_MQSAD_U8
-     {InstClass::Undefined, InstCategory::Undefined, 3, 1, ScalarType::Uint32, ScalarType::Uint32},
+     {InstClass::VectorIntGraph, InstCategory::VectorALU, 3, 1, ScalarType::Uint64,
+      ScalarType::Uint64},
      // 372 = V_TRIG_PREOP_F64
      {InstClass::VectorFpTran64, InstCategory::VectorALU, 2, 1, ScalarType::Float64,
       ScalarType::Float64},
-     // 373 = V_MQSAD_U32_U8
-     {InstClass::VectorIntGraph, InstCategory::VectorALU, 3, 1, ScalarType::Uint32,
+     // 373 = V_MQSAD_U32_U8 (B128 S2/D are split into four U32 VGPRs by the translator)
+     {InstClass::VectorIntGraph, InstCategory::VectorALU, 3, 1, ScalarType::Uint64,
       ScalarType::Uint32},
      // 374 = V_MAD_U64_U32
      {InstClass::VectorIntArith64, InstCategory::VectorALU, 3, 1, ScalarType::Uint32,
@@ -2196,7 +2198,9 @@ constexpr std::array<InstFormat, 883> InstructionFormatVOP3 = {
      // 782 = V_SUB_NC_I16
      {InstClass::VectorIntArith16, InstCategory::VectorALU, 2, 1, ScalarType::Sint16,
       ScalarType::Sint16},
-     {},
+     // 783 = V_ADD_CO_U32
+     {InstClass::VectorIntArith32, InstCategory::VectorALU, 2, 1, ScalarType::Uint32,
+      ScalarType::Uint32},
      // 784 = V_SUB_CO_U32
      {InstClass::VectorIntArith32, InstCategory::VectorALU, 2, 1, ScalarType::Uint32,
       ScalarType::Uint32},
@@ -2210,7 +2214,9 @@ constexpr std::array<InstFormat, 883> InstructionFormatVOP3 = {
      {},
      {},
      {},
-     {},
+     // 793 = V_SUBREV_CO_U32
+     {InstClass::VectorIntArith32, InstCategory::VectorALU, 2, 1, ScalarType::Uint32,
+      ScalarType::Uint32},
      {},
      {},
      {},

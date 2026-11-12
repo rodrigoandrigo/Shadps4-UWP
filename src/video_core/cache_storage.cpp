@@ -247,6 +247,27 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u32>& da
     return LoadVector(type, path, data);
 }
 
+u32 DataBase::CountBlobs(BlobType type) const {
+    if (!opened) {
+        return 0;
+    }
+    const auto ext = "." + GetBlobFileExtension(type);
+    u32 count{};
+    if (EmulatorSettings.IsPipelineCacheArchived()) {
+        const auto files = mz_zip_reader_get_num_files(&zip_ar);
+        for (mz_uint index = 0; index < files; ++index) {
+            std::array<char, MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE> name{};
+            mz_zip_reader_get_filename(&zip_ar, index, name.data(), name.size());
+            count += std::string_view{name.data()}.ends_with(ext);
+        }
+    } else {
+        for (const auto& entry : std::filesystem::directory_iterator{cache_path}) {
+            count += entry.is_regular_file() && entry.path().extension() == ext;
+        }
+    }
+    return count;
+}
+
 void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u8>&& data)>& func) {
     const auto& ext = GetBlobFileExtension(type);
     if (EmulatorSettings.IsPipelineCacheArchived()) {

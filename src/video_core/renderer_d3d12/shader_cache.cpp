@@ -12,6 +12,7 @@
 #include <d3d12shader.h>
 #include <spirv_hlsl.hpp>
 #include <winrt/base.h>
+#include "common/elf_info.h"
 #include "core/emulator_settings.h"
 #include "externals/mesa-uwp/src/microsoft/spirv_to_dxil/spirv_to_dxil.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -36,6 +37,7 @@ struct ShaderVariant {
     };
     std::vector<u32> code, copy_code, dependencies;
     Shader::RuntimeInfo input_runtime{};
+    Shader::GuestIsaGeneration guest_isa_generation{Shader::GuestIsaGeneration::Unknown};
     CompiledShader translated{};
     std::vector<Prepared> prepared;
     size_t bytes{};
@@ -426,6 +428,58 @@ spv::ExecutionModel Model(Shader::SwStage stage) {
     }
 }
 } // namespace
+NativeCapabilitySnapshot QueryNativeDeviceCapabilities(ID3D12Device* device,
+                                                       D3D_SHADER_MODEL maximum_model) {
+    if (!device)
+        throw std::invalid_argument("Cannot query capabilities from a null D3D12 device");
+    if (maximum_model < D3D_SHADER_MODEL_6_4 || maximum_model > D3D_SHADER_MODEL_6_6)
+        throw std::runtime_error("Invalid D3D12 shader model query ceiling");
+
+    D3D12_FEATURE_DATA_SHADER_MODEL model{maximum_model};
+    auto status = device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model));
+    if (status == E_INVALIDARG && maximum_model > D3D_SHADER_MODEL_6_4) {
+        model.HighestShaderModel = D3D_SHADER_MODEL_6_4;
+        status = device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model));
+    }
+    winrt::check_hresult(status);
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 wave_options{};
+    winrt::check_hresult(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &wave_options,
+                                                     sizeof(wave_options)));
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+    winrt::check_hresult(
+        device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)));
+    constexpr D3D_FEATURE_LEVEL requested_feature_levels[]{D3D_FEATURE_LEVEL_11_1,
+                                                           D3D_FEATURE_LEVEL_11_0};
+    D3D12_FEATURE_DATA_FEATURE_LEVELS feature_levels{};
+    feature_levels.NumFeatureLevels = 2;
+    feature_levels.pFeatureLevelsRequested = requested_feature_levels;
+    winrt::check_hresult(device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &feature_levels,
+                                                     sizeof(feature_levels)));
+
+    NativeCapabilitySnapshot capabilities{
+        .shader_model = static_cast<u32>(model.HighestShaderModel),
+        .wave_ops = bool(wave_options.WaveOps),
+        .wave_lane_count_min = wave_options.WaveLaneCountMin,
+        .wave_lane_count_max = wave_options.WaveLaneCountMax,
+        .feature_level = static_cast<u32>(feature_levels.MaxSupportedFeatureLevel),
+        .resource_binding_tier = static_cast<u32>(options.ResourceBindingTier),
+        .int64_shader_ops = bool(wave_options.Int64ShaderOps),
+        .double_precision_float_shader_ops = bool(options.DoublePrecisionFloatShaderOps),
+        .viewport_index_from_any_shader_without_gs = bool(
+            options.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation),
+    };
+    const auto failure = RequiredCapabilityFailure(capabilities);
+    if (failure != NativeCapabilityFailure::None) {
+        throw std::runtime_error(fmt::format(
+            "Native D3D12 device lacks required {} (shader model={:#x}, WaveOps={}, "
+            "wave lanes={}..{}, feature level={:#x}, binding tier={})",
+            CapabilityFailureName(failure), capabilities.shader_model, capabilities.wave_ops,
+            capabilities.wave_lane_count_min, capabilities.wave_lane_count_max,
+            capabilities.feature_level, capabilities.resource_binding_tier));
+    }
+    return capabilities;
+}
 void ShaderCache::Initialize(ID3D12Device* device, const ResourceCache* resources,
                              D3D_SHADER_MODEL maximum_model) {
     variants.clear();
@@ -436,44 +490,118 @@ void ShaderCache::Initialize(ID3D12Device* device, const ResourceCache* resource
     cache_bytes = 0;
     this->resources = resources;
     native_device = device;
+    descriptor_tier = DescriptorBindingTier::Tier1;
+    feature_level_11_1_or_higher = false;
+    viewport_index_from_any_shader_without_gs = false;
     persistent.Initialize("shaders");
     if (maximum_model < D3D_SHADER_MODEL_6_4 || maximum_model > D3D_SHADER_MODEL_6_6)
         throw std::runtime_error("Invalid D3D12 shader model ceiling");
-    D3D12_FEATURE_DATA_SHADER_MODEL model{maximum_model};
-    auto status = device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model));
-    if (status == E_INVALIDARG && maximum_model > D3D_SHADER_MODEL_6_4) {
-        model.HighestShaderModel = D3D_SHADER_MODEL_6_4;
-        status = device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model));
-    }
-    winrt::check_hresult(status);
-    if (model.HighestShaderModel < D3D_SHADER_MODEL_6_4)
-        throw std::runtime_error("D3D12 guest shaders require Shader Model 6.4");
-    shader_model = model.HighestShaderModel >= D3D_SHADER_MODEL_6_6 ? D3D_SHADER_MODEL_6_6
-                                                                    : D3D_SHADER_MODEL_6_4;
+    const auto capabilities = QueryNativeDeviceCapabilities(device, maximum_model);
+    viewport_index_from_any_shader_without_gs =
+        capabilities.viewport_index_from_any_shader_without_gs;
+    LOG_INFO(Core, "[UWP stage] viewport index from VS/DS without GS={}",
+             viewport_index_from_any_shader_without_gs);
+    const auto reported_model = static_cast<D3D_SHADER_MODEL>(capabilities.shader_model);
+    shader_model =
+        reported_model >= D3D_SHADER_MODEL_6_6 ? D3D_SHADER_MODEL_6_6 : D3D_SHADER_MODEL_6_4;
     LOG_INFO(Core, "[UWP stage] native shader model {}.{} (reported {}.{})", u32(shader_model) >> 4,
-             u32(shader_model) & 15, u32(model.HighestShaderModel) >> 4,
-             u32(model.HighestShaderModel) & 15);
-    D3D12_FEATURE_DATA_D3D12_OPTIONS1 options{};
-    winrt::check_hresult(
-        device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &options, sizeof(options)));
+             u32(shader_model) & 15, capabilities.shader_model >> 4,
+             capabilities.shader_model & 15);
     LOG_INFO(Core, "[UWP stage] native wave capabilities: ops={} lanes={}..{}",
-             bool(options.WaveOps), options.WaveLaneCountMin, options.WaveLaneCountMax);
-    if (!options.WaveOps || options.WaveLaneCountMin > 64 || options.WaveLaneCountMax < 64)
-        throw std::runtime_error("D3D12 guest shaders require wave64 support");
-    fixed_graphics_wave64 = options.WaveLaneCountMin == 64 && options.WaveLaneCountMax == 64;
+             capabilities.wave_ops, capabilities.wave_lane_count_min,
+             capabilities.wave_lane_count_max);
+    const bool supports_wave64 =
+        capabilities.wave_lane_count_min <= 64 && capabilities.wave_lane_count_max >= 64;
+    const bool fixed_wave64 =
+        capabilities.wave_lane_count_min == 64 && capabilities.wave_lane_count_max == 64;
+    fixed_graphics_wave64 = fixed_wave64;
     winrt::check_hresult(DxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&utils)));
     winrt::check_hresult(DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler)));
     profile.supported_spirv = 0x00010300;
+    profile.is_d3d12_profile = true;
     profile.subgroup_size = 64;
     profile.max_viewport_width = D3D12_VIEWPORT_BOUNDS_MAX;
     profile.max_viewport_height = D3D12_VIEWPORT_BOUNDS_MAX;
     profile.max_shared_memory_size = D3D12_CS_TGSM_REGISTER_COUNT * sizeof(u32);
-    profile.support_int64 = options.Int64ShaderOps;
     profile.support_bda = true;
-    D3D12_FEATURE_DATA_D3D12_OPTIONS numeric_options{};
-    winrt::check_hresult(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &numeric_options,
-                                                     sizeof(numeric_options)));
-    native_float64 = numeric_options.DoublePrecisionFloatShaderOps;
+    profile.support_int64 = capabilities.int64_shader_ops;
+    // SM6.6 can require WaveSize(64); without that attribute (SM6.4), only a device
+    // reporting an exact 64-lane range can safely run guest wave64 cross-lane code.
+    const bool dpp_wave64_compatible =
+        shader_model >= D3D_SHADER_MODEL_6_6 ? supports_wave64 : fixed_wave64;
+    const bool data_share_wave_ops =
+        capabilities.wave_ops && supports_wave64 && capabilities.int64_shader_ops;
+    profile.supports_d3d12_data_share_compute =
+        data_share_wave_ops && (fixed_wave64 || shader_model >= D3D_SHADER_MODEL_6_6);
+    profile.supports_d3d12_data_share_graphics = data_share_wave_ops && fixed_wave64;
+    LOG_INFO(Core, "[UWP stage] GCN DS append/consume wave64 compute={} graphics={}",
+             profile.supports_d3d12_data_share_compute, profile.supports_d3d12_data_share_graphics);
+    // Keep the host-only profile unqualified; GuestShaderProfile() adds a
+    // guest generation only from the effective PS4 base/Neo title mode.
+    constexpr bool d3d12_guest_isa_generation_qualified = false;
+    profile.supports_dpp_subset = shader_model >= D3D_SHADER_MODEL_6_4 && capabilities.wave_ops &&
+                                  dpp_wave64_compatible && capabilities.int64_shader_ops &&
+                                  d3d12_guest_isa_generation_qualified;
+    LOG_INFO(Core, "[UWP stage] DPP subset lowering={}", profile.supports_dpp_subset);
+    // The shader binary has no per-shader ASIC field; the per-title guest mode
+    // is applied later, when a shader is translated.
+    LOG_INFO(Core, "[UWP stage] host-only guest ISA profile qualified={}",
+             d3d12_guest_isa_generation_qualified);
+    profile.supports_vop3_co_u32_subset = profile.is_d3d12_profile && profile.supports_dpp_subset &&
+                                          d3d12_guest_isa_generation_qualified;
+    LOG_INFO(Core, "[UWP stage] VOP3B CO_U32 add/sub/reverse lowering={}",
+             profile.supports_vop3_co_u32_subset);
+    profile.supports_vop3_mad64_subset = profile.is_d3d12_profile && capabilities.wave_ops &&
+                                         dpp_wave64_compatible && capabilities.int64_shader_ops;
+    LOG_INFO(Core, "[UWP stage] GCN2 VOP3a MAD64 implicit-VCC host capability support={}",
+             profile.supports_vop3_mad64_subset);
+    // SAD/MSAD byte/short lowering is host-cheap but still needs a qualified guest opcode table.
+    profile.supports_vop3_sad_subset =
+        profile.is_d3d12_profile && d3d12_guest_isa_generation_qualified;
+    LOG_INFO(Core, "[UWP stage] VOP3 SAD/MSAD scalar U8/U16 lowering={}",
+             profile.supports_vop3_sad_subset);
+    // QSAD/MQSAD uses B64 S0 reads and U64 IR shifts; Int64ShaderOps is required even when
+    // V_MQSAD_U32_U8's B128 accumulator/result are decomposed into four U32 VGPRs.
+    profile.supports_vop3_sad_packed_subset = profile.is_d3d12_profile &&
+                                              capabilities.int64_shader_ops &&
+                                              d3d12_guest_isa_generation_qualified;
+    LOG_INFO(Core, "[UWP stage] VOP3 QSAD/MQSAD B64-source lowering={}",
+             profile.supports_vop3_sad_packed_subset);
+    profile.supports_mul_hi_24_subset = d3d12_guest_isa_generation_qualified;
+    LOG_INFO(Core, "[UWP stage] VOP2 MUL_HI 24-bit subset lowering={}",
+             profile.supports_mul_hi_24_subset);
+    // This subset reuses FP32 math and explicit half pack/unpack; it does not emit native HLSL
+    // 16-bit arithmetic and therefore does not require OPTIONS4.Native16BitShaderOpsSupported.
+    profile.supports_sdwa_f16_subset =
+        shader_model >= D3D_SHADER_MODEL_6_4 && d3d12_guest_isa_generation_qualified;
+    LOG_INFO(Core, "[UWP stage] SDWA F16 WORD subset lowering={}",
+             profile.supports_sdwa_f16_subset);
+    profile.supports_sdwa_vop1_subset =
+        shader_model >= D3D_SHADER_MODEL_6_4 && d3d12_guest_isa_generation_qualified;
+    LOG_INFO(Core, "[UWP stage] SDWA 32-bit VOP1 subset lowering={}",
+             profile.supports_sdwa_vop1_subset);
+    profile.supports_sdwa_vopc_subset =
+        profile.supports_dpp_subset && d3d12_guest_isa_generation_qualified;
+    LOG_INFO(Core, "[UWP stage] SDWA 32-bit VOPC/VCC subset lowering={}",
+             profile.supports_sdwa_vopc_subset);
+    switch (static_cast<D3D12_RESOURCE_BINDING_TIER>(capabilities.resource_binding_tier)) {
+    case D3D12_RESOURCE_BINDING_TIER_1:
+        descriptor_tier = DescriptorBindingTier::Tier1;
+        break;
+    case D3D12_RESOURCE_BINDING_TIER_2:
+        descriptor_tier = DescriptorBindingTier::Tier2;
+        break;
+    case D3D12_RESOURCE_BINDING_TIER_3:
+        descriptor_tier = DescriptorBindingTier::Tier3;
+        break;
+    default:
+        throw std::runtime_error("Unknown D3D12 resource binding tier");
+    }
+    feature_level_11_1_or_higher =
+        capabilities.feature_level >= static_cast<u32>(D3D_FEATURE_LEVEL_11_1);
+    LOG_INFO(Core, "[UWP stage] native resource binding tier={} feature level 11.1+={}",
+             u32(descriptor_tier), feature_level_11_1_or_higher);
+    native_float64 = capabilities.double_precision_float_shader_ops;
     profile.support_float64 = native_float64;
     profile.allow_fp64_to_fp32_lowering = false;
     profile.support_fp32_denorm_flush = true;
@@ -489,6 +617,28 @@ void ShaderCache::Initialize(ID3D12Device* device, const ResourceCache* resource
     profile.needs_unified_buffer_types = true;
     profile.needs_buffer_offsets = true;
     profile.reject_approximate_fmask_access = true;
+    profile.supports_fmask_storage_lowering = true;
+}
+Shader::Profile ShaderCache::GuestShaderProfile() const {
+    auto guest_profile = profile;
+    guest_profile.guest_isa_generation = Shader::GuestIsaGeneration::Unknown;
+    guest_profile.supports_vop3_mad64_subset = false;
+    guest_profile.supports_vop3_lerp_u8_subset = false;
+    const bool neo_guest_mode =
+        EmulatorSettings.IsNeo() && Common::ElfInfo::Instance().GetPSFAttributes().support_neo_mode;
+    if (!neo_guest_mode) {
+        guest_profile.guest_isa_generation = Shader::GuestIsaGeneration::Gcn2SeaIslands;
+        // The base PS4/Liverpool profile uses the GCN2 opcode table. These
+        // lowerings have exact GCN2 raw mappings and require no newer ISA form.
+        guest_profile.supports_vop3_lerp_u8_subset = guest_profile.is_d3d12_profile;
+        guest_profile.supports_vop3_sad_subset = guest_profile.is_d3d12_profile;
+        guest_profile.supports_vop3_sad_packed_subset =
+            guest_profile.is_d3d12_profile && guest_profile.support_int64;
+        guest_profile.supports_mul_hi_24_subset = guest_profile.is_d3d12_profile;
+        guest_profile.supports_vop3_mad64_subset =
+            guest_profile.is_d3d12_profile && profile.supports_vop3_mad64_subset;
+    }
+    return guest_profile;
 }
 void TessellationLink::ValidateNativeTopology() const {
     if (u32(type) > u32(AmdGpu::TessellationType::Quad))
@@ -521,9 +671,11 @@ std::unique_ptr<TranslatedShader> ShaderCache::Translate(Shader::ShaderParams pa
     const auto stage = static_cast<u32>(runtime.sw_stage);
     if (stage >= pools.size())
         throw std::runtime_error("Invalid D3D12 shader stage");
+    const auto guest_profile = GuestShaderProfile();
     if (!EmulatorSettings.IsInlineFetchShader()) {
         for (const auto& variant : variants) {
             if (variant->direct_memory_access != EmulatorSettings.IsDirectMemoryAccessEnabled() ||
+                variant->guest_isa_generation != guest_profile.guest_isa_generation ||
                 !SameRuntime(variant->input_runtime, runtime) ||
                 variant->translated.info.pgm_hash != params.hash ||
                 variant->translated.info.pgm_base != params.Base() ||
@@ -533,7 +685,7 @@ std::unique_ptr<TranslatedShader> ShaderCache::Translate(Shader::ShaderParams pa
                 !std::ranges::equal(variant->copy_code, runtime.hw.gs.vs_copy))
                 continue;
             auto translated = std::make_unique<TranslatedShader>(
-                TranslatedShader{variant->translated, {}, {}, {}});
+                TranslatedShader{variant->translated, {}, {}, {}, guest_profile});
             if (runtime.hw_stage == Shader::HwStage::Geometry)
                 translated->shader.runtime.hw.gs.vs_copy = runtime.hw.gs.vs_copy;
             BindUserData(translated->shader.info, params.user_data);
@@ -558,9 +710,10 @@ std::unique_ptr<TranslatedShader> ShaderCache::TranslateUncached(Shader::ShaderP
         pools[stage] = std::make_unique<Shader::Pools>();
     auto translated = std::make_unique<TranslatedShader>(TranslatedShader{
         {Shader::Info{runtime.hw_stage, runtime.sw_stage, params}, runtime, {}, {}, {}}, {}});
+    translated->guest_profile = GuestShaderProfile();
     auto& shader = translated->shader;
-    translated->program.emplace(
-        Shader::TranslateProgram(params.code, *pools[stage], shader.info, shader.runtime, profile));
+    translated->program.emplace(Shader::TranslateProgram(
+        params.code, *pools[stage], shader.info, shader.runtime, translated->guest_profile));
     if (shader.info.uses_fp64 && !native_float64)
         throw std::runtime_error(
             "Guest FP64 requires native double precision or a precise software implementation");
@@ -571,6 +724,7 @@ std::unique_ptr<TranslatedShader> ShaderCache::TranslateUncached(Shader::ShaderP
         auto variant = std::make_shared<ShaderVariant>();
         variant->code.assign(params.code.begin(), params.code.end());
         variant->input_runtime = input_runtime;
+        variant->guest_isa_generation = translated->guest_profile.guest_isa_generation;
         variant->direct_memory_access = EmulatorSettings.IsDirectMemoryAccessEnabled();
         if (runtime.hw_stage == Shader::HwStage::Geometry) {
             variant->copy_code.assign(input_runtime.hw.gs.vs_copy.begin(),
@@ -599,6 +753,11 @@ PreparedShader ShaderCache::Prepare(std::unique_ptr<TranslatedShader> translated
                                     Shader::Backend::Bindings bindings,
                                     std::span<const ShaderResourceRange> stage_resources,
                                     const IndexFetch& indices) {
+    if (translated->guest_profile.guest_isa_generation !=
+        GuestShaderProfile().guest_isa_generation) {
+        throw std::runtime_error(
+            "Guest ISA mode changed between shader translation and preparation");
+    }
     const u64 mapping_generation = resources ? resources->MappingGeneration() : 0;
     auto variant = translated->variant;
     if (!translated->program) {
@@ -620,6 +779,7 @@ PreparedShader ShaderCache::Prepare(std::unique_ptr<TranslatedShader> translated
         translated = TranslateUncached(*translated->params, runtime);
         translated->variant = variant;
     }
+    const auto& guest_profile = translated->guest_profile;
     auto& result = translated->shader;
     auto& program = *translated->program;
     result.start_bindings = bindings;
@@ -634,14 +794,14 @@ PreparedShader ShaderCache::Prepare(std::unique_ptr<TranslatedShader> translated
     if (LowerBufferAliases(result, program, resources) || image_aliases || index_fetch) {
         Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
         Shader::Optimization::DeadCodeEliminationPass(program);
-        Shader::Optimization::CollectShaderInfoPass(program, profile);
+        Shader::Optimization::CollectShaderInfoPass(program, guest_profile);
     }
     result.info.ResolveDirectReads();
     if (result.info.buffers.size() >
         Shader::NUM_BUFFERS - std::min(bindings.buffer, Shader::NUM_BUFFERS))
         throw std::runtime_error("D3D12 shader stages exceed push buffer offset capacity");
-    const auto words =
-        Shader::Backend::SPIRV::EmitSPIRV(profile, result.runtime, program, result.end_bindings);
+    const auto words = Shader::Backend::SPIRV::EmitSPIRV(guest_profile, result.runtime, program,
+                                                         result.end_bindings);
     result.info.RefreshFlatBuf();
     PreparedShader prepared{std::move(result), words};
     if (variant && (!resources || mapping_generation == resources->MappingGeneration())) {
@@ -795,7 +955,9 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(
     common_options.vertex.flip_pos_x = flip_x;
     cross.set_common_options(common_options);
     auto result = std::make_shared<ShaderBinary>();
-    const auto resources = cross.get_shader_resources();
+    auto active_variables = cross.get_active_interface_variables();
+    cross.set_enabled_interface_variables(active_variables);
+    const auto resources = cross.get_shader_resources(active_variables);
     const u32 space = static_cast<u32>(stage) + 1;
     const auto bind = [&](const auto& list, ResourceKind kind, D3D12_DESCRIPTOR_RANGE_TYPE type) {
         for (const auto& resource : list) {
@@ -839,6 +1001,8 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileSpirv(
     cross.add_hlsl_resource_binding(push);
     if (stage == Shader::SwStage::Compute) {
         if (const auto workgroups = cross.remap_num_workgroups_builtin()) {
+            active_variables.insert(workgroups);
+            cross.set_enabled_interface_variables(active_variables);
             constexpr u32 auxiliary_set = UINT32_MAX - 1;
             cross.set_decoration(workgroups, spv::DecorationDescriptorSet, auxiliary_set);
             cross.set_decoration(workgroups, spv::DecorationBinding, 0);
@@ -934,12 +1098,17 @@ void ShaderCache::Remember(std::vector<u32> key, std::shared_ptr<const ShaderBin
     cache.emplace(std::move(key), result);
 }
 std::shared_ptr<const ShaderBinary> ShaderCache::CompileConstantAlphaBlend(
-    const ShaderBinary& fragment, float alpha) {
+    const ShaderBinary& fragment, float alpha, const StageOutput& primary_output) {
     auto source = fragment.hlsl;
     const auto entry = source.find(" main(");
-    if (entry == std::string::npos ||
-        SemanticMember(source, "SPIRV_Cross_Output", "SV_Target0").empty())
-        throw std::runtime_error("Constant alpha blending requires color output zero");
+    if (primary_output.semantic != "SV_Target" || primary_output.index >= 8 ||
+        primary_output.integer || primary_output.component_mask != 0x0f ||
+        entry == std::string::npos)
+        throw std::runtime_error(
+            "Constant alpha blending requires one fully reflected floating-point color output");
+    const auto guest_semantic = "SV_Target" + std::to_string(primary_output.index);
+    if (SemanticMember(source, "SPIRV_Cross_Output", guest_semantic).empty())
+        throw std::runtime_error("Constant alpha blend output metadata does not match HLSL");
     const auto close = source.find(')', entry);
     if (close == std::string::npos)
         throw std::runtime_error("Invalid constant alpha blend fragment entry");
@@ -962,15 +1131,28 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileConstantAlphaBlend(
     const std::regex members{R"(((?:float|uint|int)[1-4]?)\s+(\w+)\s*:\s*(\w+)\s*;)"};
     const auto output = source.substr(output_start, output_end - output_start);
     std::string declaration = "\nstruct ShadBlendOutput {\n", copies;
+    bool copied_primary_output{};
     for (std::sregex_iterator field(output.begin(), output.end(), members), end; field != end;
          ++field) {
         const auto semantic = (*field)[3].str();
-        if (semantic.starts_with("SV_Target") && semantic != "SV_Target0")
-            continue;
-        declaration += field->str() + "\n";
         const auto name = (*field)[2].str();
+        if (semantic.starts_with("SV_Target")) {
+            if (semantic != guest_semantic)
+                continue;
+            auto member = field->str();
+            const auto semantic_offset = member.rfind(guest_semantic);
+            if (semantic_offset == std::string::npos)
+                throw std::runtime_error("Invalid constant alpha blend output semantic");
+            member.replace(semantic_offset, guest_semantic.size(), "SV_Target0");
+            declaration += member + "\n";
+            copied_primary_output = true;
+        } else {
+            declaration += field->str() + "\n";
+        }
         copies += "value." + name + " = guest." + name + ";\n";
     }
+    if (!copied_primary_output)
+        throw std::runtime_error("Constant alpha blend output disappeared from HLSL interface");
     declaration += "float4 shadBlendAlpha : SV_Target1; };\n";
     const auto renamed = source.find(" main(");
     source.replace(renamed + 1, 4, "shad_blend_guest_main");
@@ -1677,7 +1859,7 @@ std::vector<ShaderCache::StageOutput> ShaderCache::StageOutputs(const ShaderBina
             break;
         }
         outputs.push_back({semantic, parameter.SemanticIndex,
-                           u32(std::popcount(u32(parameter.Mask))),
+                           u32(std::popcount(u32(parameter.Mask))), static_cast<u8>(parameter.Mask),
                            parameter.ComponentType != D3D_REGISTER_COMPONENT_FLOAT32,
                            parameter.ComponentType == D3D_REGISTER_COMPONENT_SINT32});
     }

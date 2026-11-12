@@ -2,19 +2,21 @@
 #include "uwp/d3d12_presenter.h"
 
 #include <algorithm>
+#include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstring>
-#include <bit>
-#include <half.hpp>
-#include "core/emulator_settings.h"
 #include <stdexcept>
 #include <thread>
-#include <chrono>
+#include <fmt/format.h>
+#include <half.hpp>
 #include <winrt/base.h>
-#include "core/memory.h"
 #include "common/logging/log.h"
+#include "core/emulator_settings.h"
+#include "core/memory.h"
 #include "uwp/resident_conversion.h"
 #include "uwp/session.h"
+#include "video_core/renderer_d3d12/native_capabilities_query.h"
 #include "video_core/renderer_d3d12/profile.h"
 #include "video_core/renderer_d3d12/temporal_jitter.h"
 #include "video_core/texture_cache/cpu_tiling.h"
@@ -22,6 +24,13 @@
 using Microsoft::WRL::ComPtr;
 
 namespace Core::Uwp {
+namespace {
+bool IsDxgiDeviceLossStatus(HRESULT status) noexcept {
+    return status == DXGI_ERROR_DEVICE_REMOVED || status == DXGI_ERROR_DEVICE_RESET ||
+           status == DXGI_ERROR_DEVICE_HUNG || status == DXGI_ERROR_DRIVER_INTERNAL_ERROR;
+}
+} // namespace
+
 struct D3D12Presenter::Frame final : VideoCore::PresentationFrame {
     std::vector<u8> pixels;
     D3D12Resource upload, spatial_input;
@@ -295,6 +304,7 @@ void D3D12Presenter::SetGamma(float value) {
 void D3D12Presenter::CheckEnvironment() {
     D3D12DeviceContext device;
     device.Initialize();
+    static_cast<void>(D3D12::QueryNativeDeviceCapabilities(device.Device()));
     D3D12ResourceAllocator allocator;
     allocator.Initialize(device.Device(), 1024 * 1024);
     D3D12Resource upload;
@@ -349,6 +359,7 @@ void D3D12Presenter::CheckEnvironment() {
 
 void D3D12Presenter::Initialize(const ShadPS4Config& config) {
     context.Initialize();
+    static_cast<void>(D3D12::QueryNativeDeviceCapabilities(context.Device()));
     resources.Initialize(context.Device(), 512ULL * 1024 * 1024);
     descriptors.Initialize(context.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, false);
     static_cast<void>(descriptors.Allocate(2));
@@ -522,8 +533,46 @@ void D3D12Presenter::ConvertResident(Frame& frame, CommandFrame& command_frame,
     frame.upload_sdr_white = sdr_white_nits;
 }
 void D3D12Presenter::RenderFrame() {
+    try {
+        RenderFrameCore();
+    } catch (const winrt::hresult_error& error) {
+        const HRESULT failure = error.code().value;
+        const HRESULT device_reason =
+            context.Device() ? context.Device()->GetDeviceRemovedReason() : S_OK;
+        if (!IsDxgiDeviceLossStatus(failure) && SUCCEEDED(device_reason))
+            throw;
+        const auto message = fmt::format(
+            "D3D12 presenter device loss during frame processing (HRESULT={:08x}, "
+            "GetDeviceRemovedReason={:08x}); full device/queue/swapchain/backbuffer recreation "
+            "and XAML reattachment are NOT_IMPLEMENTED; failing session",
+            static_cast<uint32_t>(failure), static_cast<uint32_t>(device_reason));
+        LOG_ERROR(Core, "{}", message);
+        throw std::runtime_error(message);
+    } catch (...) {
+        const HRESULT device_reason =
+            context.Device() ? context.Device()->GetDeviceRemovedReason() : S_OK;
+        if (SUCCEEDED(device_reason))
+            throw;
+        const auto message = fmt::format(
+            "D3D12 presenter device loss during frame processing "
+            "(GetDeviceRemovedReason={:08x}); full device/queue/swapchain/backbuffer recreation "
+            "and XAML reattachment are NOT_IMPLEMENTED; failing session",
+            static_cast<uint32_t>(device_reason));
+        LOG_ERROR(Core, "{}", message);
+        throw std::runtime_error(message);
+    }
+}
+
+void D3D12Presenter::RenderFrameCore() {
     presenter_profile.Frame("present_interval");
     D3D12::ProfileScope timing{presenter_profile, "present_frame"};
+    if (occluded) {
+        const HRESULT status = swapchain->Present(0, DXGI_PRESENT_TEST);
+        if (status == DXGI_STATUS_OCCLUDED)
+            return;
+        winrt::check_hresult(status);
+        occluded = false;
+    }
     const bool has_frame_size = last_frame && last_frame->width && last_frame->height;
     u32 output_width = has_frame_size ? last_frame->width : display_width;
     u32 output_height = has_frame_size ? last_frame->height : display_height;
@@ -676,8 +725,14 @@ void D3D12Presenter::RenderFrame() {
     const auto ticket = context.Submit(commands);
     command_frame.fence = ticket;
     command_frame.submitted_frame = last_frame;
-    ProfileSample(presenter_profile, "swapchain_present", 128,
-                  [&] { winrt::check_hresult(swapchain->Present(1, 0)); });
+    ProfileSample(presenter_profile, "swapchain_present", 128, [&] {
+        const HRESULT status = swapchain->Present(1, 0);
+        if (status == DXGI_STATUS_OCCLUDED) {
+            occluded = true;
+            return;
+        }
+        winrt::check_hresult(status);
+    });
 }
 
 void D3D12Presenter::Resize(uint32_t new_width, uint32_t new_height, float scale_x, float scale_y) {
@@ -747,6 +802,11 @@ void D3D12Presenter::ResizeBuffers(uint32_t new_width, uint32_t new_height, DXGI
     }
     context.WaitForGpu();
     for (auto& command_frame : command_frames) {
+        // ResizeBuffers also requires releasing indirect back-buffer references held by command
+        // lists.
+        winrt::check_hresult(command_frame.allocator->Reset());
+        winrt::check_hresult(command_frame.commands->Reset(command_frame.allocator.Get(), nullptr));
+        winrt::check_hresult(command_frame.commands->Close());
         command_frame.fence = 0;
         command_frame.submitted_frame.reset();
         command_frame.fsr.ResetImages();

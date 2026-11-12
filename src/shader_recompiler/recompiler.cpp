@@ -1,8 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <stdexcept>
+#include <string>
+
 #include "common/logging/classes.h"
 #include "shader_recompiler/frontend/control_flow_graph.h"
+#include "shader_recompiler/frontend/d3d12_isa_generation_guard.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/structured_control_flow.h"
 #include "shader_recompiler/frontend/translate/translate.h"
@@ -69,12 +73,37 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     }
 
     Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
-    Gcn::GcnDecodeContext decoder;
+    Gcn::GcnDecodeContext decoder{profile.guest_isa_generation};
 
     // Decode and save instructions
     IR::Program program{info};
     program.ins_list.reserve(code.size());
     while (!slice.atEnd()) {
+        if (profile.is_d3d12_profile) {
+            if (const auto hazard =
+                    Gcn::FindD3D12IsaRawHazard(slice.at(0), profile.guest_isa_generation)) {
+                const char* format_name = "VOP1";
+                switch (hazard->format) {
+                case Gcn::D3D12IsaRawFormat::VOP1:
+                    format_name = "VOP1";
+                    break;
+                case Gcn::D3D12IsaRawFormat::VOP2:
+                    format_name = "VOP2";
+                    break;
+                case Gcn::D3D12IsaRawFormat::VOPC:
+                    format_name = "VOPC";
+                    break;
+                case Gcn::D3D12IsaRawFormat::VOP3:
+                    format_name = "VOP3";
+                    break;
+                }
+                throw std::runtime_error(std::string{"D3D12 guest ISA raw encoding remains "
+                                                     "quarantined for this profile; refusing "} +
+                                         Gcn::D3D12IsaHazardName(hazard->kind) + " raw " +
+                                         format_name + " opcode " +
+                                         std::to_string(hazard->raw_opcode) + " before decode");
+            }
+        }
         program.ins_list.emplace_back(decoder.decodeInstruction(slice));
     }
 

@@ -16,22 +16,23 @@
 #include <winrt/base.h>
 #include "common/key_manager.h"
 #include "common/logging/log.h"
-#include "core/address_space.h"
-#include "core/uwp/guest_reservations.h"
 #include "common/path_util.h"
 #include "common/scope_exit.h"
+#include "core/address_space.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/audio/audioout_backend.h"
 #include "core/user_settings.h"
+#include "core/uwp/guest_memory.h"
+#include "core/uwp/guest_reservations.h"
 #include "emulator.h"
 #include "uwp/dozen_host.h"
-#include "uwp/native_host.h"
 #include "uwp/gamepad_input.h"
+#include "uwp/native_host.h"
 #include "uwp/text_input.h"
 #include "uwp/xaudio2_output.h"
-#include "video_core/renderer_d3d12/temporal_jitter.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_d3d12/temporal_jitter.h"
 
 namespace {
 std::atomic<uint32_t> state{SHADPS4_UNINITIALIZED};
@@ -48,6 +49,8 @@ std::atomic<MemoryFailureState> memory_failure_state{};
 std::atomic<uint32_t> memory_failure_error{};
 std::atomic<uint64_t> memory_failure_address{};
 std::atomic<uint64_t> memory_failure_access{};
+std::mutex shader_compilation_mutex;
+ShadPS4ShaderCompilationStatus shader_compilation_status{sizeof(ShadPS4ShaderCompilationStatus)};
 std::mutex session_mutex;
 std::mutex guest_control_mutex;
 std::mutex worker_stop_mutex;
@@ -186,6 +189,12 @@ void FailGuestMemory(std::uint32_t error, std::uint64_t address, std::uint64_t a
     session_failed.store(true);
     guest_ready.store(false);
     stop_requested.store(true);
+}
+void UpdateShaderCompilation(std::uint32_t stage, std::uint32_t processed, std::uint32_t total,
+                             std::uint32_t compiled) {
+    std::scoped_lock lock{shader_compilation_mutex};
+    shader_compilation_status = {sizeof(ShadPS4ShaderCompilationStatus), stage, processed, total,
+                                 compiled};
 }
 bool StopRequested() {
     return stop_requested.load();
@@ -398,6 +407,15 @@ int32_t shadps4_initialize(const ShadPS4Config* config) {
     }
 }
 
+int32_t shadps4_get_shader_compilation_status(ShadPS4ShaderCompilationStatus* status) {
+    if (!status || status->size < sizeof(ShadPS4ShaderCompilationStatus)) {
+        return -1;
+    }
+    std::scoped_lock lock{shader_compilation_mutex};
+    *status = shader_compilation_status;
+    return 0;
+}
+
 int32_t shadps4_request_presentation_capture() {
     if (state.load() != SHADPS4_RUNNING || stop_requested.load() ||
         Core::Uwp::NativeGraphicsSelected())
@@ -451,6 +469,7 @@ int32_t shadps4_run(const wchar_t* executable) {
     if (!state.compare_exchange_strong(expected, SHADPS4_RUNNING)) {
         return Fail("The core is not ready for a guest session");
     }
+    Core::Uwp::UpdateShaderCompilation(SHADPS4_SHADERS_PREPARING);
     Core::Emulator* emulator{};
     try {
         APTTYPE apartment;
@@ -619,6 +638,19 @@ int32_t shadps4_render_host_frame() {
                     winrt::to_string(exception.message()));
     } catch (const std::exception& exception) {
         return Fail(exception.what());
+    }
+}
+
+int32_t shadps4_get_memory_stats(ShadPS4MemoryStats* stats) {
+    if (!stats)
+        return -1;
+    *stats = {};
+    try {
+        stats->ram_used = winrt::Windows::System::MemoryManager::AppMemoryUsage();
+        stats->ram_total = winrt::Windows::System::MemoryManager::AppMemoryUsageLimit();
+        return uwp_memory_swap_statistics(&stats->swap_used, &stats->swap_total) ? 0 : 1;
+    } catch (...) {
+        return -1;
     }
 }
 
