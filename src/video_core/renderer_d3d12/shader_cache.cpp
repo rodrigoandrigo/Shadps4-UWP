@@ -1646,7 +1646,7 @@ uint LogicUnsignedFloat(float v, uint mantissa) {
 }
 std::shared_ptr<const ShaderBinary> ShaderCache::CompileRectangle(
     const ShaderBinary& vertex, const Shader::HwFragmentRuntimeInfo& fragment, bool flat_last,
-    RectangleMode mode) {
+    RectangleMode mode, bool transform_viewport) {
     const bool points = mode == RectangleMode::Points;
     const bool quads = mode == RectangleMode::QuadFill || mode == RectangleMode::QuadStripFill;
     const bool quad_strip = mode == RectangleMode::QuadStripFill;
@@ -1665,6 +1665,9 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileRectangle(
         output.insert(output.rfind("};"), "uint shadPrimitiveId : SV_PrimitiveID; ");
         result->hlsl += "\n" + output;
     }
+    if (transform_viewport)
+        result->hlsl += "\ncbuffer ViewportConfig : register(b0,space102) { float4 ViewportXY[16]; "
+                        "uint4 ViewportFlags[4]; };\n";
     const u32 max_vertices = points ? 6 : 4;
     const std::string stream = points ? "PointStream" : "TriangleStream";
     result->hlsl += "\n[maxvertexcount(" + std::to_string(max_vertices) +
@@ -1728,6 +1731,16 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileRectangle(
             result->hlsl += "v[3]." + name + " = input[0]." + name + " * weight.x + input[1]." +
                             name + " * weight.y + input[2]." + name + " * weight.z;\n";
         }
+    }
+    if (transform_viewport) {
+        const auto value = "v[i]." + position;
+        result->hlsl += "for(uint i=0;i<4;++i) { uint flags = ViewportFlags[0].x; "
+                        "if ((flags & 4) != 0) { float2 window = " +
+                        value + ".xy * ViewportXY[0].xy + ViewportXY[0].zw; " + value +
+                        ".xy = float2(window.x/8192.0-1.0,1.0-window.y/8192.0); } else { "
+                        "if((flags&1)!=0) " +
+                        value + ".x = -" + value + ".x; if((flags&2)!=0) " + value + ".y = -" +
+                        value + ".y; } }\n";
     }
     if (quads) {
         result->hlsl += "for(uint i=0;i<4;++i) { ShadQuadOutput expanded; "

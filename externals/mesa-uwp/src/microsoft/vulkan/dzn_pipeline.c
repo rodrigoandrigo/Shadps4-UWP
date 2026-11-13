@@ -14,7 +14,7 @@
  *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
@@ -275,6 +275,145 @@ dzn_pso_subobject_size(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type, size_t *off)
    }
 }
 
+static void
+dzn_diagnose_pso_stream(const D3D12_PIPELINE_STATE_STREAM_DESC *stream)
+{
+   static int reports;
+   if (p_atomic_inc_return(&reports) > 8)
+      return;
+   const uint8_t *start = stream->pPipelineStateSubobjectStream;
+   const uint8_t *p = start, *end = start + stream->SizeInBytes;
+   mesa_loge("[DozenPsoParameters] bytes=%zu", stream->SizeInBytes);
+   while (p < end) {
+      if ((size_t)(end - p) < sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE)) {
+         mesa_loge("[DozenPsoParameters] invalid=truncated_type offset=%zu", p - start);
+         break;
+      }
+      D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = *(const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE *)p;
+      size_t off = 0, size = dzn_pso_subobject_size(type, &off);
+      if (!size || ALIGN_POT(size, sizeof(void *)) > (size_t)(end - p)) {
+         mesa_loge("[DozenPsoParameters] invalid=subobject_size type=%u offset=%zu", type, p - start);
+         break;
+      }
+      const void *data = p + off;
+      mesa_loge("[DozenPsoParameters] type=%u offset=%zu size=%zu", type, p - start, size);
+      switch (type) {
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE:
+         mesa_loge("[DozenPsoParameters] root=%p", *(void *const *)data);
+         break;
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS: {
+         const D3D12_SHADER_BYTECODE *bc = data;
+         mesa_loge("[DozenPsoParameters] shader_type=%u bytes=%zu present=%u",
+                   type, bc->BytecodeLength, bc->pShaderBytecode != NULL);
+         break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: {
+         const D3D12_DEPTH_STENCIL_DESC1 *ds = data;
+         mesa_loge("[DozenPsoParameters] depth_enable=%u write=%u func=%u bounds=%u stencil=%u read_mask=%u write_mask=%u",
+                   ds->DepthEnable, ds->DepthWriteMask, ds->DepthFunc, ds->DepthBoundsTestEnable,
+                   ds->StencilEnable, ds->StencilReadMask, ds->StencilWriteMask);
+         const D3D12_DEPTH_STENCILOP_DESC *faces[] = { &ds->FrontFace, &ds->BackFace };
+         for (unsigned i = 0; i < 2; i++)
+            mesa_loge("[DozenPsoParameters] face=%u fail=%u depth_fail=%u pass=%u func=%u",
+                      i, faces[i]->StencilFailOp, faces[i]->StencilDepthFailOp,
+                      faces[i]->StencilPassOp, faces[i]->StencilFunc);
+         break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2: {
+         const D3D12_DEPTH_STENCIL_DESC2 *ds = data;
+         mesa_loge("[DozenPsoParameters] depth2_enable=%u write=%u func=%u bounds=%u stencil=%u front=%u/%u/%u/%u back=%u/%u/%u/%u",
+                   ds->DepthEnable, ds->DepthWriteMask, ds->DepthFunc, ds->DepthBoundsTestEnable,
+                   ds->StencilEnable, ds->FrontFace.StencilFailOp, ds->FrontFace.StencilDepthFailOp,
+                   ds->FrontFace.StencilPassOp, ds->FrontFace.StencilFunc,
+                   ds->BackFace.StencilFailOp, ds->BackFace.StencilDepthFailOp,
+                   ds->BackFace.StencilPassOp, ds->BackFace.StencilFunc);
+         break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: {
+         const D3D12_INPUT_LAYOUT_DESC *layout = data;
+         mesa_loge("[DozenPsoParameters] input_elements=%u", layout->NumElements);
+         for (unsigned i = 0; i < MIN2(layout->NumElements, 32); i++) {
+            const D3D12_INPUT_ELEMENT_DESC *element = &layout->pInputElementDescs[i];
+            mesa_loge("[DozenPsoParameters] input=%u semantic=%s/%u dxgi=%u slot=%u offset=%u class=%u step=%u",
+                      i, element->SemanticName ? element->SemanticName : "<null>",
+                      element->SemanticIndex, element->Format, element->InputSlot,
+                      element->AlignedByteOffset, element->InputSlotClass,
+                      element->InstanceDataStepRate);
+         }
+         break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER: {
+         const D3D12_RASTERIZER_DESC *rs = data;
+         mesa_loge("[DozenPsoParameters] fill=%u cull=%u front_ccw=%u bias=%d clamp=%f slope=%f clip=%u msaa=%u line_aa=%u forced_samples=%u conservative=%u",
+                   rs->FillMode, rs->CullMode, rs->FrontCounterClockwise, rs->DepthBias,
+                   rs->DepthBiasClamp, rs->SlopeScaledDepthBias, rs->DepthClipEnable,
+                   rs->MultisampleEnable, rs->AntialiasedLineEnable,
+                   rs->ForcedSampleCount, rs->ConservativeRaster);
+         break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1: {
+         const D3D12_RASTERIZER_DESC1 *rs = data;
+         mesa_loge("[DozenPsoParameters] rasterizer1 fill=%u cull=%u bias=%f clamp=%f slope=%f clip=%u forced_samples=%u conservative=%u",
+                   rs->FillMode, rs->CullMode, rs->DepthBias, rs->DepthBiasClamp,
+                   rs->SlopeScaledDepthBias, rs->DepthClipEnable,
+                   rs->ForcedSampleCount, rs->ConservativeRaster);
+         break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2: {
+         const D3D12_RASTERIZER_DESC2 *rs = data;
+         mesa_loge("[DozenPsoParameters] rasterizer2 fill=%u cull=%u bias=%f clamp=%f slope=%f clip=%u line_mode=%u forced_samples=%u conservative=%u",
+                   rs->FillMode, rs->CullMode, rs->DepthBias, rs->DepthBiasClamp,
+                   rs->SlopeScaledDepthBias, rs->DepthClipEnable, rs->LineRasterizationMode,
+                   rs->ForcedSampleCount, rs->ConservativeRaster);
+         break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: {
+         const D3D12_BLEND_DESC *blend = data;
+         mesa_loge("[DozenPsoParameters] alpha_to_coverage=%u independent_blend=%u",
+                   blend->AlphaToCoverageEnable, blend->IndependentBlendEnable);
+         for (unsigned i = 0; i < 8; i++) {
+            const D3D12_RENDER_TARGET_BLEND_DESC *rt = &blend->RenderTarget[i];
+            mesa_loge("[DozenPsoParameters] blend_rt=%u enable=%u logic_enable=%u src=%u dst=%u op=%u src_alpha=%u dst_alpha=%u alpha_op=%u logic=%u write_mask=%u",
+                      i, rt->BlendEnable, rt->LogicOpEnable, rt->SrcBlend, rt->DestBlend,
+                      rt->BlendOp, rt->SrcBlendAlpha, rt->DestBlendAlpha,
+                      rt->BlendOpAlpha, rt->LogicOp, rt->RenderTargetWriteMask);
+         }
+         break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT:
+         mesa_loge("[DozenPsoParameters] dsv_dxgi=%u", *(const DXGI_FORMAT *)data);
+         break;
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: {
+         const struct D3D12_RT_FORMAT_ARRAY *rt = data;
+         mesa_loge("[DozenPsoParameters] rt_count=%u", rt->NumRenderTargets);
+         for (unsigned i = 0; i < MIN2(rt->NumRenderTargets, 8); i++)
+            mesa_loge("[DozenPsoParameters] rt=%u dxgi=%u", i, rt->RTFormats[i]);
+         break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC: {
+         const DXGI_SAMPLE_DESC *sample = data;
+         mesa_loge("[DozenPsoParameters] samples=%u quality=%u", sample->Count, sample->Quality);
+         break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY:
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE:
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK:
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK:
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS:
+         mesa_loge("[DozenPsoParameters] value=%u", *(const UINT *)data);
+         break;
+      default:
+         break;
+      }
+      p += ALIGN_POT(size, sizeof(void *));
+   }
+}
+
 static const GUID dzn_IID_ID3D12PipelineLibrary1 =
    { 0x80eabf42, 0x2568, 0x4e5e, { 0xbd, 0x82, 0xc3, 0x7f, 0x86, 0x96, 0x1d, 0xc3 } };
 
@@ -472,6 +611,8 @@ dzn_create_pso(struct dzn_device *device, const D3D12_PIPELINE_STATE_STREAM_DESC
 {
    const uint64_t diagnostic = DZN_COMPILE_BEGIN("pso");
    HRESULT result = dzn_create_pso_impl(device, desc, out, at_draw);
+   if (result == E_INVALIDARG)
+      dzn_diagnose_pso_stream(desc);
    DZN_COMPILE_END(diagnostic, result);
    return result;
 }
@@ -2617,16 +2758,36 @@ dzn_graphics_pipeline_translate_zsa(struct dzn_device *device,
          d3d12_gfx_pipeline_state_stream_new_desc(out, DEPTH_STENCIL2, D3D12_DEPTH_STENCIL_DESC2, stream_desc);
          pipeline->templates.desc_offsets.ds = (uintptr_t)stream_desc - (uintptr_t)out->pPipelineStateSubobjectStream;
          memset(stream_desc, 0, sizeof(*stream_desc));
+         stream_desc->DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+         stream_desc->FrontFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+         stream_desc->FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+         stream_desc->FrontFace.StencilPassOp = D3D12_STENCIL_OP_KEEP;
+         stream_desc->FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+         stream_desc->BackFace = stream_desc->FrontFace;
+
       } else {
          d3d12_gfx_pipeline_state_stream_new_desc(out, DEPTH_STENCIL1, D3D12_DEPTH_STENCIL_DESC1, stream_desc);
          pipeline->templates.desc_offsets.ds = (uintptr_t)stream_desc - (uintptr_t)out->pPipelineStateSubobjectStream;
          memset(stream_desc, 0, sizeof(*stream_desc));
+         stream_desc->DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+         stream_desc->FrontFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+         stream_desc->FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+         stream_desc->FrontFace.StencilPassOp = D3D12_STENCIL_OP_KEEP;
+         stream_desc->FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+         stream_desc->BackFace = stream_desc->FrontFace;
+
       }
       return;
    }
 
    D3D12_DEPTH_STENCIL_DESC2 desc;
    memset(&desc, 0, sizeof(desc));
+   desc.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+   desc.FrontFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+   desc.FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+   desc.FrontFace.StencilPassOp = D3D12_STENCIL_OP_KEEP;
+   desc.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+   desc.BackFace = desc.FrontFace;
 
    bool has_no_depth = ri && ri->depthAttachmentFormat == VK_FORMAT_UNDEFINED;
    bool has_no_stencil = ri && ri->stencilAttachmentFormat == VK_FORMAT_UNDEFINED;

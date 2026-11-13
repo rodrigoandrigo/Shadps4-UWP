@@ -1031,13 +1031,20 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
     std::shared_ptr<const ShaderBinary> line_expand;
     stages.push_back(&vertex);
     auto end_bindings = vertex.end_bindings;
+    const bool direct_rectangle_viewport =
+        request.rectangles && request.viewport_transform && request.viewport_count == 1 &&
+        !request.viewport_index_enabled && !request.geometry && !domain && !request.flat_last &&
+        request.faces.empty() && !request.point_fill && !request.line_expand &&
+        !request.rectangle_points &&
+        (!translated_fragment ||
+         !translated_fragment->shader.info.loads.GetAny(Shader::IR::Attribute::PrimitiveId));
     const bool capture_geometry =
-        draw_enabled &&
-        (!request.faces.empty() || request.flat_last || request.viewport_transform ||
-         (request.geometry || domain ||
-          (request.line_expand && request.line_pattern_scale > 0 &&
-           request.line_pattern != u16(0xffff))) &&
-             (request.point_fill || request.line_expand));
+        draw_enabled && (!request.faces.empty() || request.flat_last ||
+                         (request.viewport_transform && !direct_rectangle_viewport) ||
+                         (request.geometry || domain ||
+                          (request.line_expand && request.line_pattern_scale > 0 &&
+                           request.line_pattern != u16(0xffff))) &&
+                             (request.point_fill || request.line_expand));
     if (request.geometry) {
         geometry.emplace(compile_stage(std::move(translated_geometry), end_bindings,
                                        !request.viewport_transform && request.flip_y, false, false,
@@ -1118,7 +1125,7 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
                               ? ShaderCache::RectangleMode::Wireframe
                               : ShaderCache::RectangleMode::Fill;
         rectangle = shaders.CompileRectangle(*vertex.binary, request.fragment_runtime.hw.fs,
-                                             request.flat_last, mode);
+                                             request.flat_last, mode, direct_rectangle_viewport);
         if (!request.faces.empty()) {
             auto source = rectangle->hlsl;
             const auto maximum = source.find("maxvertexcount(4)");
@@ -1875,7 +1882,8 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         D3D12_ROOT_PARAMETER parameter{};
         parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         parameter.Descriptor = {0, 102};
-        parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        parameter.ShaderVisibility = direct_rectangle_viewport ? D3D12_SHADER_VISIBILITY_GEOMETRY
+                                                               : D3D12_SHADER_VISIBILITY_VERTEX;
         parameters.push_back(parameter);
     }
     const u32 flat_slot = parameters.size();
@@ -2501,6 +2509,8 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
     if (depth_bounds_commands)
         depth_bounds_commands->OMSetDepthBounds(request.bounds_min, request.bounds_max);
     bindings.Bind(commands.Get(), true, resource_slot, sampler_slot);
+    if (direct_rectangle_viewport)
+        commands->SetGraphicsRootConstantBufferView(viewport_slot, viewport_data);
     commands->IASetPrimitiveTopology(request.topology);
     commands->IASetVertexBuffers(0, vertices.size(), vertices.data());
     std::array<D3D12_VIEWPORT, AmdGpu::NUM_VIEWPORTS> viewports = request.viewports;
@@ -2718,6 +2728,8 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
                                  {"depth_write", u32(desc.DepthStencilState.DepthWriteMask)},
                                  {"depth_function", u32(desc.DepthStencilState.DepthFunc)},
                                  {"blend_constant", request.blend_factor}};
+            event["direct_rectangle_viewport"] = direct_rectangle_viewport;
+            event["geometry_capture"] = capture_geometry;
             event["rasterizer"] = {{"cull", u32(desc.RasterizerState.CullMode)},
                                    {"fill", u32(desc.RasterizerState.FillMode)},
                                    {"front_ccw", bool(desc.RasterizerState.FrontCounterClockwise)},

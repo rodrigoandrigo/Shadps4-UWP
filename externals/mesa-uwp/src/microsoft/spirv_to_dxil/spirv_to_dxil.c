@@ -41,6 +41,34 @@ static_assert((mesa_shader_stage)DXIL_SPIRV_SHADER_FRAGMENT == MESA_SHADER_FRAGM
 static_assert((mesa_shader_stage)DXIL_SPIRV_SHADER_COMPUTE == MESA_SHADER_COMPUTE, "must match");
 static_assert((mesa_shader_stage)DXIL_SPIRV_SHADER_KERNEL == MESA_SHADER_KERNEL, "must match");
 
+static bool
+lower_patch_vertices(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_patch_vertices_in)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def, nir_imm_int(b, *(unsigned *)data));
+   return true;
+}
+
+static void
+normalize_patch_vertices(nir_shader *nir, const struct dxil_spirv_runtime_conf *conf)
+{
+   if (!conf->link_tessellation ||
+       (nir->info.stage != MESA_SHADER_TESS_CTRL && nir->info.stage != MESA_SHADER_TESS_EVAL))
+      return;
+   unsigned count = nir->info.stage == MESA_SHADER_TESS_CTRL ?
+      conf->tessellation_input_control_points : conf->tessellation_output_control_points;
+   nir_foreach_shader_in_variable(var, nir) {
+      if (!var->data.patch && glsl_type_is_array(var->type) &&
+          glsl_array_size(var->type) != count)
+         var->type = glsl_array_type(glsl_get_array_element(var->type), count, 0);
+   }
+   nir_fixup_deref_types(nir);
+   nir_shader_intrinsics_pass(nir, lower_patch_vertices,
+                             nir_metadata_control_flow, &count);
+}
+
 bool
 spirv_to_dxil(const uint32_t *words, size_t word_count,
               struct dxil_spirv_specialization *specializations,
@@ -116,6 +144,7 @@ spirv_to_dxil(const uint32_t *words, size_t word_count,
    dxil_spirv_nir_prep(nir);
 
    dxil_spirv_nir_passes(nir, conf, &out_dxil->metadata);
+   normalize_patch_vertices(nir, conf);
 
    if (conf->link_tessellation) {
       if (!conf->tessellation_peer_words || !conf->tessellation_peer_word_count) {
@@ -139,6 +168,7 @@ spirv_to_dxil(const uint32_t *words, size_t word_count,
       struct dxil_spirv_metadata peer_metadata = {0};
       dxil_spirv_nir_prep(peer);
       dxil_spirv_nir_passes(peer, &peer_conf, &peer_metadata);
+      normalize_patch_vertices(peer, &peer_conf);
       struct dxil_spirv_metadata link_metadata = {0};
       nir_shader *tes = stage == DXIL_SPIRV_SHADER_TESS_EVAL ? nir : peer;
       nir_shader *tcs = stage == DXIL_SPIRV_SHADER_TESS_CTRL ? nir : peer;
