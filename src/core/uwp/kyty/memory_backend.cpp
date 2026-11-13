@@ -8,6 +8,7 @@
 #include <winrt/Windows.System.h>
 #include "../guest_memory.h"
 #include "../memory_diagnostics.h"
+#include "../placeholder_mutex.h"
 #include "common/scope_exit.h"
 #include "memory_backend.h"
 
@@ -208,6 +209,7 @@ void GuestMemory::PruneViews() {
 }
 
 bool GuestMemory::IsolatePlaceholder(uintptr_t address, uint64_t bytes) {
+    std::scoped_lock placeholder_lock{PlaceholderMutex()};
     MEMORY_BASIC_INFORMATION info{};
     if (!VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) ||
         info.State != MEM_RESERVE) {

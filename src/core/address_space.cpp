@@ -24,6 +24,7 @@
 #include "core/libraries/kernel/threads/pthread.h"
 #include "core/uwp/guest_memory.h"
 #include "core/uwp/guest_reservations.h"
+#include "core/uwp/placeholder_mutex.h"
 #endif
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/memory.h"

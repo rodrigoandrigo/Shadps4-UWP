@@ -181,6 +181,7 @@ struct AddressSpace::Impl {
     }
 
     void PreparePlaceholder(VAddr base, u64 size) {
+        std::scoped_lock placeholder_lock{Uwp::PlaceholderMutex()};
         const auto end = base + size;
         for (auto at = base; at < end;) {
             MEMORY_BASIC_INFORMATION info{};
