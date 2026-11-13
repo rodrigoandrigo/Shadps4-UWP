@@ -9,11 +9,14 @@
 #include <fstream>
 #include <regex>
 #include <stdexcept>
+#include <unordered_set>
+#include <nlohmann/json.hpp>
 #include <winrt/base.h>
 #include "common/logging/log.h"
 #include "d3d12_pipeline_cache.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/frontend/tessellation.h"
+#include "video_core/renderdoc.h"
 #include "video_core/renderer_d3d12/blend_output_remap_policy.h"
 #include "video_core/renderer_d3d12/cmask_address.h"
 #include "video_core/renderer_d3d12/depth_bounds.h"
@@ -575,6 +578,18 @@ void CommandRuntime::DrawClearOnly(const DrawRequest& request) {
         depth->written |= clear_depth;
         depth->stencil_written |= clear_stencil;
     }
+    if (VideoCore::IsPresentationTraceActive()) {
+        nlohmann::json event{
+            {"kind", "native_attachment_clear"},  {"context_order", context_order},
+            {"depth_clear", request.clear_depth}, {"stencil_clear", request.clear_stencil},
+            {"depth_value", request.depth_clear}, {"stencil_value", request.stencil_clear}};
+        for (const auto& color : request.colors)
+            event["targets"].push_back(
+                {{"address", color.guest_address}, {"bytes", color.guest_size}});
+        if (request.depth_image)
+            event["depth_address"] = request.depth_image->guest_address;
+        VideoCore::RecordPresentationEvent(event.dump());
+    }
     images.PrepareDownloads(commands.Get());
     winrt::check_hresult(commands->Close());
     FinishRecording(memory_access, nullptr, {}, nullptr, bool(memory_access));
@@ -637,6 +652,8 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         clear_request.point_fill = false;
         clear_request.line_expand = false;
         clear_request.rectangles = false;
+        clear_request.quad_expansion = false;
+        clear_request.quad_strip = false;
         clear_request.rectangle_points = false;
         clear_request.flat_vertices.clear();
         clear_request.indirect.reset();
@@ -769,6 +786,11 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
             for (const auto& image : info.images) {
                 const auto image_info = ShaderImageLayout(image.GetSharp(info), image);
                 reads.push_back({image_info.guest_address, image_info.guest_size});
+                if (image.is_written || image.is_atomic) {
+                    writes.push_back({image_info.guest_address, image_info.guest_size});
+                    if (image_info.stencil_addr && image_info.stencil_size)
+                        writes.push_back({image_info.stencil_addr, image_info.stencil_size});
+                }
             }
             for (const auto& buffer : info.buffers) {
                 if (buffer.buffer_type != Shader::BufferType::Guest)
@@ -1038,7 +1060,7 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
                 return AmdGpu::GsOutputPrimitiveType::PointList;
             return AmdGpu::GsOutputPrimitiveType::TriangleStrip;
         }
-        if (request.rectangles)
+        if (request.rectangles || request.quad_expansion)
             return rectangle_primitive;
         if (request.topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT)
             return AmdGpu::GsOutputPrimitiveType::PointList;
@@ -1059,7 +1081,7 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
     std::shared_ptr<const ShaderBinary> face_capture_shader;
     const bool capture_primitive_id =
         (!request.faces.empty() || request.flat_last || request.viewport_transform) && !geometry &&
-        !request.rectangles;
+        !request.rectangles && !request.quad_expansion;
     if (capture_primitive_id) {
         const auto input = shaders.OutputInterface(*last_stage);
         auto output = input;
@@ -1080,7 +1102,7 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
         face_capture_shader = shaders.CompileHelperHlsl(source, Shader::SwStage::Geometry);
         last_stage = face_capture_shader;
     }
-    if (request.rectangles) {
+    if (request.rectangles || request.quad_expansion) {
         if (request.geometry)
             throw std::runtime_error("Guest geometry cannot precede rectangle expansion");
         if (request.rectangle_points && translated_fragment &&
@@ -1088,7 +1110,10 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
              translated_fragment->shader.info.loads.GetAny(Shader::IR::Attribute::IsFrontFace)))
             throw std::runtime_error(
                 "D3D12 RectList point mode cannot preserve fragment primitive or face inputs");
-        const auto mode = request.rectangle_points ? ShaderCache::RectangleMode::Points
+        const auto mode = request.quad_expansion
+                              ? (request.quad_strip ? ShaderCache::RectangleMode::QuadStripFill
+                                                    : ShaderCache::RectangleMode::QuadFill)
+                          : request.rectangle_points ? ShaderCache::RectangleMode::Points
                           : request.rasterizer.FillMode == D3D12_FILL_MODE_WIREFRAME
                               ? ShaderCache::RectangleMode::Wireframe
                               : ShaderCache::RectangleMode::Fill;
@@ -1385,8 +1410,9 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
     }
     PrepareContext(stages);
     if (request.indirect &&
-        (request.geometry || request.hull || request.rectangles || request.clear_depth ||
-         request.clear_stencil || std::ranges::any_of(stages, [](const auto* stage) {
+        (request.geometry || request.hull || request.rectangles || request.quad_expansion ||
+         request.clear_depth || request.clear_stencil ||
+         std::ranges::any_of(stages, [](const auto* stage) {
              return std::ranges::any_of(stage->info.buffers,
                                         [](const auto& buffer) { return buffer.is_written; }) ||
                     std::ranges::any_of(stage->info.images,
@@ -2372,7 +2398,7 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
                         .RenderTargetWriteMask != 0;
         const bool writes_only_first_layer =
             !geometry && !domain && !request.geometry && !request.hull && !request.domain &&
-            !request.rectangles && !request.point_fill && !request.line_expand &&
+            !request.rectangles && !request.quad_expansion && !request.point_fill && !request.line_expand &&
             !request.flat_last && !request.viewport_transform && request.faces.empty() &&
             !request.depth_gated &&
             !vertex.info.stores.Get(Shader::IR::Attribute::RenderTargetIndex);
@@ -2666,6 +2692,128 @@ void CommandRuntime::DrawImpl(const DrawRequest& request) {
     if (depth) {
         depth->written |= depth_written && depth->has_depth;
         depth->stencil_written |= stencil_written && depth->has_stencil;
+    }
+    static thread_local std::unordered_set<size_t> traced_programs;
+    const bool trace_active = VideoCore::IsPresentationTraceActive();
+    if (!trace_active && !traced_programs.empty())
+        traced_programs.clear();
+    if (trace_active) {
+        try {
+            nlohmann::json event{{"kind", "native_draw"},
+                                 {"result", "recorded"},
+                                 {"context_order", context_order},
+                                 {"count", request.count},
+                                 {"source_index_count", request.source_index_count},
+                                 {"instances", request.instances},
+                                 {"topology", u32(request.topology)},
+                                 {"rectangle_gs", request.rectangles},
+                                 {"quad_gs", request.quad_expansion},
+                                 {"samples", request.samples},
+                                 {"shader_model", u32(shaders.ShaderModel())},
+                                 {"constant_alpha_fallback", constant_alpha_emulation},
+                                 {"depth_clear", request.clear_depth},
+                                 {"stencil_clear", request.clear_stencil},
+                                 {"depth_clear_value", request.depth_clear},
+                                 {"depth_enabled", bool(desc.DepthStencilState.DepthEnable)},
+                                 {"depth_write", u32(desc.DepthStencilState.DepthWriteMask)},
+                                 {"depth_function", u32(desc.DepthStencilState.DepthFunc)},
+                                 {"blend_constant", request.blend_factor}};
+            event["rasterizer"] = {{"cull", u32(desc.RasterizerState.CullMode)},
+                                   {"fill", u32(desc.RasterizerState.FillMode)},
+                                   {"front_ccw", bool(desc.RasterizerState.FrontCounterClockwise)},
+                                   {"depth_clip", bool(desc.RasterizerState.DepthClipEnable)}};
+            const auto record_program = [&](const ShaderBinary& binary, u32 stage) {
+                const auto id = std::hash<std::string>{}(binary.hlsl);
+                if (binary.hlsl.size() <= (1u << 20) && traced_programs.insert(id).second)
+                    event["programs"].push_back(
+                        {{"id", id}, {"stage", stage}, {"hlsl", binary.hlsl}});
+                return id;
+            };
+            const auto helper = rectangle ? rectangle : point_fill ? point_fill : line_expand;
+            if (helper)
+                event["geometry_helper"] = record_program(*helper, u32(Shader::SwStage::Geometry));
+            for (u32 bound = 0; bound < request.colors.size(); ++bound) {
+                const auto slot = request.color_slots[bound];
+                const auto& info = request.colors[bound];
+                const auto& blend_target =
+                    desc.BlendState.RenderTarget[desc.BlendState.IndependentBlendEnable ? slot : 0];
+                nlohmann::json target{
+                    {"slot", slot},
+                    {"address", info.guest_address},
+                    {"bytes", info.guest_size},
+                    {"width", info.size.width},
+                    {"height", info.size.height},
+                    {"pitch", info.pitch},
+                    {"guest_format", u32(info.pixel_format)},
+                    {"native_format", u32(color_view_formats[slot])},
+                    {"resource", reinterpret_cast<uintptr_t>(colors[slot]->Native())},
+                    {"blend_enabled", bool(blend_target.BlendEnable)},
+                    {"rgb_source", u32(blend_target.SrcBlend)},
+                    {"rgb_destination", u32(blend_target.DestBlend)},
+                    {"rgb_operation", u32(blend_target.BlendOp)},
+                    {"alpha_source", u32(blend_target.SrcBlendAlpha)},
+                    {"alpha_destination", u32(blend_target.DestBlendAlpha)},
+                    {"alpha_operation", u32(blend_target.BlendOpAlpha)},
+                    {"write_mask", u32(blend_target.RenderTargetWriteMask)}};
+                if (bound < request.color_clear_buffers.size()) {
+                    const auto& clear = request.color_clear_buffers[bound];
+                    target["clear"] = {{"fast_clear", bool(clear.info.fast_clear)},
+                                       {"cmask_address", clear.CmaskAddress()},
+                                       {"word0", clear.clear_word0},
+                                       {"word1", clear.clear_word1}};
+                }
+                event["targets"].push_back(std::move(target));
+            }
+            for (u32 viewport = 0; viewport < request.viewport_count; ++viewport) {
+                const auto& v = request.viewports[viewport];
+                const auto& r = request.scissors[viewport];
+                event["viewports"].push_back(
+                    {v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth});
+                event["scissors"].push_back({r.left, r.top, r.right, r.bottom});
+            }
+            for (const auto* shader : stages) {
+                const auto& info = shader->info;
+                nlohmann::json stage{
+                    {"stage", u32(info.sw_stage)},
+                    {"hash", info.pgm_hash},
+                    {"address", info.pgm_base},
+                    {"user_data", std::vector<u32>(info.user_data.begin(), info.user_data.end())}};
+                stage["program"] = record_program(*shader->binary, u32(info.sw_stage));
+                for (u32 target = 0; target < 8; ++target) {
+                    const auto attribute = Shader::IR::Attribute::RenderTarget0 + target;
+                    u32 mask{};
+                    for (u32 component = 0; component < 4; ++component)
+                        mask |= u32(info.stores.Get(attribute, component)) << component;
+                    stage["color_exports"].push_back(mask);
+                }
+                for (const auto& buffer : info.buffers) {
+                    nlohmann::json resource{{"type", u32(buffer.buffer_type)},
+                                            {"written", buffer.is_written}};
+                    if (buffer.buffer_type == Shader::BufferType::Guest) {
+                        const auto sharp = buffer.GetSharp(info);
+                        resource["address"] = u64(sharp.base_address);
+                        resource["records"] = u32(sharp.num_records);
+                        resource["stride"] = u32(sharp.stride);
+                    }
+                    stage["buffers"].push_back(std::move(resource));
+                }
+                for (const auto& image : info.images) {
+                    const auto sharp = image.GetSharp(info);
+                    stage["images"].push_back({{"address", sharp.Address()},
+                                               {"data_format", u32(sharp.GetDataFmt())},
+                                               {"number_format", u32(sharp.GetNumberFmt())},
+                                               {"width", u32(sharp.width) + 1},
+                                               {"height", u32(sharp.height) + 1},
+                                               {"base_level", u32(sharp.base_level)},
+                                               {"written", image.is_written},
+                                               {"atomic", image.is_atomic}});
+                }
+                event["shaders"].push_back(std::move(stage));
+            }
+            VideoCore::RecordPresentationEvent(event.dump());
+        } catch (const std::exception& error) {
+            LOG_ERROR(Render, "Native draw trace failed: {}", error.what());
+        }
     }
     resources.PrepareDownload(commands.Get());
     images.PrepareDownloads(commands.Get());

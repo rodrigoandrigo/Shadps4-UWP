@@ -417,8 +417,7 @@ int32_t shadps4_get_shader_compilation_status(ShadPS4ShaderCompilationStatus* st
 }
 
 int32_t shadps4_request_presentation_capture() {
-    if (state.load() != SHADPS4_RUNNING || stop_requested.load() ||
-        Core::Uwp::NativeGraphicsSelected())
+    if (state.load() != SHADPS4_RUNNING || stop_requested.load())
         return -1;
     return VideoCore::RequestPresentationCapture() ? 0 : 1;
 }

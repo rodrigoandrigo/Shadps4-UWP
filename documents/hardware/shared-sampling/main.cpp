@@ -89,13 +89,20 @@ bool Measure(uint8_t *bytes, uint32_t kind, uint32_t variant, bool shared,
         texture[face * 1024 + pixel * 4] = uint8_t(face * 40);
         texture[face * 1024 + pixel * 4 + 3] = 255;
       }
-  if (kind >= 9)
+  if (kind == 9 || kind == 10)
     for (uint32_t y = 0; y < 16; ++y)
       for (uint32_t x = 0; x < 16; ++x) {
         texture[(y * 16 + x) * 4] = uint8_t(x * 11);
         texture[(y * 16 + x) * 4 + 1] = uint8_t(y * 13);
         texture[(y * 16 + x) * 4 + 2] = uint8_t(x * 3 + y * 5);
         texture[(y * 16 + x) * 4 + 3] = 255;
+      }
+  if (kind == 11)
+    for (uint32_t y = 0; y < 16; ++y)
+      for (uint32_t x = 0; x < 16; ++x) {
+        const uint16_t texel = uint16_t(x | (y << 4) | (((x + y) & 15) << 8) |
+                                       (((x ^ y) & 15) << 12));
+        std::memcpy(texture + (y * 16 + x) * 2, &texel, sizeof(texel));
       }
   const float custom_border[]{-0.125f, 1.75f, 0.12345679f, 0.75f};
   std::memcpy(bytes + 0x100000, custom_border, sizeof(custom_border));
@@ -230,11 +237,17 @@ bool Measure(uint8_t *bytes, uint32_t kind, uint32_t variant, bool shared,
     scalar(2, float(variant));
     scalar(3, 0);
   }
-  if (kind >= 9) {
+  if (kind == 9 || kind == 10) {
     for (uint32_t axis = 0; axis < 2; ++axis)
       pixel.insert(pixel.end(), {vop2(8, axis, 255, axis), bits(0.25f),
                                  vop2(3, axis, 255, axis), bits(-2.f)});
     scalar(2, 0);
+  }
+  if (kind == 11) {
+    opcode = 39;
+    scalar(0, 0.46875f);
+    scalar(1, 0.46875f);
+    scalar(2, 0.f);
   }
   const bool comparison = (kind == 2 && variant == 25) || (kind == 1 && variant == 26);
   if (comparison)
@@ -283,6 +296,12 @@ bool Measure(uint8_t *bytes, uint32_t kind, uint32_t variant, bool shared,
       image[1] = (image[1] & ~(uint64_t(15) << 60)) | (uint64_t(11) << 60);
       image[2] |= uint64_t(5) << 45;
     }
+  }
+  if (kind == 11) {
+    image[0] = (image[0] & ~(uint64_t(63) << 52)) | (uint64_t(19) << 52);
+    image[1] &= ~((uint64_t(0xfff) << 32) | (uint64_t(15) << 48));
+    for (uint32_t c = 0; c < 4; ++c)
+      image[1] |= uint64_t(4 + ((c + variant) & 3)) << (32 + c * 3);
   }
   std::memcpy(ps_user, image, sizeof(image));
   if (lod_probe)
@@ -333,7 +352,7 @@ bool Measure(uint8_t *bytes, uint32_t kind, uint32_t variant, bool shared,
     sampler[0] = 2 | (uint64_t(2) << 3) | (uint64_t(0xfff) << 44);
     sampler[1] = uint64_t(1) << 26;
   }
-  if (kind >= 9) {
+  if (kind == 9 || kind == 10) {
     const uint64_t mode = variant / 2;
     sampler[0] = mode | (mode << 3) | (uint64_t(0xfff) << 44);
     sampler[1] = (uint64_t(variant & 1) << 20) | (uint64_t(variant & 1) << 22) |
@@ -469,10 +488,11 @@ int main() {
   auto *bytes = static_cast<uint8_t *>(memory);
   std::memset(bytes, 0, AllocationSize);
   bool pass = true;
-  for (uint32_t kind : {0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u})
+  for (uint32_t kind : {0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u, 11u})
     for (uint32_t variant = 0; variant < (kind == 5                ? 9u
                                           : kind == 6 || kind == 7 ? 18u
                                           : kind == 8              ? 6u
+                                          : kind == 11             ? 4u
                                           : kind >= 9              ? 16u
                                                                    : 27u);
          ++variant) {

@@ -21,7 +21,9 @@ public:
     ~CommandRuntime();
     using AcquireMemory =
         std::function<std::shared_ptr<void>(std::span<const ResourceCache::Range>)>;
-    void EnableAsync(ResourceCache::ResolveBacking backing, AcquireMemory acquire);
+    using AcquireAsyncMemory =
+        std::function<std::shared_ptr<void>(std::span<const ImageCache::Watch>)>;
+    void EnableAsync(ResourceCache::ResolveBacking backing, AcquireAsyncMemory acquire);
     void SubmitReady();
     void MaintainMemory(bool force = false);
     void SetBackground(bool background);
@@ -91,6 +93,8 @@ public:
         u32 index_read_count{UINT32_MAX};
         u32 index_prefix{};
         bool rectangles{};
+        bool quad_expansion{};
+        bool quad_strip{};
         bool rectangle_points{};
         std::vector<VideoCore::ImageInfo> colors;
         std::vector<AmdGpu::ColorBuffer> color_clear_buffers;
@@ -198,7 +202,8 @@ public:
 
     using ImageWatches = std::function<void(std::span<const ImageCache::Watch>)>;
     void SetImageResidency(ImageWatches callback);
-    std::shared_ptr<void> AcquireCpuAccess(VAddr address, u64 size, bool write);
+    std::shared_ptr<void> AcquireCpuAccess(VAddr address, u64 size, bool write,
+                                           bool backing_access = false);
     std::shared_ptr<void> AcquireMemoryMappingAccess();
     struct GpuTimingStatistics {
         u64 submissions{}, ticks{}, frequency{};
@@ -270,7 +275,8 @@ private:
     explicit CommandRuntime(D3D12DeviceContext& shared) : device{shared} {}
     CommandRuntime& NextContext(std::span<const ResourceCache::Range> writes = {},
                                 std::span<const ResourceCache::Range> reads = {});
-    void DrainContexts(std::span<const ResourceCache::Range> ranges = {}, bool all = true);
+    void DrainContexts(std::span<const ResourceCache::Range> ranges = {}, bool all = true,
+                       bool writes_only = false);
     void CompleteContext();
     void PrepareContext(std::span<CompiledShader*> stages);
     void FinishRecording(std::shared_ptr<void> lease, ResourceCache::Buffer* gds_buffer,
@@ -308,6 +314,12 @@ private:
     D3D12DeviceContext& device{owned_device};
     std::shared_ptr<TransferPool> transfer_pool;
     std::vector<D3D12Resource> input_resources;
+    struct ResidentSnapshot {
+        Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+        std::shared_ptr<void> handle;
+        u64 bytes{}, allocation_bytes{};
+    };
+    std::vector<ResidentSnapshot> resident_snapshots;
     D3D12DescriptorArena resource_descriptors, sampler_descriptors;
     D3D12DescriptorArena color_descriptors, depth_descriptors;
     ShaderCache shaders;

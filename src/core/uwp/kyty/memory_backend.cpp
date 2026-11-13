@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <bit>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -45,9 +46,8 @@ bool GuestMemory::ValidRange(uint64_t address, uint64_t bytes) {
 
 GuestMemory::GuestMemory(uint64_t bytes, uint64_t direct, uintptr_t base)
     : size{bytes}, direct_size{direct}, canonical{base}, physical_pages(bytes / PageSize),
-      window_sections(bytes / WindowSize), discard_windows(bytes / WindowSize, UINT32_MAX),
-      window_history(bytes / WindowSize + 1) {
-    free_sections.reserve(128);
+      window_sections(bytes / WindowSize), window_slots(bytes / WindowSize, UINT64_MAX),
+      discard_windows(bytes / WindowSize, UINT32_MAX), window_history(bytes / WindowSize + 1) {
     if (!bytes || bytes % WindowSize || direct > bytes || base % WindowSize ||
         !ValidRange(base, bytes) || !regions.Map(Logical(0), bytes)) {
         throw std::invalid_argument("invalid Kyty guest backing range");
@@ -58,15 +58,12 @@ GuestMemory::~GuestMemory() {
     Stop();
     for (auto& [address, page] : pages)
         ReleaseMapping(page);
-    if (scratch_view)
-        UnmapViewOfFile2(GetCurrentProcess(), scratch_view, MEM_PRESERVE_PLACEHOLDER);
-    if (scratch_address)
-        VirtualFree(scratch_address, 0, MEM_RELEASE);
-    for (auto section : window_sections)
-        if (section)
-            CloseHandle(section);
-    for (auto section : free_sections)
-        CloseHandle(section);
+    for (const auto& pool : section_pools) {
+        if (pool.data)
+            UnmapViewOfFile2(GetCurrentProcess(), pool.data, 0);
+        if (pool.section)
+            CloseHandle(pool.section);
+    }
 }
 
 bool GuestMemory::OpenStore(const wchar_t* path) {
@@ -86,17 +83,16 @@ bool GuestMemory::AllocationFailed(const char* api, uint64_t address, HANDLE sec
         last_failure_report = now;
         APP_MEMORY_INFORMATION memory{};
         const bool available = GetProcessInformation(GetCurrentProcess(), ProcessAppMemoryInfo,
-                                                      &memory, sizeof(memory));
+                                                     &memory, sizeof(memory));
         char message[1024]{};
         std::snprintf(message, sizeof(message),
                       "[MappingDiag] api=%s win32=%lu tid=%lu address=0x%llx section=%p "
                       "failures=%llu views=%llu sections_live=%llu cached=%llu "
                       "resident_bytes=%llu commit_available=%llu private_commit=%llu "
                       "total_commit=%llu memory_info=%u",
-                      api, error, GetCurrentThreadId(), address, section, failure_count,
-                      view_count, sections_live, static_cast<uint64_t>(free_sections.size()),
-                      Resident(), memory.AvailableCommit, memory.PrivateCommitUsage,
-                      memory.TotalCommitUsage, available);
+                      api, error, GetCurrentThreadId(), address, section, failure_count, view_count,
+                      sections_live, uint64_t{0}, Resident(), memory.AvailableCommit,
+                      memory.PrivateCommitUsage, memory.TotalCommitUsage, available);
         uwp_memory_log_diagnostic(message);
     }
     SetLastError(error);
@@ -106,23 +102,76 @@ bool GuestMemory::AllocationFailed(const char* api, uint64_t address, HANDLE sec
 HANDLE GuestMemory::AcquireSection(uint64_t physical) {
     auto& state = physical_pages[physical / PageSize];
     auto& section = window_sections[physical / WindowSize];
-    if (!section) {
-        if (!free_sections.empty()) {
-            section = free_sections.back();
-            free_sections.pop_back();
-            ++sections_reused;
-        } else {
-            section = CreateFileMappingFromApp(INVALID_HANDLE_VALUE, nullptr,
-                                               PAGE_EXECUTE_READWRITE, WindowSize, nullptr);
-            if (!section) {
-                AllocationFailed("CreateFileMappingFromApp", physical, nullptr);
-                return nullptr;
-            }
-            ++sections_created;
-            ++sections_live;
-        }
+    if (section) {
+        state.section = section;
+        return section;
     }
-    state.section = section;
+    size_t index = section_pools.size();
+    size_t empty = index;
+    for (size_t i = 0; i < section_pools.size(); ++i) {
+        if (section_pools[i].section && section_pools[i].used != UINT64_MAX) {
+            index = i;
+            break;
+        }
+        if (!section_pools[i].section && empty == section_pools.size())
+            empty = i;
+    }
+    if (index == section_pools.size()) {
+        index = empty;
+        if (index == section_pools.size())
+            section_pools.emplace_back();
+    }
+    auto& pool = section_pools[index];
+    if (!pool.section) {
+        const auto handle = CreateFileMappingFromApp(INVALID_HANDLE_VALUE, nullptr,
+                                                     PAGE_EXECUTE_READWRITE | SEC_RESERVE,
+                                                     PoolWindows * WindowSize, nullptr);
+        if (!handle) {
+            AllocationFailed("CreateFileMappingFromApp.pool", physical, nullptr);
+            return nullptr;
+        }
+        auto* data = static_cast<uint8_t*>(
+            MapViewOfFile3FromApp(handle, GetCurrentProcess(), nullptr, 0, PoolWindows * WindowSize,
+                                  0, PAGE_READWRITE, nullptr, 0));
+        if (!data) {
+            const auto error = GetLastError();
+            CloseHandle(handle);
+            SetLastError(error);
+            AllocationFailed("MapViewOfFile3FromApp.pool", physical, handle);
+            return nullptr;
+        }
+        pool.section = handle;
+        pool.data = data;
+        ++sections_created;
+        ++sections_live;
+        ++pool_maps;
+    } else {
+        ++sections_reused;
+    }
+    const auto reusable = pool.committed & ~pool.used;
+    const auto slot = std::countr_zero(reusable ? reusable : ~pool.used);
+    if (!VirtualAllocFromApp(pool.data + slot * WindowSize, WindowSize, MEM_COMMIT,
+                             PAGE_READWRITE)) {
+        const auto error = GetLastError();
+        if (!pool.used) {
+            if (!UnmapViewOfFile2(GetCurrentProcess(), pool.data, 0))
+                std::terminate();
+            CloseHandle(pool.section);
+            pool = {};
+            --sections_live;
+            ++sections_closed;
+        }
+        SetLastError(error);
+        AllocationFailed("VirtualAllocFromApp.pool", physical, pool.section);
+        return nullptr;
+    }
+    if (!(pool.committed & (uint64_t{1} << slot))) {
+        pool.committed |= uint64_t{1} << slot;
+        pool_committed_bytes += WindowSize;
+    }
+    pool.used |= uint64_t{1} << slot;
+    window_slots[physical / WindowSize] = index * PoolWindows + slot;
+    state.section = section = pool.section;
     return section;
 }
 
@@ -135,52 +184,30 @@ void GuestMemory::ReleaseSection(uint64_t physical) {
     for (auto at = first; at < first + WindowSize; at += PageSize)
         if (physical_pages[at / PageSize].section)
             return;
-    auto& section = window_sections[physical / WindowSize];
-    if (scratch_section == section) {
-        if (!UnmapViewOfFile2(GetCurrentProcess(), scratch_view, MEM_PRESERVE_PLACEHOLDER))
+    auto& slot = window_slots[physical / WindowSize];
+    auto& pool = section_pools[slot / PoolWindows];
+    pool.used &= ~(uint64_t{1} << (slot % PoolWindows));
+    window_sections[physical / WindowSize] = nullptr;
+    slot = UINT64_MAX;
+    if (!pool.used) {
+        pool_committed_bytes -= std::popcount(pool.committed) * WindowSize;
+        if (!UnmapViewOfFile2(GetCurrentProcess(), pool.data, 0))
             std::terminate();
-        scratch_view = nullptr;
-        scratch_section = nullptr;
-    }
-    if (free_sections.size() < 128)
-        free_sections.push_back(section);
-    else {
-        CloseHandle(section);
+        CloseHandle(pool.section);
+        pool = {};
         --sections_live;
         ++sections_closed;
     }
-    section = nullptr;
 }
 
-void* GuestMemory::MapScratch(HANDLE section) {
-    if (scratch_section == section) {
-        ++scratch_reuses;
-        return scratch_view;
-    }
-    if (scratch_view && !UnmapViewOfFile2(GetCurrentProcess(), scratch_view, MEM_PRESERVE_PLACEHOLDER)) {
-        AllocationFailed("UnmapViewOfFile2.scratch", reinterpret_cast<uintptr_t>(scratch_view), scratch_section);
-        return nullptr;
-    }
-    scratch_section = nullptr;
-    scratch_view = nullptr;
-    if (!scratch_address) {
-        scratch_address = VirtualAlloc2FromApp(nullptr, nullptr, WindowSize,
-                                               MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-                                               PAGE_NOACCESS, nullptr, 0);
-        if (!scratch_address) {
-            AllocationFailed("VirtualAlloc2FromApp.scratch", 0, section);
-            return nullptr;
-        }
-    }
-    scratch_view = MapViewOfFile3(section, GetCurrentProcess(), scratch_address, 0, WindowSize,
-                                  MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
-    if (!scratch_view) {
-        AllocationFailed("MapViewOfFile3.scratch", reinterpret_cast<uintptr_t>(scratch_address), section);
-        return nullptr;
-    }
-    scratch_section = section;
-    ++scratch_maps;
-    return scratch_view;
+uint64_t GuestMemory::SectionOffset(uint64_t physical) const {
+    return window_slots[physical / WindowSize] % PoolWindows * WindowSize;
+}
+
+void* GuestMemory::SectionData(uint64_t physical) {
+    const auto slot = window_slots[physical / WindowSize];
+    ++pool_accesses;
+    return section_pools[slot / PoolWindows].data + SectionOffset(physical);
 }
 
 void GuestMemory::PruneViews() {
@@ -379,6 +406,8 @@ void GuestMemory::Decommit(uint64_t address, uint64_t bytes, bool) {
     for (uint64_t at = first; at < first + bytes; at += PageSize) {
         auto& state = physical_pages[at / PageSize];
         const bool was_resident = state.owner && state.owner->resident;
+        if (was_resident && state.owner->view)
+            shared_resident_bytes -= PageSize;
         for (auto* page = state.first; page; page = page->next) {
             if (!ReleaseMapping(*page))
                 std::terminate();
@@ -530,7 +559,7 @@ bool GuestMemory::CommitFromStore(uint64_t window, uint64_t address, uint64_t by
                                   uint32_t slot) {
     if (bytes != WindowSize || !ReadStored(window, slot, transfer.data()))
         return false;
-    if (app_ceiling && Tight(bytes)) {
+    if (app_ceiling && RestoreRequiresMemory() && Tight(bytes)) {
         UpdatePressure();
         if (app_usage >= app_ceiling || bytes > app_ceiling - app_usage) {
             SetLastError(ERROR_NOT_ENOUGH_MEMORY);
@@ -546,7 +575,7 @@ bool GuestMemory::CommitFromStore(uint64_t window, uint64_t address, uint64_t by
     const auto section = AcquireSection(first);
     if (!section)
         return false;
-    auto* scratch = MapScratch(section);
+    auto* scratch = SectionData(first);
     if (!scratch)
         return false;
     std::memcpy(scratch, transfer.data(), bytes);
@@ -558,8 +587,8 @@ bool GuestMemory::CommitFromStore(uint64_t window, uint64_t address, uint64_t by
         if (!IsolatePlaceholder(page.address, PageSize))
             break;
         if (!MapViewOfFile3(section, GetCurrentProcess(), reinterpret_cast<void*>(page.address),
-                            done, PageSize, MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE,
-                            nullptr, 0)) {
+                            SectionOffset(first) + done, PageSize, MEM_REPLACE_PLACEHOLDER,
+                            PAGE_EXECUTE_READWRITE, nullptr, 0)) {
             AllocationFailed("MapViewOfFile3.page_in", page.address, section);
             break;
         }
@@ -567,6 +596,7 @@ bool GuestMemory::CommitFromStore(uint64_t window, uint64_t address, uint64_t by
         page.resident = true;
         ++view_count;
         resident_bytes += PageSize;
+        shared_resident_bytes += PageSize;
         if (!ApplyProtection(page))
             break;
     }
@@ -586,6 +616,12 @@ void GuestMemory::FreeSlot(uint32_t slot) {
     store.Free(slot);
 }
 
+bool GuestMemory::RestoreRequiresMemory() const {
+    return std::none_of(section_pools.begin(), section_pools.end(), [](const SectionPool& pool) {
+        return (pool.committed & ~pool.used) != 0;
+    });
+}
+
 bool GuestMemory::Tight(uint64_t bytes) {
     const auto growth = Resident() - std::min(Resident(), sampled_resident);
     return store.IsOpen() && app_target &&
@@ -593,7 +629,7 @@ bool GuestMemory::Tight(uint64_t bytes) {
 }
 
 uint64_t GuestMemory::Resident() const {
-    return resident_bytes;
+    return resident_bytes - shared_resident_bytes + pool_committed_bytes;
 }
 
 bool GuestMemory::Promote(PhysicalPage& state) {
@@ -607,7 +643,7 @@ bool GuestMemory::Promote(PhysicalPage& state) {
     const auto section = AcquireSection(owner.physical);
     if (!section)
         return false;
-    auto* base = static_cast<uint8_t*>(MapScratch(section));
+    auto* base = static_cast<uint8_t*>(SectionData(owner.physical));
     auto* scratch = base ? base + owner.physical % WindowSize : nullptr;
     if (!scratch) {
         const auto error = GetLastError();
@@ -635,10 +671,12 @@ bool GuestMemory::Promote(PhysicalPage& state) {
     }
     if (copied && ReleaseMapping(owner)) {
         if (MapViewOfFile3(section, GetCurrentProcess(), reinterpret_cast<void*>(owner.address),
-                           owner.physical % WindowSize, PageSize, MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, nullptr, 0)) {
+                           SectionOffset(owner.physical) + owner.physical % WindowSize, PageSize,
+                           MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, nullptr, 0)) {
             state.section = section;
             owner.view = true;
             owner.resident = true;
+            shared_resident_bytes += PageSize;
             ++view_count;
             if (!ApplyProtection(owner))
                 std::terminate();
@@ -681,7 +719,8 @@ bool GuestMemory::MapAlias(VirtualPage& page) {
         return false;
     last_operation = "map_alias";
     if (!MapViewOfFile3(state.section, GetCurrentProcess(), reinterpret_cast<void*>(page.address),
-                        page.physical % WindowSize, PageSize, MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, nullptr, 0))
+                        SectionOffset(page.physical) + page.physical % WindowSize, PageSize,
+                        MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, nullptr, 0))
         return AllocationFailed("MapViewOfFile3.alias", page.address, state.section);
     page.view = true;
     page.resident = true;
@@ -1370,8 +1409,11 @@ uint64_t GuestMemory::Reclaim(uint64_t bytes, bool urgent) {
     diagnostic.Stage(urgent ? "make_room" : "sweep");
     if (!store.IsOpen())
         return 0;
-    if (urgent)
-        return regions.MakeRoom((bytes + WindowSize - 1) / WindowSize, *this) * WindowSize;
+    if (urgent) {
+        const auto before = Resident();
+        regions.MakeRoom((bytes + WindowSize - 1) / WindowSize, *this);
+        return before - std::min(before, Resident());
+    }
     const auto now = GetTickCount64();
     const bool pressure = (configured_budget || app_target) && Resident() > budget;
     if (!pressure && (Resident() < budget && budget - Resident() > (256ULL << 20)))
@@ -1383,7 +1425,7 @@ uint64_t GuestMemory::Reclaim(uint64_t bytes, bool urgent) {
     size_t visited{}, selected{};
     regions.ForEachFullWindow(hand, [&](uint64_t window) {
         hand = window + 1;
-        if ((!pressure && window_history[window].shield_until > now)) {
+        if (window_history[window].shield_until > now) {
             return ++visited >= 2048;
         }
         if (regions.SweepIfCold(window, *this)) {
@@ -1458,7 +1500,7 @@ void GuestMemory::PagerLoop(std::stop_token stop) {
                     break;
                 const auto window = swept.front().window;
                 swept.pop_front();
-                if (!regions.BeginEvict(window, *this))
+                if (!PreferEviction(window) || !regions.BeginEvict(window, *this))
                     continue;
                 uint32_t slot{UINT32_MAX};
                 auto cancel = ::detail::MakeScopeGuard([&] {
@@ -1572,30 +1614,33 @@ void GuestMemory::Report(void (*log)(const char*)) {
     char message[2048]{};
     {
         std::lock_guard lock{mutex};
-        std::snprintf(message, sizeof(message),
-                      "[KytyMemory] resident_mb=%llu views=%llu view_limit=%llu virtual_pages=%llu "
-                      "swapped_windows=%llu slots=%llu swept=%llu evicted=%llu "
-                      "page_ins=%llu errors=%llu corrupt=%llu aborted=%llu "
-                      "privatized=%llu app_mb=%llu limit_mb=%llu budget_mb=%llu target_mb=%llu operation=%s "
-                      "address=0x%llx protection=0x%lx pins=%llu protected_windows=%llu "
-                      "pending_discards=%llu lease_releases=%llu discard_visits=%llu "
-                      "sections_created=%llu sections_reused=%llu sections_cached=%llu "
-                      "sections_live=%llu scratch_maps=%llu scratch_reuses=%llu "
-                      "views_pruned=%llu fault_retries=%llu failure_api=%s failure_error=%lu "
-                      "failure_address=0x%llx failure_section=%p",
-                      Resident() >> 20, view_count, view_limit, static_cast<uint64_t>(pages.size()),
-                      static_cast<uint64_t>(regions.EvictedCount()), store.SlotsInUse(),
-                      store.counters.swept.load(), store.counters.evicted.load(),
-                      store.counters.page_ins.load(), store.counters.errors.load(),
-                      store.counters.corrupt.load(), store.counters.aborted.load(),
-                      store.counters.privatized.load(), app_usage >> 20, app_limit >> 20,
-                      budget >> 20, app_target >> 20, last_operation, static_cast<uint64_t>(last_address),
-                      last_protection, static_cast<uint64_t>(regions.TemporaryPinCount()),
-                      static_cast<uint64_t>(protected_windows.size()), pending_discard_count,
-                      release_calls, discard_visits, sections_created, sections_reused,
-                      static_cast<uint64_t>(free_sections.size()), sections_live, scratch_maps,
-                      scratch_reuses, views_pruned, fault_retries,
-                      failure_api, failure_error, failure_address, failure_section);
+        std::snprintf(
+            message, sizeof(message),
+            "[KytyMemory] resident_mb=%llu views=%llu view_limit=%llu virtual_pages=%llu "
+            "swapped_windows=%llu slots=%llu swept=%llu evicted=%llu "
+            "page_ins=%llu errors=%llu corrupt=%llu aborted=%llu "
+            "privatized=%llu app_mb=%llu limit_mb=%llu budget_mb=%llu target_mb=%llu operation=%s "
+            "address=0x%llx protection=0x%lx pins=%llu protected_windows=%llu "
+            "pending_discards=%llu lease_releases=%llu discard_visits=%llu "
+            "sections_created=%llu sections_reused=%llu sections_cached=%llu "
+            "sections_live=%llu pool_maps=%llu pool_accesses=%llu "
+            "pool_committed_mb=%llu shared_resident_mb=%llu pool_retained_mb=%llu "
+            "views_pruned=%llu fault_retries=%llu failure_api=%s failure_error=%lu "
+            "failure_address=0x%llx failure_section=%p",
+            Resident() >> 20, view_count, view_limit, static_cast<uint64_t>(pages.size()),
+            static_cast<uint64_t>(regions.EvictedCount()), store.SlotsInUse(),
+            store.counters.swept.load(), store.counters.evicted.load(),
+            store.counters.page_ins.load(), store.counters.errors.load(),
+            store.counters.corrupt.load(), store.counters.aborted.load(),
+            store.counters.privatized.load(), app_usage >> 20, app_limit >> 20, budget >> 20,
+            app_target >> 20, last_operation, static_cast<uint64_t>(last_address), last_protection,
+            static_cast<uint64_t>(regions.TemporaryPinCount()),
+            static_cast<uint64_t>(protected_windows.size()), pending_discard_count, release_calls,
+            discard_visits, sections_created, sections_reused, uint64_t{0}, sections_live,
+            pool_maps, pool_accesses, pool_committed_bytes >> 20, shared_resident_bytes >> 20,
+            (pool_committed_bytes - shared_resident_bytes) >> 20,
+            views_pruned, fault_retries, failure_api, failure_error,
+            failure_address, failure_section);
     }
     log(message);
 }

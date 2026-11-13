@@ -34,3 +34,7 @@ decisão necessárias para reproduzir todos os resultados. A matriz registra os
 valores brutos para distinguir mudança de mip, arredondamento de peso e
 mudanças no número ou na posição dos taps.
 [Guia de registradores Sea Islands](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/programmer-references/CIK_3D_registers_v2.pdf)
+
+## Packed 16-bit color verification
+
+`kind=11` samples a 16x16 RGBA4444 pattern with independent channel values and alpha, using four component-selector rotations. It compares ordinary sampled views against the shared-storage lowering. The source is provided for an OpenOrbis homebrew build; this addition has not been built with OpenOrbis or executed on hardware.

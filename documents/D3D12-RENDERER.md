@@ -1,12 +1,59 @@
 # Renderer D3D12: estado de implementação
 
+
+
+
+## Xbox visual defect remains open; native LT+RT capture - 2026-11-13
+
+The user confirmed that the preceding alpha/quad corrections did not resolve white saturation and scene trails on Xbox. A PC diagnostic run with SM6.4 and the constant-alpha fallback also did not reproduce the defect; automatic capability selection was restored afterward. The root cause is not established.
+
+The existing presentation-capture API and UI previously rejected native D3D12. They now support it through the same LT+RT shortcut. Native captures save producer VideoOut and presentation backbuffer PNG/BIN files, a complete-interval native draw/clear trace, actual blend/depth/raster state, buffer/image bindings and bounded HLSL source records. Copies execute on the presenter queue and readbacks wait for their submission fence. Capture payload is bounded and the extra wait/IO occurs only on request.
+
+PC validation saved both 1920x1080 stages, eight draw events and eleven HLSL programs without truncation. After BGRA/RGBA channel ordering, producer and backbuffer had zero differing bytes. Core/frontend Release builds passed. This validates the diagnostic, not the Xbox rendering fix. Required evidence is the newest `LocalState/shadPS4/screenshots/presentation/native-*` directory captured on the affected Xbox scene. Details: `Build/xbox-background/RESULTS.md`.
+
+## Xbox background alpha and auxiliary quad geometry - 2026-11-13
+
+Native blending no longer replaces SRC_ALPHA / INV_SRC_ALPHA with ONE / ZERO based on CB_SHADER_MASK. That mask is not evidence that the translated pixel shader omitted alpha. The exported alpha now remains available to the output merger, including RGB-only writes and transparent particles. An isolated PC GPU probe reproduced the failure mechanism: sixteen draws with alpha zero preserved a dark background at 32/255 with the requested factors, while the old forced factors wrote 255/255. The user reports this background defect only on Xbox; its resolution there is not yet confirmed.
+
+Rectangles already used an auxiliary geometry shader. Compatible QuadList and QuadStrip fill draws now also use a four-input adjacency GS that emits a four-vertex strip (two triangles). Index grouping preserves source ordinals, restart boundaries and complete quads rather than submitting six triangle indices to the guest VS. The helper propagates per-quad PrimitiveID and accepts integer and clip-distance array outputs. Complex per-face/provoking-last, guest GS/tessellation, viewport replay, line/point and stream-out combinations retain their existing paths; this is not a replacement for guest tessellation. No guest shader replay or additional global GPU wait was introduced. Existing persistent cache identity hashes the core and compiler binaries, so the rebuilt core separates old shaders/PSOs automatically.
+
+Twenty-four WARP/SM6.4 GPU comparisons of the generated helper against indexed triangles passed without differing bytes: rectangles, quads and quad strips, interpolation, mirroring, reversed vertex order, and culling. Pipeline statistics reported three or four VS invocations and one GS invocation for each helper draw. Additional SM6.4 compile checks passed for integer and clip-distance array outputs. Native PC game sessions exited normally; these do not reproduce the Xbox-only defect. Core and UWP frontend Release builds passed. Extended OpenOrbis alpha-mask reproduction cases are provided but have not been built or executed. Evidence and limits: `Build/native-background/RESULTS.md`.
+
+## Native image formats and tessellation compatibility - 2026-11-13
+
+RGBA4444 sampled views no longer permute channels a second time after upload conversion. Shared-storage packed loads/stores use the equivalent 4/8/12/0 bit offsets before guest component selection. Native UWP composition now fills the panel on both axes, matching embedded Vulkan/Dozen presentation, including resize and composition-scale handling.
+
+The native SPIR-V to DXIL entry point now applies Dozen-equivalent patch normalization after system-value lowering: per-vertex hull inputs use the input patch count, domain inputs use the hull output count, and `PatchVertices` becomes the corresponding constant in both linked modules. Patch variables and domain-specific factor signatures are preserved. This removes an unimplemented intrinsic; it does not introduce a general software tessellator or approximate invalid domain/topology pairs.
+
+The core, compiler DLL and UWP frontend built successfully. All 36 SM6.4 shader compilation/validator cases passed, including triangle/quad/isoline domains, all three spacing modes, point output on/off, and different input/output patch counts. The exhaustive RGBA4444 layout check passed for 65,536 words. Final PC GPU captures show corrected colored logos and menu elements; the 48-second run exited normally. Xbox execution, final XAML scaling and complete scene equivalence remain unverified; a white cross in gameplay captures still requires a matching-scene comparison. Extended OpenOrbis reproduction sources were provided but not executed. Evidence: `Build/d3d12-image-fixes/RESULTS.md`.
+
+## Native performance checkpoint - 2026-11-13
+
+The renderer now accepts byte-compatible UNORM/sRGB resident presentation, uses typeless resources for compatible color views, and synchronizes only the decoded fetch shader extent. Preflight shader variants are retained with full dependency validation. Buffer-source intervals are compacted; contiguous persistent views reuse 64 KiB native allocations while retaining exact guest source ranges. Mapping changes invalidate prepared shader identities.
+
+Asynchronous ownership distinguishes GPU readers from writers. Readers retain readonly protection and can share cached data; writers retain exclusion, fences and cache invalidation. Canonical CPU backing reads avoid read/read hazards, while guest virtual faults keep their access guards. Storage-image writes and atomics are included in scheduler write ranges. Presentation snapshots reuse bounded, consumer-held resources, with memory accounting and reclamation after their frame references are released.
+
+On PC, the initial instrumented Pac-Man run produced 82 frames in 60 seconds. The last complete instrumented run produced 2,355 frames in 75 seconds, about 60 FPS before the gameplay transition and 27.2-27.6 FPS during steady gameplay. These totals include startup and different scene progression, so they do not establish an equivalent-scene speedup. The 55 FPS gameplay target remains open. Temporary investigation instrumentation was removed afterward; the final cleaned core and frontend compiled successfully but were not rebenchmarked. Xbox performance and full visual fidelity remain unverified.
+
+The user requested this checkpoint before further optimization. Detailed measurements, build logs, source backups, hashes and remaining work are recorded in `Build/native-55/RESULTS.md` and `Build/native-55/validation.json`. Dozen loading, guest paging/swap, render resolution, draw counts and shared-command synchronization were preserved.
+
+## Startup deadlock and shader-interface fixes - 2026-11-13
+
+Native CPU access and mapping guards now acquire the renderer lock before taking shared memory access. Presentation capture, `Flush`, and `Finish` also acquire shared memory access inside the renderer operation. This removes the reproduced cycle where a mapper retained the renderer lock while waiting for exclusive memory access and another thread retained shared memory access while waiting for the renderer. Ownership leases and GPU fences remain in place.
+
+HLSL vertex outputs and fragment inputs place `SV_Position` in the first signature row. Fragment input structures with texture coordinates reserve that row even when the shader does not consume position, keeping following TEXCOORD rows compatible. Generated HLSL VS/PS helpers use the same normalization. Persistent cache identity includes the core binary, preventing reuse of binaries produced with the previous layout. This addresses the reproduced D3D12 validation error 660; it does not establish complete geometry/tessellation interface coverage.
+
+`GAME_D3D_DEBUG=1` now enables diagnostics before device creation. Pipeline errors include info-queue messages with a healthy device; DRED queries remain restricted to device loss. Diagnostics remain opt-in in Release builds.
+
+The production core completed PC native-D3D12 runs of Bloodborne (126 frames in 90 seconds) and Chronicles of Teddy (88 frames in 45 seconds), with normal shutdown and without the reproduced deadlock or invalid-pipeline error. These frame counts are startup/progress checks, not equivalent-scene performance or visual-accuracy measurements. Xbox, SM6.4 hardware, and extended gameplay remain unverified. Evidence and source backups are in `Build/native-blockers`.
+
 ## Native CPU overhead and submission fixes - 2026-11-12
 
 Read-only CPU access that finds no GPU writeback no longer republishes the complete resource-watch set. Buffer and image invalidation report whether tracked state actually changed; unchanged invalidations avoid protection updates. Published watch sets are sorted, deduplicated, and compared before notifying memory management. Mapping invalidation explicitly republishes the remaining watches before remapping, and callback replacement resets the snapshot. Retained watch metadata is included in the aggregate memory budget.
 
 Normal rasterizer `Flush` drains submitted contexts and their leases without requesting a global buffer/image readback or an extra idle signal. `Finish`, `CpSync`, recovery checkpoints, and destruction retain full synchronization; CPU accesses continue to resolve dirty overlapping resources. No guest commands or draws are skipped. Profiling remains opt-in through `GAME_PROFILE`, with CPU-access and watch-update scopes.
 
-PC Pac-Man throughput increased from 17 to 75 frames in a fixed 60-second run with the same input schedule. This is a frame-count comparison, not an equivalent-scene FPS benchmark; time to the first frame did not improve measurably. Chronicles of Teddy did not present a frame with either the prior or updated DLL, blocking validation of that title. PC measurements and limitations are recorded in `Build/native-performance`. Xbox performance, long gameplay, and rendering fidelity require separate validation; this work does not establish Vulkan performance parity.
+PC Pac-Man throughput increased from 17 to 75 frames in a fixed 60-second run with the same input schedule. This is a frame-count comparison, not an equivalent-scene FPS benchmark; time to the first frame did not improve measurably. At that measurement snapshot, Chronicles of Teddy did not present a frame; the startup lock-order issue was subsequently corrected in the 2026-11-13 fixes above. PC measurements and limitations are recorded in `Build/native-performance`. Xbox performance, long gameplay, and rendering fidelity require separate validation; this work does not establish Vulkan performance parity.
 
 ## Reference integration — 2026-11-12
 

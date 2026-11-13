@@ -6,16 +6,22 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <thread>
 #include <fmt/format.h>
 #include <half.hpp>
+#include <nlohmann/json.hpp>
+#include <stb_image_write.h>
 #include <winrt/base.h>
+#include "common/io_file.h"
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "uwp/resident_conversion.h"
 #include "uwp/session.h"
+#include "video_core/renderdoc.h"
 #include "video_core/renderer_d3d12/native_capabilities_query.h"
 #include "video_core/renderer_d3d12/profile.h"
 #include "video_core/renderer_d3d12/temporal_jitter.h"
@@ -31,8 +37,37 @@ bool IsDxgiDeviceLossStatus(HRESULT status) noexcept {
 }
 } // namespace
 
+namespace {
+struct NativePresentationCapture {
+    struct Stage {
+        ComPtr<ID3D12Resource> readback;
+        u32 width{}, height{}, row_pitch{}, pixel_bytes{};
+        u64 bytes{};
+        bool recorded{};
+    };
+    std::array<Stage, 2> stages;
+    std::filesystem::path directory;
+    nlohmann::json manifest;
+    ~NativePresentationCapture() {
+        VideoCore::CompletePresentationCapture();
+    }
+};
+bool WriteDiagnosticPng(const std::filesystem::path& path, const std::vector<u8>& rgba, u32 width,
+                        u32 height) {
+    Common::FS::IOFile file(path, Common::FS::FileAccessMode::Create);
+    if (!file.IsOpen())
+        return false;
+    return stbi_write_png_to_func(
+               [](void* context, void* bytes, int count) {
+                   static_cast<Common::FS::IOFile*>(context)->WriteRaw<u8>(bytes, count);
+               },
+               &file, width, height, 4, rgba.data(), 0) != 0;
+}
+} // namespace
+
 struct D3D12Presenter::Frame final : VideoCore::PresentationFrame {
     std::vector<u8> pixels;
+    std::shared_ptr<NativePresentationCapture> capture;
     D3D12Resource upload, spatial_input;
     std::shared_ptr<VideoCore::ResidentFrame> resident;
     ComPtr<ID3D12Resource> source, converted;
@@ -104,6 +139,30 @@ VideoCore::FrameHandle D3D12Presenter::PrepareFrame(
     frame->height = group.attrib.height;
     frame->format = group.attrib.pixel_format;
     frame->gamma = gamma.load();
+    if (VideoCore::ConsumePresentationCaptureRequest()) {
+        try {
+            auto capture = std::make_shared<NativePresentationCapture>();
+            static std::atomic<u64> sequence{};
+            const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::system_clock::now().time_since_epoch()).count();
+            capture->directory = Common::FS::GetUserPath(Common::FS::PathType::ScreenshotsDir) /
+                                 "presentation" / fmt::format("native-{}-{}", stamp, ++sequence);
+            std::filesystem::create_directories(capture->directory);
+            capture->manifest = {
+                {"version", 1},
+                {"backend", "D3D12 native"},
+                {"videoout_address", address},
+                {"videoout_format", u32(frame->format)},
+                {"gamma", frame->gamma},
+                {"readback_changes_timing", true},
+                {"render_trace", nlohmann::json::parse(VideoCore::PresentationTraceSnapshot())}};
+            frame->capture = std::move(capture);
+        } catch (const std::exception& error) {
+            VideoCore::CompletePresentationCapture();
+            LOG_ERROR(Render, "Native presentation capture setup failed: {}", error.what());
+        }
+    }
+
     D3D12::ProfileScope prepare_timing{presenter_profile, "presenter_prepare"};
     frame->resident = Core::Memory::Instance()->CapturePresentation(info);
     if (frame->resident) {
@@ -597,11 +656,8 @@ void D3D12Presenter::RenderFrameCore() {
     }
     ResizeBuffers(output_width, output_height,
                   floating_point ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM);
-    const float scale = std::min(float(display_width) / width, float(display_height) / height);
-    const DXGI_MATRIX_3X2_F transform{
-        scale / composition_scale_x, 0, 0, scale / composition_scale_y,
-        (display_width - width * scale) * 0.5f / composition_scale_x,
-        (display_height - height * scale) * 0.5f / composition_scale_y};
+    const DXGI_MATRIX_3X2_F transform{float(display_width) / width / composition_scale_x,   0, 0,
+                                      float(display_height) / height / composition_scale_y, 0, 0};
     winrt::check_hresult(swapchain->SetMatrixTransform(&transform));
     const auto index = swapchain->GetCurrentBackBufferIndex();
     auto& command_frame = command_frames[index];
@@ -720,11 +776,22 @@ void D3D12Presenter::RenderFrameCore() {
                                                   EmulatorSettings.GetRcasAttenuation() / 1000.f);
         commands->CopyResource(buffers[index].Get(), filtered);
     }
+    if (last_frame && last_frame->capture) {
+        try {
+            RecordDiagnosticCapture(*last_frame, commands, encoder, buffers[index].Get());
+        } catch (const std::exception& error) {
+            last_frame->capture->manifest["recording_error"] = error.what();
+            LOG_ERROR(Render, "Native presentation capture recording failed: {}", error.what());
+        }
+    }
     encoder.Transition(buffers[index].Get(), D3D12_RESOURCE_STATE_PRESENT);
     winrt::check_hresult(commands->Close());
     const auto ticket = context.Submit(commands);
     command_frame.fence = ticket;
     command_frame.submitted_frame = last_frame;
+    if (last_frame && last_frame->capture)
+        SaveDiagnosticCapture(*last_frame, ticket);
+
     ProfileSample(presenter_profile, "swapchain_present", 128, [&] {
         const HRESULT status = swapchain->Present(1, 0);
         if (status == DXGI_STATUS_OCCLUDED) {
@@ -733,6 +800,167 @@ void D3D12Presenter::RenderFrameCore() {
         }
         winrt::check_hresult(status);
     });
+}
+
+void D3D12Presenter::RecordDiagnosticCapture(Frame& frame, ID3D12GraphicsCommandList* commands,
+                                             D3D12CommandEncoder& encoder,
+                                             ID3D12Resource* backbuffer) {
+    auto& capture = *frame.capture;
+    capture.manifest["videoout_source"] = frame.resident ? "resident" : "cpu";
+    const auto description = backbuffer->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    u64 backbuffer_bytes{};
+    context.Device()->GetCopyableFootprints(&description, 0, 1, 0, &footprint, nullptr, nullptr,
+                                            &backbuffer_bytes);
+    const u64 source_bytes = frame.resident ? frame.resident->bytes : frame.pixels.size();
+    constexpr u64 limit = 128ull << 20;
+    if (source_bytes > limit || backbuffer_bytes > limit - source_bytes)
+        throw std::runtime_error("Native presentation capture exceeds 128 MiB");
+    const auto allocate = [&](NativePresentationCapture::Stage& stage) {
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = stage.bytes;
+        buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = buffer.SampleDesc.Count = 1;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_READBACK;
+        winrt::check_hresult(context.Device()->CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&stage.readback)));
+    };
+    auto& source = capture.stages[0];
+    source.width = frame.width;
+    source.height = frame.height;
+    source.pixel_bytes =
+        frame.format == Libraries::VideoOut::PixelFormat::A16R16G16B16Float ? 8 : 4;
+    source.row_pitch =
+        frame.resident ? frame.resident->row_pitch : source.width * source.pixel_bytes;
+    source.bytes = source_bytes;
+    if (!source.width || !source.height ||
+        u64(source.width) * source.pixel_bytes > source.row_pitch ||
+        u64(source.height - 1) * source.row_pitch + u64(source.width) * source.pixel_bytes >
+            source.bytes)
+        throw std::runtime_error("Native presentation capture source footprint exceeds storage");
+    if (frame.resident) {
+        allocate(source);
+        if (!frame.source)
+            winrt::check_hresult(context.Device()->OpenSharedHandle(frame.resident->handle.get(),
+                                                                    IID_PPV_ARGS(&frame.source)));
+        encoder.Track(frame.source.Get(), D3D12_RESOURCE_STATE_COMMON);
+        encoder.Transition(frame.source.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE);
+        commands->CopyBufferRegion(source.readback.Get(), 0, frame.source.Get(), 0, source.bytes);
+        encoder.Transition(frame.source.Get(), D3D12_RESOURCE_STATE_COMMON);
+    }
+    source.recorded = true;
+    auto& output = capture.stages[1];
+    output.width = u32(description.Width);
+    output.height = description.Height;
+    output.pixel_bytes = description.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4;
+    output.row_pitch = footprint.Footprint.RowPitch;
+    output.bytes = backbuffer_bytes;
+    allocate(output);
+    encoder.Transition(backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION from{}, to{};
+    from.pResource = backbuffer;
+    from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    to.pResource = output.readback.Get();
+    to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    to.PlacedFootprint = footprint;
+    commands->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    output.recorded = true;
+    capture.manifest["backbuffer_format"] = u32(description.Format);
+    capture.manifest["display"] = {{"width", display_width},
+                                   {"height", display_height},
+                                   {"composition_scale_x", composition_scale_x},
+                                   {"composition_scale_y", composition_scale_y},
+                                   {"hdr", hdr_enabled},
+                                   {"fsr", EmulatorSettings.IsFsrEnabled()}};
+}
+void D3D12Presenter::SaveDiagnosticCapture(Frame& frame, u64 fence) {
+    auto capture = std::move(frame.capture);
+    try {
+        context.Wait(fence);
+        capture->manifest["presenter_fence"] = fence;
+        constexpr std::array names{"videoout", "backbuffer"};
+        for (u32 index = 0; index < capture->stages.size(); ++index) {
+            auto& stage = capture->stages[index];
+            if (!stage.recorded)
+                continue;
+            std::vector<u8> raw;
+            if (stage.readback) {
+                void* mapped{};
+                const D3D12_RANGE range{0, size_t(stage.bytes)};
+                winrt::check_hresult(stage.readback->Map(0, &range, &mapped));
+                try {
+                    raw.assign(static_cast<const u8*>(mapped),
+                               static_cast<const u8*>(mapped) + stage.bytes);
+                } catch (...) {
+                    const D3D12_RANGE empty{0, 0};
+                    stage.readback->Unmap(0, &empty);
+                    throw;
+                }
+                const D3D12_RANGE empty{0, 0};
+                stage.readback->Unmap(0, &empty);
+            } else {
+                raw = frame.pixels;
+            }
+            std::ofstream binary(capture->directory / fmt::format("{}.bin", names[index]),
+                                 std::ios::binary);
+            binary.write(reinterpret_cast<const char*>(raw.data()), raw.size());
+            binary.close();
+            std::vector<u8> rgba;
+            if (!index) {
+                Frame snapshot;
+                snapshot.width = stage.width;
+                snapshot.height = stage.height;
+                snapshot.format = frame.format;
+                snapshot.gamma = frame.gamma;
+                snapshot.pixels.resize(u64(stage.width) * stage.height * stage.pixel_bytes);
+                for (u32 y = 0; y < stage.height; ++y)
+                    std::memcpy(snapshot.pixels.data() + u64(y) * stage.width * stage.pixel_bytes,
+                                raw.data() + u64(y) * stage.row_pitch,
+                                u64(stage.width) * stage.pixel_bytes);
+                rgba = ConvertPixels(snapshot, false);
+            } else {
+                rgba.resize(u64(stage.width) * stage.height * 4);
+                for (u32 y = 0; y < stage.height; ++y)
+                    for (u32 x = 0; x < stage.width; ++x) {
+                        const auto* pixel =
+                            raw.data() + u64(y) * stage.row_pitch + u64(x) * stage.pixel_bytes;
+                        auto* output = rgba.data() + (u64(y) * stage.width + x) * 4;
+                        if (stage.pixel_bytes == 4)
+                            std::memcpy(output, pixel, 4);
+                        else
+                            for (u32 c = 0; c < 4; ++c) {
+                                u16 bits;
+                                std::memcpy(&bits, pixel + c * 2, 2);
+                                float value = float(std::bit_cast<half_float::half>(bits));
+                                output[c] =
+                                    u8(std::clamp(std::isfinite(value) ? value : 0.f, 0.f, 1.f) *
+                                           255.f +
+                                       .5f);
+                            }
+                    }
+            }
+            capture->manifest["stages"][names[index]] = {
+                {"width", stage.width},
+                {"height", stage.height},
+                {"row_pitch", stage.row_pitch},
+                {"pixel_bytes", stage.pixel_bytes},
+                {"raw_saved", !binary.fail()},
+                {"png_saved",
+                 WriteDiagnosticPng(capture->directory / fmt::format("{}.png", names[index]), rgba,
+                                    stage.width, stage.height)}};
+        }
+        std::ofstream manifest(capture->directory / "manifest.json", std::ios::binary);
+        manifest << capture->manifest.dump(2);
+        manifest.close();
+        if (manifest.fail())
+            throw std::runtime_error("Unable to save native presentation capture manifest");
+        LOG_INFO(Render, "Native presentation capture saved: {}", capture->directory.string());
+    } catch (const std::exception& error) {
+        LOG_ERROR(Render, "Native presentation capture save failed: {}", error.what());
+    }
 }
 
 void D3D12Presenter::Resize(uint32_t new_width, uint32_t new_height, float scale_x, float scale_y) {

@@ -11,6 +11,9 @@ public:
     virtual std::shared_ptr<void> AcquireCpuAccess(VAddr, u64, bool) {
         return {};
     }
+    virtual std::shared_ptr<void> AcquireCpuBackingAccess(VAddr address, u64 size, bool write) {
+        return AcquireCpuAccess(address, size, write);
+    }
     virtual std::shared_ptr<void> AcquireMemoryMappingAccess() {
         return {};
     }

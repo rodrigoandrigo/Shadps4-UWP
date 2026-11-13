@@ -46,7 +46,7 @@ void Bake(uint8_t *destination, std::vector<uint32_t> code, uint64_t hash) {
 
 bool Measure(uint8_t *bytes, uint32_t domain, uint32_t topology,
              uint32_t partition, float factor, uint32_t &count,
-             uint32_t &hash) {
+             uint32_t &hash, uint32_t input_points = 3) {
   std::memset(bytes + 0x200000, 0, 0x400000);
   const auto mov = [](uint32_t dst, uint32_t src) {
     return 0x7e000200u | (dst << 17) | src;
@@ -128,7 +128,7 @@ bool Measure(uint8_t *bytes, uint32_t domain, uint32_t topology,
   for (uint32_t i = 0; i < 8; ++i)
     shader(0x2c4c + i, ds_user[i]);
   context(0xa2d5, 0x45);
-  context(0xa2d6, 1 | (3 << 8) | (1 << 14));
+  context(0xa2d6, 1 | (input_points << 8) | (1 << 14));
   context(0xa2db, domain | (partition << 2) | (topology << 5));
   context(0xa286, std::bit_cast<uint32_t>(64.f));
   context(0xa287, std::bit_cast<uint32_t>(1.f));
@@ -175,7 +175,7 @@ bool Measure(uint8_t *bytes, uint32_t domain, uint32_t topology,
   context(0xa30e, 0xffffffff);
   context(0xa30f, 0xffffffff);
   commands.Packet(0x2f, {1});
-  commands.Packet(0x2d, {3, 2});
+  commands.Packet(0x2d, {input_points, 2});
   auto *fence = reinterpret_cast<volatile uint32_t *>(bytes + 0x20100);
   *fence = 0;
   const auto completion = uintptr_t(fence);
@@ -198,9 +198,9 @@ bool Measure(uint8_t *bytes, uint32_t domain, uint32_t topology,
     for (uint32_t x = 0; x < 16; ++x)
       for (uint32_t c = 0; c < 4; ++c)
         hash = (hash ^ bytes[0x200000 + (y * 64 + x) * 4 + c]) * 16777619;
-  std::printf("TESS_CASE domain=%u topology=%u partition=%u factor=%08x "
+  std::printf("TESS_CASE domain=%u topology=%u partition=%u factor=%08x input_points=%u "
               "count=%u hash=%08x\n",
-              domain, topology, partition, std::bit_cast<uint32_t>(factor),
+              domain, topology, partition, std::bit_cast<uint32_t>(factor), input_points,
               count, hash);
   return true;
 }
@@ -234,6 +234,14 @@ int main() {
         pass &= count[0] == count[1] && hash[0] == hash[1];
       }
     }
+  for (uint32_t domain = 0; domain < 3; ++domain)
+    for (uint32_t partition = 0; partition < 4; ++partition)
+      for (uint32_t points : {1u, 3u, 4u, 16u}) {
+        uint32_t count{}, hash{};
+        if (!Measure(bytes, domain, domain == 0 ? 1u : 2u, partition, 3.1f,
+                     count, hash, points))
+          return 1;
+      }
   std::printf("TESS_RESULT %s\n", pass ? "PASS" : "FAIL");
   sceKernelMunmap(memory, AllocationSize);
   sceKernelReleaseDirectMemory(physical, AllocationSize);

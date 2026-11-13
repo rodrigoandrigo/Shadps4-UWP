@@ -695,6 +695,11 @@ std::unique_ptr<TranslatedShader> ShaderCache::Translate(Shader::ShaderParams pa
             if (runtime.hw_stage == Shader::HwStage::Geometry &&
                 !std::ranges::equal(variant->copy_code, runtime.hw.gs.vs_copy))
                 continue;
+            if (variant->translated.info.srt_info.flattened_bufsize_dw >= params.user_data.size() &&
+                variant->dependencies.size() >= params.user_data.size() &&
+                !std::ranges::equal(params.user_data, std::span{variant->dependencies}.first(
+                                                          params.user_data.size())))
+                continue;
             auto translated = std::make_unique<TranslatedShader>(
                 TranslatedShader{variant->translated, {}, {}, {}, guest_profile});
             if (runtime.hw_stage == Shader::HwStage::Geometry)
@@ -713,7 +718,8 @@ std::unique_ptr<TranslatedShader> ShaderCache::Translate(Shader::ShaderParams pa
     return TranslateUncached(params, runtime);
 }
 std::unique_ptr<TranslatedShader> ShaderCache::TranslateUncached(Shader::ShaderParams params,
-                                                                 Shader::RuntimeInfo runtime) {
+                                                                 Shader::RuntimeInfo runtime,
+                                                                 bool retain_variant) {
     ProfileScope timing{shader_profile, "gcn_translate", 16};
     const auto stage = static_cast<u32>(runtime.sw_stage);
     const auto input_runtime = runtime;
@@ -752,6 +758,21 @@ std::unique_ptr<TranslatedShader> ShaderCache::TranslateUncached(Shader::ShaderP
                           variant->dependencies.capacity()) *
                              sizeof(u32) +
                          InfoBytes(shader.info);
+        if (retain_variant) {
+            constexpr size_t budget = 64 * 1024 * 1024;
+            if (variant->bytes <= budget) {
+                while (!variants.empty() &&
+                       (variants.size() >= 512 || variant_bytes + variant->bytes > budget)) {
+                    const auto oldest = std::ranges::min_element(
+                        variants, {}, [](const auto& entry) { return entry->used; });
+                    variant_bytes -= (*oldest)->bytes;
+                    variants.erase(oldest);
+                }
+                variant->used = ++variant_age;
+                variant_bytes += variant->bytes;
+                variants.push_back(variant);
+            }
+        }
         translated->variant = std::move(variant);
     }
     return translated;
@@ -787,7 +808,7 @@ PreparedShader ShaderCache::Prepare(std::unique_ptr<TranslatedShader> translated
         auto runtime = variant->input_runtime;
         if (runtime.hw_stage == Shader::HwStage::Geometry)
             runtime.hw.gs.vs_copy = translated->shader.runtime.hw.gs.vs_copy;
-        translated = TranslateUncached(*translated->params, runtime);
+        translated = TranslateUncached(*translated->params, runtime, false);
         translated->variant = variant;
     }
     const auto& guest_profile = translated->guest_profile;
@@ -1627,6 +1648,8 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileRectangle(
     const ShaderBinary& vertex, const Shader::HwFragmentRuntimeInfo& fragment, bool flat_last,
     RectangleMode mode) {
     const bool points = mode == RectangleMode::Points;
+    const bool quads = mode == RectangleMode::QuadFill || mode == RectangleMode::QuadStripFill;
+    const bool quad_strip = mode == RectangleMode::QuadStripFill;
     const auto first = vertex.hlsl.find("struct SPIRV_Cross_Output");
     const auto last = vertex.hlsl.find("};", first);
     if (first == std::string::npos || last == std::string::npos || last - first > 16384)
@@ -1636,26 +1659,42 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileRectangle(
         throw std::runtime_error("Rectangle expansion requires a position export");
     auto result = std::make_shared<ShaderBinary>();
     result->hlsl = vertex.hlsl.substr(first, last + 2 - first);
+    if (quads) {
+        auto output = result->hlsl;
+        output.replace(output.find("SPIRV_Cross_Output"), 18, "ShadQuadOutput");
+        output.insert(output.rfind("};"), "uint shadPrimitiveId : SV_PrimitiveID; ");
+        result->hlsl += "\n" + output;
+    }
     const u32 max_vertices = points ? 6 : 4;
     const std::string stream = points ? "PointStream" : "TriangleStream";
     result->hlsl += "\n[maxvertexcount(" + std::to_string(max_vertices) +
                     ")]\n"
-                    "void main(triangle SPIRV_Cross_Output input[3], inout " +
-                    stream + "<SPIRV_Cross_Output> stream) {\n";
-    result->hlsl += "float3 weight; uint corner = 0;\n";
-    for (u32 i = 0; i < 3; ++i) {
-        const auto a = "input[" + std::to_string(i) + "]." + position;
-        const auto b = "input[" + std::to_string((i + 1) % 3) + "]." + position;
-        const auto c = "input[" + std::to_string((i + 2) % 3) + "]." + position;
-        result->hlsl += "bool edge" + std::to_string(i) + " = (" + a + ".x == " + b + ".x && " + a +
-                        ".y == " + c + ".y) || (" + a + ".y == " + b + ".y && " + a + ".x == " + c +
-                        ".x);\nweight[" + std::to_string(i) + "] = edge" + std::to_string(i) +
-                        " ? -1.0 : 1.0;\n";
+                    "void main(" +
+                    std::string(quads ? "lineadj" : "triangle") + " SPIRV_Cross_Output input[" +
+                    std::string(quads ? "4" : "3") + "], " +
+                    (quads ? "uint primitive : SV_PrimitiveID, " : "") + "inout " + stream + "<" +
+                    std::string(quads ? "ShadQuadOutput" : "SPIRV_Cross_Output") + "> stream) {\n";
+    if (quads) {
+        result->hlsl += "SPIRV_Cross_Output v[4]; v[0] = input[1]; v[2] = input[0]; ";
+        result->hlsl += quad_strip ? "v[1] = input[3]; v[3] = input[2];\n"
+                                   : "v[1] = input[2]; v[3] = input[3];\n";
+    } else {
+        result->hlsl += "float3 weight; uint corner = 0;\n";
+        for (u32 i = 0; i < 3; ++i) {
+            const auto a = "input[" + std::to_string(i) + "]." + position;
+            const auto b = "input[" + std::to_string((i + 1) % 3) + "]." + position;
+            const auto c = "input[" + std::to_string((i + 2) % 3) + "]." + position;
+            result->hlsl += "bool edge" + std::to_string(i) + " = (" + a + ".x == " + b + ".x && " +
+                            a + ".y == " + c + ".y) || (" + a + ".y == " + b + ".y && " + a +
+                            ".x == " + c + ".x);\nweight[" + std::to_string(i) + "] = edge" +
+                            std::to_string(i) + " ? -1.0 : 1.0;\n";
+        }
+        result->hlsl += "corner = edge1 ? 1 : (edge2 ? 2 : 0);\n"
+                        "SPIRV_Cross_Output v[4];\n"
+                        "v[0] = input[corner]; v[1] = input[(corner+1)%3]; "
+                        "v[2] = input[(corner+2)%3]; v[3] = input[0];\n";
     }
-    result->hlsl += "corner = edge1 ? 1 : (edge2 ? 2 : 0);\n"
-                    "SPIRV_Cross_Output v[4];\n"
-                    "v[0] = input[corner]; v[1] = input[(corner+1)%3]; "
-                    "v[2] = input[(corner+2)%3]; v[3] = input[0];\n";
+    std::string quad_fields;
     const auto body = vertex.hlsl.find('{', first);
     std::istringstream members(vertex.hlsl.substr(body + 1, last - body - 1));
     for (std::string member; std::getline(members, member, ';');) {
@@ -1663,25 +1702,38 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileRectangle(
         std::string type, name, colon, semantic;
         if (!(declaration >> type))
             continue;
+        const bool integer = type == "uint" || type == "uint2" || type == "uint3" ||
+                             type == "uint4" || type == "int" || type == "int2" || type == "int3" ||
+                             type == "int4";
         if (!(declaration >> name >> colon >> semantic) || colon != ":" ||
-            name.find('[') != std::string::npos ||
-            (type != "float" && type != "float2" && type != "float3" && type != "float4"))
+            (!quads && name.find('[') != std::string::npos) ||
+            (type != "float" && type != "float2" && type != "float3" && type != "float4" &&
+             !(quads && integer)))
             throw std::runtime_error(
                 "D3D12 RectList cannot lower array or non-float vertex outputs");
-        bool flat{};
+        if (quads) {
+            name = name.substr(0, name.find('['));
+            quad_fields += "expanded." + name + " = v[i]." + name + ";\n";
+        }
+        bool flat = quads && integer;
         for (u32 i = 0; i < fragment.num_inputs; ++i) {
             const auto& input = fragment.inputs[i];
             flat |= input.is_flat && semantic == "TEXCOORD" + std::to_string(input.param_index);
         }
         if (flat) {
             result->hlsl += "for(uint i=0;i<4;++i) v[i]." + name + " = input[" +
-                            std::string(flat_last ? "2" : "0") + "]." + name + ";\n";
-        } else {
+                            std::string(flat_last ? (quads && !quad_strip ? "3" : "2") : "0") +
+                            "]." + name + ";\n";
+        } else if (!quads) {
             result->hlsl += "v[3]." + name + " = input[0]." + name + " * weight.x + input[1]." +
                             name + " * weight.y + input[2]." + name + " * weight.z;\n";
         }
     }
-    if (points) {
+    if (quads) {
+        result->hlsl += "for(uint i=0;i<4;++i) { ShadQuadOutput expanded; "
+                        "expanded.shadPrimitiveId = primitive;\n" +
+                        quad_fields + "stream.Append(expanded); } stream.RestartStrip();\n}\n";
+    } else if (points) {
         result->hlsl += "stream.Append(v[0]); stream.Append(v[1]); stream.Append(v[2]); "
                         "stream.Append(v[2]); stream.Append(v[1]); stream.Append(v[3]);\n}\n";
     } else {

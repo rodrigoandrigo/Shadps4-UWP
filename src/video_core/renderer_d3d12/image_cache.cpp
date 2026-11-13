@@ -28,6 +28,8 @@ bool CompatibleTypelessView(DXGI_FORMAT resource, DXGI_FORMAT view) {
                view == DXGI_FORMAT_R8G8B8A8_SNORM;
     case DXGI_FORMAT_B8G8R8A8_TYPELESS:
         return view == DXGI_FORMAT_B8G8R8A8_UNORM || view == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+        return view == DXGI_FORMAT_B8G8R8X8_UNORM || view == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
     case DXGI_FORMAT_R16_TYPELESS:
         return view == DXGI_FORMAT_R16_FLOAT || view == DXGI_FORMAT_R16_UNORM ||
                view == DXGI_FORMAT_R16_SNORM || view == DXGI_FORMAT_R16_UINT ||
@@ -48,6 +50,18 @@ bool CompatibleTypelessView(DXGI_FORMAT resource, DXGI_FORMAT view) {
         return false;
     }
 }
+DXGI_FORMAT PresentationFormat(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8X8_UNORM;
+    default:
+        return format;
+    }
+}
 bool CompatibleImageViews(DXGI_FORMAT resource, DXGI_FORMAT first, DXGI_FORMAT second) {
     return CompatibleTypelessView(resource, first) && CompatibleTypelessView(resource, second);
 }
@@ -58,8 +72,7 @@ ImageCache::Image* ImageCache::FindPresentation(const VideoCore::ImageInfo& info
     for (auto& [key, image] : images) {
         const auto& source = image->info;
         if (!image->resident || image->cpu_dirty || image->logic_op || source.props.is_depth ||
-            source.props.is_volume || source.pixel_format != info.pixel_format ||
-            source.num_samples != 1 || image->base_layer != 0 ||
+            source.props.is_volume || source.num_samples != 1 || image->base_layer != 0 ||
             source.size.width != info.size.width || source.size.height != info.size.height ||
             source.num_bits != info.num_bits || source.pitch != info.pitch ||
             source.mips_layout[0].pitch != info.mips_layout[0].pitch ||
@@ -74,7 +87,9 @@ ImageCache::Image* ImageCache::FindPresentation(const VideoCore::ImageInfo& info
         if (first.address != second.address || first.physical != second.physical)
             continue;
         const auto format = image->Native()->GetDesc().Format;
-        const bool compatible = CompatibleTypelessView(format, ConvertFormat(info.pixel_format));
+        const auto target_format = ConvertFormat(info.pixel_format);
+        const bool compatible = CompatibleTypelessView(format, target_format) ||
+                                PresentationFormat(format) == PresentationFormat(target_format);
         if (compatible &&
             (!result ||
              (image->written != result->written ? image->written : image->age > result->age)))
@@ -434,6 +449,21 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
             format = DXGI_FORMAT_R16_TYPELESS;
         else if (view_format == DXGI_FORMAT_D32_FLOAT)
             format = DXGI_FORMAT_R32_TYPELESS;
+    }
+    if (!info.props.is_depth && !multisampled && !logic_op) {
+        switch (PresentationFormat(format)) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+            format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+            break;
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+            format = DXGI_FORMAT_B8G8R8A8_TYPELESS;
+            break;
+        case DXGI_FORMAT_B8G8R8X8_UNORM:
+            format = DXGI_FORMAT_B8G8R8X8_TYPELESS;
+            break;
+        default:
+            break;
+        }
     }
     DXGI_FORMAT resource_format = format;
     DXGI_FORMAT depth_footprint = DXGI_FORMAT_UNKNOWN;

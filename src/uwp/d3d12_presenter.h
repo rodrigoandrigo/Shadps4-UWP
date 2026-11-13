@@ -53,6 +53,9 @@ private:
     void ConvertResident(Frame& frame, CommandFrame& command_frame,
                          ID3D12GraphicsCommandList* commands);
     void WaitForFrameUse(const Frame& frame);
+    void RecordDiagnosticCapture(Frame& frame, ID3D12GraphicsCommandList* commands,
+                                 D3D12CommandEncoder& encoder, ID3D12Resource* backbuffer);
+    void SaveDiagnosticCapture(Frame& frame, u64 fence);
     void GetBuffers();
     void RenderFrame();
     void RenderFrameCore();

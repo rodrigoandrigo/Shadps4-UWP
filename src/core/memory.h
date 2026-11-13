@@ -299,12 +299,14 @@ public:
 
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
     std::shared_ptr<void> AcquireGpuAccess(std::span<const std::pair<VAddr, u64>> ranges);
-    std::shared_ptr<void> AcquireAsyncGpuAccess(std::span<const std::pair<VAddr, u64>> ranges);
+    std::shared_ptr<void> AcquireAsyncGpuAccess(std::span<const std::pair<VAddr, u64>> ranges,
+                                                bool write = true);
     struct GpuImageWatch {
         VAddr address;
         u64 size;
         bool dirty;
     };
+    std::shared_ptr<void> AcquireAsyncGpuAccess(std::span<const GpuImageWatch> ranges);
     void EnableGpuImageTracking(bool enabled);
     void SetGpuImageWatches(std::span<const GpuImageWatch> ranges);
 
@@ -403,6 +405,7 @@ private:
     void ReleaseAsyncGpuAccess(u64 id);
     void UpdateAsyncGpuProtection();
     std::map<u64, std::vector<GpuProtectedRange>> async_gpu_ranges;
+    std::map<u64, std::vector<GpuProtectedRange>> async_gpu_read_ranges;
     u64 async_gpu_id{};
     std::shared_lock<Common::SharedFirstMutex> LockGpuAccess();
     void ReleaseGpuAccess();
@@ -415,11 +418,13 @@ private:
     std::condition_variable_any gpu_access_cv;
     std::thread::id gpu_access_owner;
     std::vector<GpuProtectedRange> gpu_protected_ranges;
+    std::vector<GpuProtectedRange> gpu_read_ranges;
     struct GpuImageProtectedRange {
         GpuProtectedRange range;
         bool dirty;
     };
-    void ApplyGpuImageProtection(std::span<const GpuImageProtectedRange> previous, bool release);
+    void ApplyGpuImageProtection(std::span<const GpuImageProtectedRange> previous, bool release,
+                                 bool incremental = false);
     std::vector<GpuImageProtectedRange> gpu_image_ranges;
     std::atomic<bool> gpu_image_tracking{};
     u64 gpu_access_epoch{};

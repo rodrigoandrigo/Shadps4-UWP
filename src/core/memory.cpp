@@ -155,7 +155,7 @@ void MemoryManager::SetPrtArea(u32 id, VAddr address, u64 size) {
 void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     const auto image_access = gpu_image_tracking.load(std::memory_order_acquire) &&
                                       gpu_access_memory != this && rasterizer
-                                  ? rasterizer->AcquireCpuAccess(virtual_addr, size, false)
+                                  ? rasterizer->AcquireCpuBackingAccess(virtual_addr, size, false)
                                   : nullptr;
     GuestCopyScope scope{this};
     auto access_lock = LockGpuAccess();
@@ -364,7 +364,7 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     const auto image_access =
         gpu_image_tracking.load(std::memory_order_acquire) && gpu_access_memory != this &&
                 rasterizer
-            ? rasterizer->AcquireCpuAccess(reinterpret_cast<VAddr>(address), size, true)
+            ? rasterizer->AcquireCpuBackingAccess(reinterpret_cast<VAddr>(address), size, true)
             : nullptr;
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);
     // Shared lock unless a GuestCopyScope already holds it (see GuestCopyScope).

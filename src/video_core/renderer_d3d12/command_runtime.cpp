@@ -7,8 +7,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <nlohmann/json.hpp>
 #include <winrt/base.h>
 #include "common/logging/log.h"
+#include "video_core/renderdoc.h"
 #include "video_core/renderer_d3d12/cmask_address.h"
 #include "video_core/renderer_d3d12/color_clear.h"
 #include "video_core/renderer_d3d12/logic_op_policy.h"
@@ -255,16 +257,36 @@ std::shared_ptr<VideoCore::ResidentFrame> CommandRuntime::CapturePresentation(
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     Microsoft::WRL::ComPtr<ID3D12Resource> snapshot;
-    winrt::check_hresult(Core::Uwp::AllocateMemory([&] {
-        return device.Device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &buffer,
-                                                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                        IID_PPV_ARGS(&snapshot));
-    }));
+    std::shared_ptr<void> shared_handle;
+    const auto available = std::ranges::find_if(resident_snapshots, [&](const auto& cached) {
+        return cached.bytes == bytes && cached.handle.use_count() == 1;
+    });
+    const bool reused = available != resident_snapshots.end();
+    if (reused) {
+        snapshot = available->resource;
+        shared_handle = available->handle;
+    } else {
+        winrt::check_hresult(Core::Uwp::AllocateMemory([&] {
+            return device.Device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &buffer,
+                                                            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                            IID_PPV_ARGS(&snapshot));
+        }));
+        HANDLE handle{};
+        winrt::check_hresult(device.Device()->CreateSharedHandle(snapshot.Get(), nullptr,
+                                                                 GENERIC_ALL, nullptr, &handle));
+        shared_handle = std::shared_ptr<void>(handle, [](void* value) { CloseHandle(value); });
+        const auto allocation = device.Device()->GetResourceAllocationInfo(0, 1, &buffer);
+        ResidentSnapshot cached{snapshot, shared_handle, bytes, allocation.SizeInBytes};
+        if (resident_snapshots.size() < 4)
+            resident_snapshots.push_back(std::move(cached));
+        else if (const auto unused = std::ranges::find_if(
+                     resident_snapshots,
+                     [](const auto& entry) { return entry.handle.use_count() == 1; });
+                 unused != resident_snapshots.end())
+            *unused = std::move(cached);
+    }
     auto frame = std::make_shared<VideoCore::ResidentFrame>();
-    HANDLE handle{};
-    winrt::check_hresult(device.Device()->CreateSharedHandle(snapshot.Get(), nullptr, GENERIC_ALL,
-                                                             nullptr, &handle));
-    frame->handle = std::shared_ptr<void>(handle, [](void* value) { CloseHandle(value); });
+    frame->handle = std::move(shared_handle);
     frame->bytes = bytes;
     frame->row_pitch = footprint.Footprint.RowPitch;
     winrt::check_hresult(allocator->Reset());
@@ -281,6 +303,13 @@ std::shared_ptr<VideoCore::ResidentFrame> CommandRuntime::CapturePresentation(
     destination.PlacedFootprint = footprint;
     if (runtime_profile.enabled)
         runtime_profile.Record("capture_copy_bytes", 128, 0, bytes);
+    if (reused) {
+        D3D12_RESOURCE_BARRIER reuse{};
+        reuse.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        reuse.Transition = {snapshot.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST};
+        commands->ResourceBarrier(1, &reuse);
+    }
     commands->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
     images.Barrier(*image, commands.Get(), previous);
     D3D12_RESOURCE_BARRIER barrier{};
@@ -567,11 +596,12 @@ void CommandRuntime::SynchronizeImages(std::span<const ResourceCache::Range> ran
     if (changed)
         UpdateImageWatches();
 }
-std::shared_ptr<void> CommandRuntime::AcquireCpuAccess(VAddr address, u64 size, bool write) {
+std::shared_ptr<void> CommandRuntime::AcquireCpuAccess(VAddr address, u64 size, bool write,
+                                                       bool backing_access) {
     ProfileScope timing{runtime_profile, "cpu_access", 128};
     std::unique_lock parent_lock{mutex};
     const ResourceCache::Range requested{address, size};
-    DrainContexts({&requested, 1}, false);
+    DrainContexts({&requested, 1}, false, backing_access && !write);
     for (auto& context : contexts)
         if (!context->completing && !context->recording_context && !context->synchronizing_images) {
             const auto watches = context->ResourceWatches();
@@ -580,7 +610,7 @@ std::shared_ptr<void> CommandRuntime::AcquireCpuAccess(VAddr address, u64 size, 
                            resources.Aliases(address, size, watch.address, watch.size);
                 }))
                 context->CompleteContext();
-            static_cast<void>(context->AcquireCpuAccess(address, size, write));
+            static_cast<void>(context->AcquireCpuAccess(address, size, write, backing_access));
         }
     const bool internal_access =
         buffer_commands_open || recording_context || synchronizing_images || completing ||
@@ -734,6 +764,17 @@ void CommandRuntime::MaterializeColorClearImpl(const AmdGpu::ColorBuffer& buffer
     }
     if (tiles.empty())
         return;
+    if (VideoCore::IsPresentationTraceActive()) {
+        nlohmann::json event{{"kind", "native_cmask_clear"},
+                             {"address", info.guest_address},
+                             {"cmask_address", buffer.CmaskAddress()},
+                             {"tile_count", tiles.size()},
+                             {"width", info.size.width},
+                             {"height", info.size.height},
+                             {"clear_word0", buffer.clear_word0},
+                             {"clear_word1", buffer.clear_word1}};
+        VideoCore::RecordPresentationEvent(event.dump());
+    }
     const auto clear = DecodeColorClear(buffer);
     if (!clear || clear->pixel_bytes * 8 != info.num_bits ||
         clear->data_format != u32(buffer.GetDataFmt()) ||
@@ -807,10 +848,12 @@ void CommandRuntime::Dispatch(Shader::ShaderParams params, Shader::RuntimeInfo r
                 {sharp.base_address, u64(sharp.num_records) * std::max<u32>(1, sharp.stride)});
         }
         for (const auto& image : shader.info.images) {
-            if (!image.is_written)
+            if (!image.is_written && !image.is_atomic)
                 continue;
             const auto info = ShaderImageLayout(image.GetSharp(shader.info), image);
             writes.push_back({info.guest_address, info.guest_size});
+            if (info.stencil_addr && info.stencil_size)
+                writes.push_back({info.stencil_addr, info.stencil_size});
         }
         auto& context = NextContext(writes, reads);
         struct Scope {

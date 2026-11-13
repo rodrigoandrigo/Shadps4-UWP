@@ -288,7 +288,7 @@ std::optional<PackedChannels> PackedFormat(AmdGpu::DataFormat format) {
     case AmdGpu::DataFormat::Format1_5_5_5:
         return PackedChannels{{5, 5, 5, 1}, {10, 5, 0, 15}};
     case AmdGpu::DataFormat::Format4_4_4_4:
-        return PackedChannels{{4, 4, 4, 4}, {8, 4, 0, 12}};
+        return PackedChannels{{4, 4, 4, 4}, {4, 8, 12, 0}};
     case AmdGpu::DataFormat::Format8_24:
         return PackedChannels{{24, 8, 0, 0}, {0, 24, 0, 0}};
     case AmdGpu::DataFormat::Format24_8:

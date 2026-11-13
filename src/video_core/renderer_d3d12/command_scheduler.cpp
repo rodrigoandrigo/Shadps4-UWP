@@ -16,6 +16,8 @@ u64 CommandRuntime::LocalMemoryBytes() const {
                 shaders.MemoryBytes() + gpu_commands.MemoryBytes() + pipeline_bytes +
                 pipelines.size() * 65536 + pending_feedback_snapshot_bytes +
                 published_watches.capacity() * sizeof(ImageCache::Watch);
+    for (const auto& snapshot : resident_snapshots)
+        bytes += snapshot.allocation_bytes;
     if (transfer_pool)
         bytes += transfer_pool->ResourceStatistics().live_bytes;
     return bytes;
@@ -30,6 +32,8 @@ void CommandRuntime::TrimLocalMemory(u64 target, bool writeback) {
     transfer_pool->TrimMemory(0);
     if (LocalMemoryBytes() <= target)
         return;
+    std::erase_if(resident_snapshots,
+                  [](const auto& snapshot) { return snapshot.handle.use_count() == 1; });
     shaders.TrimMemory(std::min(shaders.MemoryBytes(), target / 8));
     if (LocalMemoryBytes() > target) {
         pipelines.clear();
@@ -120,7 +124,8 @@ ResourceCache::UploadStatistics CommandRuntime::BufferStatistics(bool input) con
     }
     return total;
 }
-void CommandRuntime::EnableAsync(ResourceCache::ResolveBacking backing, AcquireMemory acquire) {
+void CommandRuntime::EnableAsync(ResourceCache::ResolveBacking backing,
+                                 AcquireAsyncMemory acquire) {
     auto lock = ProfileSample(runtime_profile, "scheduler_lock", 512,
                               [&] { return std::unique_lock{mutex}; });
     if (!contexts.empty() || coordinator || !backing || !acquire)
@@ -144,7 +149,20 @@ void CommandRuntime::EnableAsync(ResourceCache::ResolveBacking backing, AcquireM
         auto* worker = context.get();
         context->SetMemoryAccess([this, worker,
                                   acquire](std::span<const ResourceCache::Range> ranges) {
-            DrainContexts(ranges, false);
+            std::vector<ImageCache::Watch> access;
+            access.reserve(ranges.size());
+            std::vector<ResourceCache::Range> writes;
+            for (const auto& range : ranges) {
+                const bool written =
+                    std::ranges::any_of(worker->write_ranges, [&](const auto& output) {
+                        return resources.Aliases(range.address, range.size, output.address,
+                                                 output.size);
+                    });
+                access.push_back({range.address, range.size, written});
+                if (written)
+                    writes.push_back(range);
+            }
+            DrainContexts(ranges, false, true);
             for (auto& other : contexts) {
                 if (other.get() == worker || other->completing || other->recording_context ||
                     other->synchronizing_images)
@@ -158,12 +176,16 @@ void CommandRuntime::EnableAsync(ResourceCache::ResolveBacking backing, AcquireM
                 });
                 if (dirty && other->completion)
                     other->CompleteContext();
-                other->SynchronizeBuffers(ranges, true);
-                other->SynchronizeImages(ranges, true);
+                other->SynchronizeBuffers(ranges, false);
+                other->SynchronizeImages(ranges, false);
+                if (!writes.empty()) {
+                    other->SynchronizeBuffers(writes, true);
+                    other->SynchronizeImages(writes, true);
+                }
             }
             worker->pending_ranges.insert(worker->pending_ranges.end(), ranges.begin(),
                                           ranges.end());
-            return acquire(ranges);
+            return acquire(access);
         });
         contexts.push_back(std::move(context));
         if (image_watches)
@@ -179,6 +201,19 @@ CommandRuntime& CommandRuntime::NextContext(std::span<const ResourceCache::Range
         last_context = &context;
         return context;
     };
+    for (auto& context : contexts)
+        if (std::ranges::any_of(writes, [&](const auto& next) {
+                return std::ranges::any_of(context->write_ranges, [&](const auto& previous) {
+                    return resources.Aliases(next.address, next.size, previous.address,
+                                             previous.size);
+                });
+            })) {
+            if (context->completion) {
+                ++async_statistics.hazard_waits;
+                context->CompleteContext();
+            }
+            return select(*context);
+        }
     for (const auto affinity : {reads, writes})
         for (auto& context : contexts) {
             const auto watches = context->ResourceWatches();
@@ -189,19 +224,6 @@ CommandRuntime& CommandRuntime::NextContext(std::span<const ResourceCache::Range
                     });
                 }))
                 continue;
-            if (context->completion) {
-                ++async_statistics.hazard_waits;
-                context->CompleteContext();
-            }
-            return select(*context);
-        }
-    for (auto& context : contexts)
-        if (std::ranges::any_of(writes, [&](const auto& next) {
-                return std::ranges::any_of(context->write_ranges, [&](const auto& previous) {
-                    return resources.Aliases(next.address, next.size, previous.address,
-                                             previous.size);
-                });
-            })) {
             if (context->completion) {
                 ++async_statistics.hazard_waits;
                 context->CompleteContext();
@@ -325,7 +347,8 @@ void CommandRuntime::CompleteContext() {
         throw;
     }
 }
-void CommandRuntime::DrainContexts(std::span<const ResourceCache::Range> ranges, bool all) {
+void CommandRuntime::DrainContexts(std::span<const ResourceCache::Range> ranges, bool all,
+                                   bool writes_only) {
     auto lock = ProfileSample(runtime_profile, "scheduler_lock", 512,
                               [&] { return std::unique_lock{mutex}; });
     std::vector<CommandRuntime*> pending;
@@ -334,10 +357,12 @@ void CommandRuntime::DrainContexts(std::span<const ResourceCache::Range> ranges,
             continue;
         const bool overlaps =
             all || std::ranges::any_of(ranges, [&](const auto& requested) {
-                return std::ranges::any_of(context->pending_ranges, [&](const auto& used) {
-                    return resources.Aliases(requested.address, requested.size, used.address,
-                                             used.size);
-                });
+                return std::ranges::any_of(
+                    writes_only ? context->write_ranges : context->pending_ranges,
+                    [&](const auto& used) {
+                        return resources.Aliases(requested.address, requested.size, used.address,
+                                                 used.size);
+                    });
             });
         if (overlaps)
             pending.push_back(context.get());

@@ -28,7 +28,11 @@ std::vector<ResourceCache::Buffer::WriteTarget> UniqueRanges(
         range.address += skip;
         range.offset += skip;
         range.size -= skip;
-        result.push_back(range);
+        if (!result.empty() && result.back().offset + result.back().size == range.offset &&
+            result.back().address + result.back().size == range.address)
+            result.back().size += range.size;
+        else
+            result.push_back(range);
         end = next_end;
     }
     return result;
@@ -176,6 +180,10 @@ bool ResourceCache::CopyResident(VAddr address, u64 size, Buffer& destination, u
     return false;
 }
 void ResourceCache::InvalidateMappings() {
+    {
+        std::scoped_lock lock{invalidation_mutex};
+        ++mapping_generation;
+    }
     for (auto& [key, buffer] : buffers) {
         if (buffer->host)
             continue;
@@ -192,14 +200,44 @@ void ResourceCache::PrepareViews(std::span<const Range> ranges) {
     if (!persistent)
         return;
     const auto views = GetViews(ranges);
+    std::vector<Range> requested_backing;
+    if (resolve_backing)
+        for (const auto& range : ranges) {
+            if (!range.address || !range.size)
+                continue;
+            const auto parts = resolve_backing(range.address, range.size);
+            requested_backing.insert(requested_backing.end(), parts.begin(), parts.end());
+        }
+    const auto overlaps_backing = [&](const Buffer& buffer) {
+        if (!resolve_backing || buffer.backing_layout.empty())
+            return std::ranges::any_of(ranges, [&](const auto& range) {
+                return BufferOverlaps(buffer, range.address, range.size);
+            });
+        u64 offset{};
+        for (const auto& [address, size] : buffer.backing_layout) {
+            for (const auto& source : buffer.sources) {
+                const auto first = std::max(offset, source.offset);
+                const auto last = std::min(offset + size, source.offset + source.size);
+                if (first >= last)
+                    continue;
+                const auto begin = address + first - offset;
+                const auto end = address + last - offset;
+                if (std::ranges::any_of(requested_backing, [&](const auto& requested) {
+                        return begin < requested.address + requested.size &&
+                               requested.address < end;
+                    }))
+                    return true;
+            }
+            offset += size;
+        }
+        return false;
+    };
     for (auto& [key, buffer] : buffers) {
         if (!buffer->resident || buffer->host || std::ranges::any_of(views, [&](const auto& view) {
                 return view.buffer == buffer.get();
             }))
             continue;
-        if (std::ranges::any_of(ranges, [&](const auto& range) {
-                return BufferOverlaps(*buffer, range.address, range.size);
-            })) {
+        if (overlaps_backing(*buffer)) {
             if (buffer->written && synchronize)
                 for (const auto& source : buffer->sources)
                     synchronize(source.address, source.size);
@@ -387,7 +425,7 @@ std::vector<ResourceCache::View> ResourceCache::GetBackingViews(std::span<const 
         u64 offset{};
         for (const auto& part : resolve_backing(range.address, range.size)) {
             if (!part.size || part.size > range.size - offset ||
-                part.address > UINT64_MAX - part.size - 15)
+                part.address > UINT64_MAX - part.size - 65535)
                 throw std::runtime_error("Invalid D3D12 buffer backing segment");
             backing[i].push_back({part.address, part.size, offset});
             offset += part.size;
@@ -416,12 +454,18 @@ std::vector<ResourceCache::View> ResourceCache::GetBackingViews(std::span<const 
                 }
             }
         }
+        const u64 alignment = persistent && group.size() == 1 &&
+                                      backing[group.front()].size() == 1 &&
+                                      ranges[group.front()].size <= 16ULL * 1024 * 1024 - 65536
+                                  ? 65536
+                                  : 16;
         std::vector<Range> physical;
         for (const u32 index : group)
             for (const auto& segment : backing[index])
-                physical.push_back({segment.address & ~u64{15},
-                                    ((segment.address + segment.size + 15) & ~u64{15}) -
-                                        (segment.address & ~u64{15})});
+                physical.push_back(
+                    {segment.address & ~(alignment - 1),
+                     ((segment.address + segment.size + alignment - 1) & ~(alignment - 1)) -
+                         (segment.address & ~(alignment - 1))});
         std::ranges::sort(physical, {}, &Range::address);
         std::vector<Segment> allocations;
         u64 bytes{};
@@ -515,6 +559,7 @@ std::vector<ResourceCache::View> ResourceCache::GetBackingViews(std::span<const 
                 }))
                 view.offset = first;
         }
+        buffer.sources = UniqueRanges(std::move(buffer.sources));
     }
     return views;
 }

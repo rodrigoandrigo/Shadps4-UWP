@@ -71,6 +71,7 @@ public:
     void ScopeMarkerEnd(bool = false) override {}
     void ScopedMarkerInsertColor(std::string_view, u32, bool = false) override {}
     std::shared_ptr<void> AcquireCpuAccess(VAddr address, u64 size, bool write) override;
+    std::shared_ptr<void> AcquireCpuBackingAccess(VAddr address, u64 size, bool write) override;
     std::shared_ptr<void> AcquireMemoryMappingAccess() override;
     std::shared_ptr<VideoCore::ResidentFrame> CapturePresentation(
         const VideoCore::ImageInfo& info) override;

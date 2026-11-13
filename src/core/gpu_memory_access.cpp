@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <stdexcept>
+#include <tuple>
 #include "common/alignment.h"
 #include "common/signal_context.h"
 #include "core/gpu_memory_watch.h"
@@ -52,7 +53,7 @@ MemoryManager::AcquireGpuAccess(std::span<const std::pair<VAddr, u64>> ranges) {
         throw std::runtime_error("Nested guest GPU memory ownership is not supported");
     auto lease = std::make_shared<GpuAccessLease>(*this);
     std::unique_lock lock{gpu_access_mutex};
-    if (!async_gpu_ranges.empty())
+    if (!async_gpu_ranges.empty() || !async_gpu_read_ranges.empty())
         throw std::runtime_error("Cannot mix synchronous and asynchronous GPU ownership");
     auto protected_ranges = ResolveGpuProtectedRanges(ranges);
     gpu_protected_ranges = std::move(protected_ranges);
@@ -134,16 +135,37 @@ struct MemoryManager::AsyncGpuAccessLease {
     }
 };
 std::shared_ptr<void> MemoryManager::AcquireAsyncGpuAccess(
-    std::span<const std::pair<VAddr, u64>> ranges) {
+    std::span<const std::pair<VAddr, u64>> ranges, bool write) {
+    std::vector<GpuImageWatch> access;
+    access.reserve(ranges.size());
+    for (const auto& [address, size] : ranges)
+        access.push_back({address, size, write});
+    return AcquireAsyncGpuAccess(access);
+}
+std::shared_ptr<void> MemoryManager::AcquireAsyncGpuAccess(std::span<const GpuImageWatch> ranges) {
     GuestCopyScope scope{this};
     std::unique_lock lock{gpu_access_mutex};
     if (gpu_access_memory)
         throw std::runtime_error("Cannot mix synchronous and asynchronous GPU ownership");
-    auto protected_ranges = ResolveGpuProtectedRanges(ranges);
+    std::vector<std::pair<VAddr, u64>> reads, writes;
+    for (const auto& range : ranges)
+        (range.dirty ? writes : reads).emplace_back(range.address, range.size);
+    auto protected_writes = ResolveGpuProtectedRanges(writes);
+    auto protected_reads = ResolveGpuProtectedRanges(reads);
     auto lease = std::make_shared<AsyncGpuAccessLease>();
     const auto id = ++async_gpu_id;
-    async_gpu_ranges.emplace(id, std::move(protected_ranges));
-    UpdateAsyncGpuProtection();
+    try {
+        if (!protected_writes.empty())
+            async_gpu_ranges.emplace(id, std::move(protected_writes));
+        if (!protected_reads.empty())
+            async_gpu_read_ranges.emplace(id, std::move(protected_reads));
+        UpdateAsyncGpuProtection();
+    } catch (...) {
+        async_gpu_ranges.erase(id);
+        async_gpu_read_ranges.erase(id);
+        UpdateAsyncGpuProtection();
+        throw;
+    }
     gpu_access_owner = std::this_thread::get_id();
     gpu_fault_memory.store(this, std::memory_order_release);
     lease->id = id;
@@ -153,7 +175,16 @@ std::shared_ptr<void> MemoryManager::AcquireAsyncGpuAccess(
 void MemoryManager::UpdateAsyncGpuProtection() {
     std::vector<GpuImageProtectedRange> previous;
     for (const auto& range : gpu_protected_ranges)
+        previous.push_back({range, true});
+    for (const auto& range : gpu_read_ranges)
         previous.push_back({range, false});
+    previous.insert(previous.end(), gpu_image_ranges.begin(), gpu_image_ranges.end());
+    std::vector<std::pair<VAddr, VAddr>> protected_before;
+    for (const auto& watched : previous)
+        if (watched.dirty)
+            protected_before.emplace_back(watched.range.address,
+                                          watched.range.address + watched.range.size);
+    std::ranges::sort(protected_before);
     gpu_protected_ranges.clear();
     for (const auto& [id, ranges] : async_gpu_ranges)
         gpu_protected_ranges.insert(gpu_protected_ranges.end(), ranges.begin(), ranges.end());
@@ -163,22 +194,53 @@ void MemoryManager::UpdateAsyncGpuProtection() {
         if (!merged.empty() && range.address <= merged.back().address + merged.back().size &&
             range.permissions == merged.back().permissions) {
             auto& last = merged.back();
-            last.size = std::max(last.address + last.size, range.address + range.size) - last.address;
+            last.size =
+                std::max(last.address + last.size, range.address + range.size) - last.address;
         } else {
             merged.push_back(range);
         }
     }
     gpu_protected_ranges = std::move(merged);
-    for (const auto& range : gpu_protected_ranges)
-        impl.Protect(range.address, range.size, MemoryPermission::None);
-    ApplyGpuImageProtection(previous, false);
+    gpu_read_ranges.clear();
+    for (const auto& [id, ranges] : async_gpu_read_ranges)
+        gpu_read_ranges.insert(gpu_read_ranges.end(), ranges.begin(), ranges.end());
+    std::ranges::sort(gpu_read_ranges, {}, &GpuProtectedRange::address);
+    merged.clear();
+    for (const auto& range : gpu_read_ranges) {
+        if (!merged.empty() && range.address <= merged.back().address + merged.back().size &&
+            range.permissions == merged.back().permissions) {
+            auto& last = merged.back();
+            last.size =
+                std::max(last.address + last.size, range.address + range.size) - last.address;
+        } else {
+            merged.push_back(range);
+        }
+    }
+    gpu_read_ranges = std::move(merged);
+    for (const auto& range : gpu_protected_ranges) {
+        auto cursor = range.address;
+        const auto end = range.address + range.size;
+        for (const auto& [first, last] : protected_before) {
+            if (last <= cursor)
+                continue;
+            if (first >= end)
+                break;
+            if (first > cursor)
+                impl.Protect(cursor, first - cursor, MemoryPermission::None);
+            cursor = std::min(end, std::max(cursor, last));
+        }
+        if (cursor < end)
+            impl.Protect(cursor, end - cursor, MemoryPermission::None);
+    }
+    ApplyGpuImageProtection(previous, false, true);
     ++gpu_access_epoch;
 }
 void MemoryManager::ReleaseAsyncGpuAccess(u64 id) {
     std::unique_lock lock{gpu_access_mutex};
     async_gpu_ranges.erase(id);
+    async_gpu_read_ranges.erase(id);
     UpdateAsyncGpuProtection();
-    if (async_gpu_ranges.empty())
+    if (async_gpu_ranges.empty() && async_gpu_read_ranges.empty())
         gpu_access_owner = {};
     lock.unlock();
     gpu_access_cv.notify_all();
@@ -232,12 +294,44 @@ void MemoryManager::SetGpuImageWatches(std::span<const GpuImageWatch> ranges) {
             throw std::runtime_error("Persistent GPU image requires stable mapped backing");
     }
     auto previous = std::move(gpu_image_ranges);
+    for (const auto& range : gpu_protected_ranges)
+        previous.push_back({range, true});
+    for (const auto& range : gpu_read_ranges)
+        previous.push_back({range, false});
     gpu_image_ranges = std::move(next);
-    ApplyGpuImageProtection(previous, false);
+    ApplyGpuImageProtection(previous, false, true);
     ++gpu_access_epoch;
 }
 void MemoryManager::ApplyGpuImageProtection(std::span<const GpuImageProtectedRange> previous,
-                                            bool release) {
+                                            bool release, bool incremental) {
+    using Identity = std::tuple<VAddr, u64, MemoryPermission, bool>;
+    const auto identity = [](const GpuImageProtectedRange& watched) {
+        return Identity{watched.range.address, watched.range.size, watched.range.permissions,
+                        watched.dirty};
+    };
+    std::vector<Identity> old_ranges, new_ranges;
+    std::vector<std::pair<VAddr, u64>> dirty_changes;
+    if (incremental) {
+        for (const auto& watched : previous)
+            old_ranges.push_back(identity(watched));
+        for (const auto& watched : gpu_image_ranges)
+            new_ranges.push_back(identity(watched));
+        std::ranges::sort(old_ranges);
+        std::ranges::sort(new_ranges);
+        for (const auto& watched : previous)
+            if (watched.dirty && !std::ranges::binary_search(new_ranges, identity(watched)))
+                dirty_changes.emplace_back(watched.range.address, watched.range.size);
+        for (const auto& watched : gpu_image_ranges)
+            if (watched.dirty && !std::ranges::binary_search(old_ranges, identity(watched)))
+                dirty_changes.emplace_back(watched.range.address, watched.range.size);
+    }
+    const auto unchanged = [&](const GpuImageProtectedRange& watched) {
+        return incremental && std::ranges::binary_search(old_ranges, identity(watched)) &&
+               (watched.dirty || std::ranges::none_of(dirty_changes, [&](const auto& changed) {
+                    return watched.range.address < changed.first + changed.second &&
+                           changed.first < watched.range.address + watched.range.size;
+                }));
+    };
     using Range = std::pair<VAddr, u64>;
     std::vector<Range> all, unreadable;
     for (const auto& watched : gpu_image_ranges) {
@@ -245,7 +339,8 @@ void MemoryManager::ApplyGpuImageProtection(std::span<const GpuImageProtectedRan
         all.push_back(range);
         if (watched.dirty) {
             unreadable.push_back(range);
-            impl.Protect(watched.range.address, watched.range.size, MemoryPermission::None);
+            if (!unchanged(watched))
+                impl.Protect(watched.range.address, watched.range.size, MemoryPermission::None);
         }
     }
     if (!release)
@@ -253,6 +348,9 @@ void MemoryManager::ApplyGpuImageProtection(std::span<const GpuImageProtectedRan
             all.emplace_back(range.address, range.address + range.size);
             unreadable.emplace_back(range.address, range.address + range.size);
         }
+    if (!release)
+        for (const auto& range : gpu_read_ranges)
+            all.emplace_back(range.address, range.address + range.size);
     std::ranges::sort(all);
     std::ranges::sort(unreadable);
     const auto protect_uncovered = [&](const GpuProtectedRange& range,
@@ -273,9 +371,13 @@ void MemoryManager::ApplyGpuImageProtection(std::span<const GpuImageProtectedRan
             impl.Protect(cursor, end - cursor, permission);
     };
     for (const auto& watched : gpu_image_ranges)
-        if (!watched.dirty)
+        if (!watched.dirty && !unchanged(watched))
             protect_uncovered(watched.range, unreadable,
                               watched.range.permissions & ~MemoryPermission::Write);
+    if (!release)
+        for (const auto& range : gpu_read_ranges)
+            if (!unchanged({range, false}))
+                protect_uncovered(range, unreadable, range.permissions & ~MemoryPermission::Write);
     for (const auto& watched : previous)
         protect_uncovered(watched.range, all, watched.range.permissions);
     if (release)
@@ -305,18 +407,21 @@ void MemoryManager::DetachGpuAccess() {
 
 bool MemoryManager::HandleGpuAccessFault(void* context, VAddr address) {
     std::unique_lock lock{gpu_access_mutex};
-    if (!gpu_access_epoch || (async_gpu_ranges.empty() &&
+    if (!gpu_access_epoch || (async_gpu_ranges.empty() && async_gpu_read_ranges.empty() &&
                               gpu_access_owner == std::this_thread::get_id()))
         return false;
     const auto owned = [&] {
-        const auto it = std::ranges::upper_bound(gpu_protected_ranges, address, {},
-                                                 &GpuProtectedRange::address);
-        if (it == gpu_protected_ranges.begin())
-            return false;
-        const auto& range = *std::prev(it);
-        return address - range.address < range.size;
+        const auto contains = [&](const auto& ranges) {
+            const auto it =
+                std::ranges::upper_bound(ranges, address, {}, &GpuProtectedRange::address);
+            if (it == ranges.begin())
+                return false;
+            const auto& range = *std::prev(it);
+            return address - range.address < range.size;
+        };
+        return contains(gpu_protected_ranges) || contains(gpu_read_ranges);
     };
-    if (owned() && !async_gpu_ranges.empty() && rasterizer) {
+    if (owned() && (!async_gpu_ranges.empty() || !async_gpu_read_ranges.empty()) && rasterizer) {
         const bool write = Common::IsWriteError(context);
         lock.unlock();
         const auto access = rasterizer->AcquireCpuAccess(Common::AlignDown(address, u64{4096}),

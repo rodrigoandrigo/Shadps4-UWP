@@ -60,7 +60,7 @@ struct PreparedShader {
 };
 class ShaderCache {
 public:
-    enum class RectangleMode { Fill, Wireframe, Points };
+    enum class RectangleMode { Fill, Wireframe, Points, QuadFill, QuadStripFill };
     struct StageOutput {
         std::string semantic;
         u32 index, components;
@@ -148,7 +148,8 @@ public:
 
 private:
     std::unique_ptr<TranslatedShader> TranslateUncached(Shader::ShaderParams params,
-                                                        Shader::RuntimeInfo runtime);
+                                                        Shader::RuntimeInfo runtime,
+                                                        bool retain_variant = true);
     Shader::Profile GuestShaderProfile() const;
     std::vector<std::shared_ptr<ShaderVariant>> variants;
     size_t variant_bytes{};

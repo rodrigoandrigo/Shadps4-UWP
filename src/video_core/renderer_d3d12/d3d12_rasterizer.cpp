@@ -16,6 +16,7 @@
 #include "core/memory.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
+#include "shader_recompiler/frontend/opcodes.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_d3d12/adjacency_restart.h"
 #include "video_core/renderer_d3d12/blend_constant_policy.h"
@@ -432,11 +433,47 @@ void SynchronizeFetchInputs(Core::MemoryManager& memory, CommandRuntime& runtime
             throw std::runtime_error("Invalid D3D12 fetch shader code address");
         constexpr u32 MaxFetchWords = 4096;
         const auto words = MappedIndexCount(memory, address, MaxFetchWords, sizeof(u32));
-        const auto code_access =
-            words ? runtime.AcquireCpuAccess(address, u64(words) * sizeof(u32), false) : nullptr;
+        struct FetchExtent {
+            VAddr address{};
+            u32 words{};
+        };
+        static thread_local std::array<FetchExtent, 64> extents;
+        auto& extent = extents[(address / sizeof(u32)) % extents.size()];
         FetchShaderData fetch;
-        if (!ParseFetchShader(info, fetch, words ? words : MaxFetchWords))
-            throw std::runtime_error("D3D12 fetch shader exceeds its mapped code range");
+        bool parsed{};
+        if (extent.address == address && extent.words && extent.words <= words) {
+            const auto access =
+                runtime.AcquireCpuAccess(address, u64(extent.words) * sizeof(u32), false);
+            parsed = ParseFetchShader(info, fetch, extent.words);
+        }
+        if (!parsed) {
+            const auto* fetch_code = reinterpret_cast<const u32*>(address);
+            u32 code_words{};
+            bool terminated{};
+            while (code_words < words) {
+                const auto access = runtime.AcquireCpuAccess(
+                    address + u64(code_words) * sizeof(u32), sizeof(u32), false);
+                u32 token{};
+                std::memcpy(&token, fetch_code + code_words, sizeof(token));
+                const auto encoding = GetInstructionEncoding(token);
+                const u32 instruction_words =
+                    encoding == InstEncoding::MUBUF || encoding == InstEncoding::MTBUF ? 2 : 1;
+                if (instruction_words > words - code_words)
+                    break;
+                code_words += instruction_words;
+                if (encoding == InstEncoding::SOP1) {
+                    terminated = OpcodeSOP1((token >> 8) & 0xff) == OpcodeSOP1::S_SETPC_B64;
+                    break;
+                }
+            }
+            if (!terminated)
+                throw std::runtime_error("D3D12 fetch shader exceeds its mapped code range");
+            const auto code_access =
+                runtime.AcquireCpuAccess(address, u64(code_words) * sizeof(u32), false);
+            if (!ParseFetchShader(info, fetch, code_words))
+                throw std::runtime_error("D3D12 fetch shader exceeds its mapped code range");
+        }
+        extent = {address, fetch.size / u32(sizeof(u32))};
         for (const auto& attribute : fetch.attributes) {
             const auto descriptor = attribute.DescriptorAddress(info);
             if (descriptor)
@@ -661,11 +698,11 @@ void Rasterizer::InitializeRuntime(CommandRuntime& target) {
     if (!recovery_enabled)
         target.EnableAsync(
             [this](VAddr address, u64 size) { return ResolveBacking(memory, address, size); },
-            [this](std::span<const ResourceCache::Range> ranges) {
-                std::vector<std::pair<VAddr, u64>> access;
+            [this](std::span<const ImageCache::Watch> ranges) {
+                std::vector<Core::MemoryManager::GpuImageWatch> access;
                 access.reserve(ranges.size());
                 for (const auto& range : ranges)
-                    access.emplace_back(range.address, range.size);
+                    access.push_back({range.address, range.size, range.dirty});
                 return memory.AcquireAsyncGpuAccess(access);
             });
     target.SetExternalMemory(external_memory, trim_external_memory);
@@ -1251,19 +1288,6 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
                 blend.separate_alpha_blend ? blend.alpha_dst_factor : blend.color_dst_factor);
             target.BlendOpAlpha =
                 BlendOperation(blend.separate_alpha_blend ? blend.alpha_func : blend.color_func);
-            // GCN defaults a masked pixel-shader alpha export to 1 for RGB blending.
-            // D3D12 uses the shader's SRC_ALPHA input directly, so emulate that value here.
-            if (target.BlendEnable &&
-                (regs.color_shader_mask.GetMask(i) & AmdGpu::ColorBufferMask::ComponentA) == 0) {
-                const auto normalize_masked_alpha = [](D3D12_BLEND& factor) {
-                    if (factor == D3D12_BLEND_SRC_ALPHA)
-                        factor = D3D12_BLEND_ONE;
-                    else if (factor == D3D12_BLEND_INV_SRC_ALPHA)
-                        factor = D3D12_BLEND_ZERO;
-                };
-                normalize_masked_alpha(target.SrcBlend);
-                normalize_masked_alpha(target.DestBlend);
-            }
             NormalizeMinMaxBlend(target.BlendOp, target.SrcBlend, target.DestBlend,
                                  color.GetNumberFmt());
             NormalizeMinMaxBlend(target.BlendOpAlpha, target.SrcBlendAlpha, target.DestBlendAlpha,
@@ -1991,6 +2015,17 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
     const bool wire_expand_conv = !face_passes && !has_geometry && !tessellation && line_expand &&
                                   !draw.flat_last && !line_primitive &&
                                   polygon_mode == AmdGpu::PolygonMode::Line;
+    draw.quad_expansion = !has_geometry && !tessellation && !face_passes && !point_face &&
+                          !point_cpu && !contour && !line_expand && !draw.flat_last &&
+                          !draw.viewport_transform && !strmout_buffer_mask && !depth_gated &&
+                          !wants_flat_last && polygon_mode == AmdGpu::PolygonMode::Fill &&
+                          (regs.primitive_type == AmdGpu::PrimitiveType::QuadList ||
+                           regs.primitive_type == AmdGpu::PrimitiveType::QuadStrip);
+    draw.quad_strip = regs.primitive_type == AmdGpu::PrimitiveType::QuadStrip;
+    if (draw.quad_expansion) {
+        draw.topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ;
+        draw.topology_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+    }
     const bool convert = regs.primitive_type == AmdGpu::PrimitiveType::LineLoop ||
                          regs.primitive_type == AmdGpu::PrimitiveType::TriangleFan ||
                          regs.primitive_type == AmdGpu::PrimitiveType::Polygon ||
@@ -2014,7 +2049,7 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
     }
     if (convert && gpu_conversion && !indirect && !regs.enable_primitive_restart && !has_geometry &&
         !tessellation && !face_passes && !depth_gated && !point_face && !point_cpu && !contour &&
-        !wire_expand_conv && !line_expand && !strmout_buffer_mask) {
+        !wire_expand_conv && !line_expand && !strmout_buffer_mask && !draw.quad_expansion) {
         u32 mode{}, output{};
         using P = AmdGpu::PrimitiveType;
         switch (regs.primitive_type) {
@@ -2135,7 +2170,25 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
             draw.face_masks = ConvertPolygonFaceMasks(regs.primitive_type, indices, restart);
         if (draw.flat_last && !has_geometry && !tessellation)
             draw.flat_vertices = ConvertPolygonFlatVertices(regs.primitive_type, indices, restart);
-        if (preserve_adjacency_list_restart) {
+        if (draw.quad_expansion) {
+            const auto append_segment = [&](size_t first, size_t last) {
+                const size_t step = draw.quad_strip ? 2 : 4;
+                for (size_t i = first; i + 3 < last; i += step) {
+                    if (draw.converted_indices.size() > 4 * 1024 * 1024 - 4)
+                        throw std::runtime_error("Converted D3D12 quads exceed upload budget");
+                    draw.converted_indices.insert(
+                        draw.converted_indices.end(),
+                        {indices[i], indices[i + 1], indices[i + 2], indices[i + 3]});
+                }
+            };
+            size_t first{};
+            for (size_t i = 0; i < indices.size(); ++i)
+                if (restart && indices[i] == *restart) {
+                    append_segment(first, i);
+                    first = i + 1;
+                }
+            append_segment(first, indices.size());
+        } else if (preserve_adjacency_list_restart) {
             const u32 group_size =
                 regs.primitive_type == AmdGpu::PrimitiveType::AdjLineList ? 4 : 6;
             draw.converted_indices = KeepCompleteAdjacencyGroups(indices, restart, group_size);
@@ -2157,7 +2210,7 @@ void Rasterizer::DrawImpl(bool indexed, u32 index_offset, std::optional<Indirect
             draw.topology_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
         else if (contour)
             draw.topology_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
-        if (!preserve_adjacency_list_restart) {
+        if (!preserve_adjacency_list_restart && !draw.quad_expansion) {
             if (draw.topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE)
                 draw.topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST;
             else if (draw.topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE)
@@ -2484,6 +2537,12 @@ std::shared_ptr<void> Rasterizer::AcquireCpuAccess(VAddr address, u64 size, bool
     auto guard = std::make_shared<RuntimeAccess>(runtime_mutex);
     Core::MemoryManager::GuestCopyScope scope{&memory};
     guard->access = runtime->AcquireCpuAccess(address, size, write);
+    return guard;
+}
+std::shared_ptr<void> Rasterizer::AcquireCpuBackingAccess(VAddr address, u64 size, bool write) {
+    auto guard = std::make_shared<RuntimeAccess>(runtime_mutex);
+    Core::MemoryManager::GuestCopyScope scope{&memory};
+    guard->access = runtime->AcquireCpuAccess(address, size, write, true);
     return guard;
 }
 std::shared_ptr<void> Rasterizer::AcquireMemoryMappingAccess() {

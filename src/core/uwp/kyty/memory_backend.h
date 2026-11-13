@@ -111,7 +111,8 @@ private:
     bool Promote(PhysicalPage& physical);
     HANDLE AcquireSection(uint64_t physical);
     void ReleaseSection(uint64_t physical);
-    void* MapScratch(HANDLE section);
+    void* SectionData(uint64_t physical);
+    uint64_t SectionOffset(uint64_t physical) const;
     bool AllocationFailed(const char* api, uint64_t address, HANDLE section);
     void PruneViews();
     bool MapAlias(VirtualPage& page);
@@ -138,6 +139,7 @@ private:
     void FreeSlot(uint32_t slot) override;
     bool Spill(uint64_t window, uint64_t address, uint64_t size, uint32_t& slot) override;
     bool Tight(uint64_t size) override;
+    bool RestoreRequiresMemory() const override;
 
     std::recursive_mutex mutex;
     std::shared_mutex copy_mutex;
@@ -148,15 +150,22 @@ private:
     Xbox::PagerStore store;
     std::vector<PhysicalPage> physical_pages;
     std::vector<HANDLE> window_sections;
-    std::vector<HANDLE> free_sections;
-    HANDLE scratch_section{};
-    void* scratch_address{};
-    void* scratch_view{};
+    struct SectionPool {
+        HANDLE section{};
+        uint8_t* data{};
+        uint64_t used{};
+        uint64_t committed{};
+    };
+    static constexpr uint64_t PoolWindows = 64;
+    std::vector<SectionPool> section_pools;
+    std::vector<uint64_t> window_slots;
+    uint64_t pool_committed_bytes{};
+    uint64_t shared_resident_bytes{};
     uint64_t sections_created{};
     uint64_t sections_reused{};
     uint64_t sections_live{};
-    uint64_t scratch_maps{};
-    uint64_t scratch_reuses{};
+    uint64_t pool_maps{};
+    uint64_t pool_accesses{};
     uint64_t views_pruned{};
     uint64_t prune_hand{};
     uint64_t fault_retries{};

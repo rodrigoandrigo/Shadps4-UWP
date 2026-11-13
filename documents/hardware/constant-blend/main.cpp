@@ -65,6 +65,7 @@ int main() {
   auto *bytes = static_cast<uint8_t *>(memory);
   auto *vs = reinterpret_cast<uint32_t *>(bytes + 0x10000);
   auto *ps = reinterpret_cast<uint32_t *>(bytes + 0x11000);
+  auto *alpha_ps = reinterpret_cast<uint32_t *>(bytes + 0x12000);
   const uint32_t vertex[]{
       Vop2(26, 1, 129, 0), Vop2(27, 1, 130, 1), Vop2(27, 2, 130, 0),
       Vop1(6, 1, 257),     Vop1(6, 2, 258),     Vop2(8, 1, 244, 1),
@@ -77,14 +78,16 @@ int main() {
                             0x03020100,      0xbf810000};
   std::memcpy(vs, vertex, sizeof(vertex));
   std::memcpy(ps, fragment, sizeof(fragment));
-  for (auto shader : {vs, ps}) {
+  std::memcpy(alpha_ps, fragment, sizeof(fragment));
+  alpha_ps[7] = std::bit_cast<uint32_t>(.25f);
+  for (auto shader : {vs, ps, alpha_ps}) {
     const bool is_vs = shader == vs;
     const BinaryInfo metadata{
         {'O', 'r', 'b', 'S', 'h', 'd', 'r'},
         1,
         uint32_t(is_vs ? sizeof(vertex) : sizeof(fragment)) << 8,
         0,
-        is_vs ? 1u : 2u,
+        is_vs ? 1u : shader == ps ? 2u : 3u,
         0};
     std::memcpy(reinterpret_cast<uint8_t *>(shader) + 0x800, &metadata,
                 sizeof(metadata));
@@ -96,11 +99,13 @@ int main() {
   const std::array<Format, 1> formats{{{10, 0, 4, 8, {128, 64, 191, 255}}}};
   bool all_match = true;
   for (const auto &format : formats)
-    for (uint32_t operation = 0; operation < 20; ++operation) {
+    for (uint32_t operation = 0; operation < 22; ++operation) {
       const uint32_t rop = 0xcc;
       const uint32_t mode = operation / 5, op = operation % 5;
-      const uint32_t mask = 15;
-      const uint32_t instances = 1;
+      const bool source_alpha = operation >= 20;
+      const uint32_t shader_mask = operation == 21 ? 7 : 15;
+      const uint32_t mask = source_alpha ? 7 : 15;
+      const uint32_t instances = source_alpha ? 16 : 1;
       auto *pixels = bytes + 0x40000;
       std::memset(pixels, 0x35, 64 * 16 * format.bytes);
       auto *fence = reinterpret_cast<volatile uint32_t *>(bytes + 0x30000);
@@ -111,7 +116,7 @@ int main() {
       if (initialized <= 0 || initialized > 0x1000)
         return 3;
       Commands commands{words, words + initialized};
-      for (auto shader : {vs, ps}) {
+      for (auto shader : {vs, source_alpha ? alpha_ps : ps}) {
         const uint32_t base = shader == vs ? 0x2c48 : 0x2c08;
         const auto address = uintptr_t(shader);
         commands.Shader(base, uint32_t(address >> 8));
@@ -127,11 +132,11 @@ int main() {
                        (format.data << 2) | (format.number << 8) | (1 << 15));
       commands.Context(0xa31d, 8);
       commands.Context(0xa08e, mask);
-      commands.Context(0xa08f, 15);
+      commands.Context(0xa08f, shader_mask);
       commands.Context(0xa202, (rop << 16) | (1 << 4));
-      const uint32_t sf = mode == 0 ? 13 : mode == 1 ? 14 : mode == 2 ? 19 : 20;
-      const uint32_t df = mode < 2 ? 19 : mode == 2 ? 13 : 14;
-      commands.Context(0xa1e0, sf | (op << 5) | (df << 8) | (4 << 16) |
+      const uint32_t sf = source_alpha ? 4 : mode == 0 ? 13 : mode == 1 ? 14 : mode == 2 ? 19 : 20;
+      const uint32_t df = source_alpha ? 5 : mode < 2 ? 19 : mode == 2 ? 13 : 14;
+      commands.Context(0xa1e0, sf | ((source_alpha ? 0 : op) << 5) | (df << 8) | (4 << 16) |
                                    (5 << 24) | (1u << 29) | (1u << 30));
       const float constants[]{.25f, .5f, .75f, .375f};
       for (uint32_t c = 0; c < 4; ++c)
@@ -159,8 +164,9 @@ int main() {
         commands.Context(reg + 1, 16 | (16 << 16));
       }
       commands.Packet(0x79, {0x242, 4});
-      commands.Packet(0x2f, {instances});
-      commands.Packet(0x2d, {3, 2});
+      commands.Packet(0x2f, {1});
+      for (uint32_t repeat = 0; repeat < instances; ++repeat)
+        commands.Packet(0x2d, {3, 2});
       const auto completion = uintptr_t(fence);
       commands.Packet(0x47, {20u | (5u << 8), uint32_t(completion),
                              uint32_t(completion >> 32) | (1u << 29), 2, 0});
@@ -177,21 +183,23 @@ int main() {
       }
       const auto *center = pixels + (8 * 64 + 8) * 4;
       bool match = true;
-      const float source[]{.5f, .25f, .75f, 1.f};
-      std::printf("CONSTANT_BLEND mode=%u op=%u raw=", mode, op);
+      const float source[]{.5f, .25f, .75f, source_alpha ? .25f : 1.f};
+      std::printf("CONSTANT_BLEND mode=%u op=%u shader_mask=%u raw=", mode, op, shader_mask);
       for (uint32_t c = 0; c < 4; ++c) {
-        float value = 1.f;
+        float value = source_alpha ? 0x35 / 255.f : 1.f;
         if (c < 3) {
           const float d = 0x35 / 255.f;
-          const float sf = mode == 0   ? constants[c]
+          const float sf = source_alpha ? source[3] : mode == 0   ? constants[c]
                            : mode == 1 ? 1 - constants[c]
                            : mode == 2 ? constants[3]
                                        : 1 - constants[3];
-          const float df = mode < 2    ? constants[3]
+          const float df = source_alpha ? 1.f - source[3] : mode < 2    ? constants[3]
                            : mode == 2 ? constants[c]
                                        : 1 - constants[c];
           const float left = source[c] * sf, right = d * df;
-          value = op == 0   ? left + right
+          value = source_alpha ? source[c] * (1.f - std::pow(df, float(instances))) +
+                                     d * std::pow(df, float(instances))
+                  : op == 0   ? left + right
                   : op == 1 ? left - right
                   : op == 2 ? std::min(source[c], d)
                   : op == 3 ? std::max(source[c], d)

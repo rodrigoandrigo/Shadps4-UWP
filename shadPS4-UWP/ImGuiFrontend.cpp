@@ -1441,13 +1441,12 @@ void ImGuiFrontend::Draw() {
             ImGui::MenuItem("Game list", nullptr, &show_game_list);
             ImGui::MenuItem("Game log", nullptr, &show_game_log);
             if (ImGui::MenuItem("Capture image diagnostics", nullptr, false,
-                                game_running &&
-                                    core->GraphicsBackend() == SHADPS4_GRAPHICS_VULKAN_DOZEN)) {
+                                game_running)) {
                 const auto result = request_presentation_capture();
                 status = result == 0 ? "Capture requested for a complete frame. Files in "
                                        "screenshots/presentation."
                          : result == 1 ? "A capture is already pending or in progress."
-                                       : "Capture requires an active Dozen session.";
+                                       : "Capture requires an active game session.";
             }
             ImGui::Separator();
             if (ImGui::MenuItem("List mode", nullptr, !grid_view))

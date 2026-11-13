@@ -124,6 +124,9 @@ public:
 	// A view becomes private memory with the same contents and protections (before an unmap cuts through the window and keeps a part of it).
 	virtual bool MakePrivate(uint64_t /*address*/, uint64_t /*size*/) { return false; }
 	virtual void FreeSlot(uint32_t /*slot*/) {}
+    virtual bool RestoreRequiresMemory() const {
+        return true;
+    }
     virtual bool PreferEviction(uint64_t) const {
         return true;
     }
@@ -345,10 +348,10 @@ public:
 		}
 		const uint64_t lo = std::max(r->start, w << kWindowBits), hi = std::min(r->end, (w + 1) << kWindowBits);
 		bool           committed = false;
-		if (host.Tight(hi - lo)) {
+		if (host.Tight(hi - lo) && (m_evicted.count(w) == 0 || host.RestoreRequiresMemory())) {
 			// close to the limit: one window out for the one that comes in, no more (a batch would throw out what the game just brought back, and the
 			// game would do nothing but page in; a failed commit makes room in a batch, below)
-			MakeRoom(2, host);
+			MakeRoom(1, host, false);
 		}
 		for (int attempt = 0; attempt < 2 && !committed; ++attempt) {
 			// the second attempt follows a failure (the process is at its limit of memory): some windows leave first
@@ -649,11 +652,11 @@ public:
 	// Evicts up to `count` windows on the spot, the coldest it finds (swept ones first in effect: they were not touched for a while; then the ones
 	// not touched since the last look; then any), so that the commit can be tried again. Under the caller's exclusive lock, which also holds off
 	// every thread that writes to a window while it is copied: that one waits for the lock at its fault. Returns how many windows left.
-	uint64_t MakeRoom(uint64_t count, HostOps& host) {
+	uint64_t MakeRoom(uint64_t count, HostOps& host, bool urgent = true) {
 		uint64_t done     = 0;
 		int      failures = 0; // in a row: when the host cannot spill (no store), trying 128 windows each time would only cost
 		bool     give_up  = false;
-		for (int pass = 0; pass < 2 && done < count && !give_up; ++pass) {
+		for (int pass = 0; pass < (urgent ? 2 : 1) && done < count && !give_up; ++pass) {
 			const uint64_t start   = m_room_hand;
 			uint64_t       from    = start;
 			bool           wrapped = false;
@@ -669,7 +672,7 @@ public:
 					if ((f & kFull) == 0 || (f & (kProt | kNoAccess | kEvicting)) != 0 || IsPinned(w)) {
 						return false;
 					}
-                    if (pass == 0 && !host.PreferEviction(w))
+                    if ((!urgent || pass == 0) && !host.PreferEviction(w))
                         return false;
                     if (pass == 0 && (f & (kSwept | kTouched)) == kTouched) {
                         m_flags.And(w, static_cast<uint8_t>(~kTouched)); // used lately: it gets its chance on the second pass
