@@ -100,7 +100,7 @@ public:
     void ConfigureResidency(bool enabled, std::function<void(VAddr, u64)> synchronize = {});
     std::vector<Watch> Watches() const;
     bool RequestDownloads(std::span<const Range> ranges, bool all = false);
-    void InvalidateCpu(std::span<const Range> ranges, bool all = false);
+    bool InvalidateCpu(std::span<const Range> ranges, bool all = false);
     bool CopyResident(VAddr address, u64 size, Buffer& destination, u64 offset,
                       ID3D12GraphicsCommandList* commands);
     void InvalidateMappings();

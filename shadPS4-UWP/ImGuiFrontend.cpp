@@ -6,12 +6,13 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
-#include <cstring>
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <imgui.h>
 #include <numeric>
+#include <imgui.h>
 #include <ppltasks.h>
 #include <roapi.h>
 #include <wincodec.h>
@@ -1319,6 +1320,61 @@ void ImGuiFrontend::SubmitInput(const FrontendInput& snapshot) {
     analog(ImGuiKey_GamepadR2, pad.RightTrigger);
 }
 
+namespace {
+void DrawToolbarIcon(ImDrawList* draw, const char* icon, ImVec2 origin, float scale, ImU32 color) {
+    const auto point = [&](float x, float y) {
+        return ImVec2{origin.x + x * scale, origin.y + y * scale};
+    };
+    const auto line = [&](float x1, float y1, float x2, float y2) {
+        draw->AddLine(point(x1, y1), point(x2, y2), color, 2 * scale);
+    };
+    if (std::strcmp(icon, "play_icon.png") == 0) {
+        draw->AddTriangleFilled(point(13, 7), point(13, 33), point(32, 20), color);
+    } else if (std::strcmp(icon, "pause_icon.png") == 0) {
+        draw->AddRectFilled(point(11, 8), point(17, 32), color, scale);
+        draw->AddRectFilled(point(23, 8), point(29, 32), color, scale);
+    } else if (std::strcmp(icon, "stop_icon.png") == 0) {
+        draw->AddRectFilled(point(9, 9), point(31, 31), color, 2 * scale);
+    } else if (std::strcmp(icon, "settings_icon.png") == 0) {
+        for (int index = 0; index < 32; ++index) {
+            const float angle = index * 6.2831853f / 32;
+            const float radius = index % 4 == 1 || index % 4 == 2 ? 16.0f : 12.5f;
+            draw->PathLineTo(point(20 + std::cos(angle) * radius, 20 + std::sin(angle) * radius));
+        }
+        draw->PathStroke(color, ImDrawFlags_Closed, 2 * scale);
+        draw->AddCircle(point(20, 20), 5 * scale, color, 20, 2 * scale);
+    } else if (std::strcmp(icon, "fullscreen_icon.png") == 0) {
+        for (int side = 0; side < 2; ++side) {
+            const float x = side ? 33.0f : 7.0f;
+            const float dx = side ? -9.0f : 9.0f;
+            line(x, 7, x + dx, 7);
+            line(x, 7, x, 16);
+            line(x, 33, x + dx, 33);
+            line(x, 33, x, 24);
+        }
+    } else if (std::strcmp(icon, "controller_icon.png") == 0) {
+        draw->AddRect(point(4, 10), point(36, 30), color, 7 * scale, 0, 2 * scale);
+        line(9, 20, 19, 20);
+        line(14, 15, 14, 25);
+        draw->AddCircleFilled(point(27, 17), 2 * scale, color);
+        draw->AddCircleFilled(point(31, 23), 2 * scale, color);
+    } else if (std::strcmp(icon, "keyboard_icon.png") == 0) {
+        draw->AddRect(point(3, 9), point(37, 31), color, 2 * scale, 0, 2 * scale);
+        for (int row = 0; row < 2; ++row)
+            for (int column = 0; column < 5; ++column)
+                draw->AddRectFilled(point(7 + column * 6, 13 + row * 6),
+                                    point(10 + column * 6, 16 + row * 6), color);
+        line(12, 27, 28, 27);
+    } else {
+        draw->PathArcTo(point(20, 20), 13 * scale, 0.6f, 5.7f, 28);
+        draw->PathStroke(color, 0, 2.5f * scale);
+        draw->AddTriangleFilled(point(27, 7), point(35, 8), point(33, 16), color);
+        if (std::strcmp(icon, "refreshlist_icon.png") == 0)
+            draw->AddTriangleFilled(point(7, 24), point(5, 32), point(13, 33), color);
+    }
+}
+} // namespace
+
 bool ImGuiFrontend::ToolbarButton(const char* label, const char* icon, bool enabled) {
     const float scale = ImGui::GetIO().FontGlobalScale;
     ImGui::PushID(label);
@@ -1326,17 +1382,9 @@ bool ImGuiFrontend::ToolbarButton(const char* label, const char* icon, bool enab
     const auto position = ImGui::GetCursorScreenPos();
     const float width = std::max(72.0f * scale, ImGui::CalcTextSize(label).x + 16 * scale);
     const bool pressed = ImGui::Button("##tool", {width, 76 * scale});
-    const auto key = std::string{"launcher:"} + icon;
-    const auto texture = renderer->Image(key);
     auto* draw = ImGui::GetWindowDrawList();
-    if (texture) {
-        const float left = position.x + (width - 40 * scale) / 2;
-        draw->AddImage(reinterpret_cast<ImTextureID>(texture), {left, position.y + 6 * scale},
-                       {left + 40 * scale, position.y + 46 * scale}, {0, 0}, {1, 1},
-                       ImGui::GetColorU32(ImGuiCol_Text));
-    } else {
-        RequestImage(key, icon);
-    }
+    DrawToolbarIcon(draw, icon, {position.x + (width - 40 * scale) / 2, position.y + 6 * scale},
+                    scale, ImGui::GetColorU32(ImGuiCol_Text));
     const auto size = ImGui::CalcTextSize(label);
     draw->AddText({position.x + (width - size.x) / 2, position.y + 54 * scale},
                   ImGui::GetColorU32(ImGuiCol_Text), label);

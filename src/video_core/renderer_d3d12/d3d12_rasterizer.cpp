@@ -2497,7 +2497,7 @@ void Rasterizer::MapMemory(VAddr address, u64 size) {
 u64 Rasterizer::Flush() {
     Core::MemoryManager::GuestCopyScope scope{&memory};
     u64 ticket{};
-    Execute([&] { ProfileSample(profile, "flush", 64, [&] { ticket = runtime->Flush(); }); });
+    Execute([&] { ProfileSample(profile, "flush", 64, [&] { ticket = runtime->Flush(false); }); });
     return ticket;
 }
 bool Rasterizer::OcclusionCounter(u64& value, bool reset) {
@@ -2505,7 +2505,8 @@ bool Rasterizer::OcclusionCounter(u64& value, bool reset) {
     return true;
 }
 void Rasterizer::Finish() {
-    static_cast<void>(Flush());
+    Core::MemoryManager::GuestCopyScope scope{&memory};
+    Execute([&] { runtime->Flush(); });
 }
 void Rasterizer::CpSync() {
     Finish();

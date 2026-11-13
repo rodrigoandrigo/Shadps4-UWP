@@ -14,7 +14,8 @@ Profile runtime_profile;
 u64 CommandRuntime::LocalMemoryBytes() const {
     u64 bytes = resources.MemoryBytes() + inputs.MemoryBytes() + images.MemoryBytes() +
                 shaders.MemoryBytes() + gpu_commands.MemoryBytes() + pipeline_bytes +
-                pipelines.size() * 65536 + pending_feedback_snapshot_bytes;
+                pipelines.size() * 65536 + pending_feedback_snapshot_bytes +
+                published_watches.capacity() * sizeof(ImageCache::Watch);
     if (transfer_pool)
         bytes += transfer_pool->ResourceStatistics().live_bytes;
     return bytes;

@@ -76,7 +76,7 @@ public:
     void ConfigureResidency(bool enabled, std::function<void(VAddr, u64)> synchronize = {});
     std::vector<Watch> Watches() const;
     bool RequestDownloads(std::span<const ResourceCache::Range> ranges, bool all);
-    void InvalidateCpu(std::span<const ResourceCache::Range> ranges, bool all = false);
+    bool InvalidateCpu(std::span<const ResourceCache::Range> ranges, bool all = false);
     bool HasDirtyImages() const;
     const Statistics& ResidencyStatistics() const {
         return statistics;

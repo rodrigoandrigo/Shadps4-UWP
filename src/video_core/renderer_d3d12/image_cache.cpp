@@ -309,7 +309,8 @@ bool ImageCache::RequestDownloads(std::span<const ResourceCache::Range> ranges, 
     }
     return found;
 }
-void ImageCache::InvalidateCpu(std::span<const ResourceCache::Range> ranges, bool all) {
+bool ImageCache::InvalidateCpu(std::span<const ResourceCache::Range> ranges, bool all) {
+    bool changed{};
     for (auto& [key, image] : images) {
         if (!(all || std::ranges::any_of(ranges, [&](const auto& range) {
                   return Overlaps(*image, range.address, range.size);
@@ -317,12 +318,15 @@ void ImageCache::InvalidateCpu(std::span<const ResourceCache::Range> ranges, boo
             continue;
         if (image->written || image->stencil_written)
             throw std::runtime_error("CPU invalidation requires GPU image writeback first");
+        changed |= image->resident || !image->cpu_dirty || !image->guest.empty() ||
+                   !image->stencil_guest.empty();
         image->cpu_dirty = true;
         image->resident = false;
         image->guest.clear();
         image->stencil_guest.clear();
         ++statistics.cpu_invalidations;
     }
+    return changed;
 }
 u64 ImageCache::MemoryBytes() const {
     u64 bytes = native_bytes + transfers.MemoryBytes();

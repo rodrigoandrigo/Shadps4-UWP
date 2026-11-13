@@ -81,12 +81,14 @@ bool ResourceCache::RequestDownloads(std::span<const Range> ranges, bool all) {
         }
     return requested;
 }
-void ResourceCache::InvalidateCpu(std::span<const Range> ranges, bool all) {
+bool ResourceCache::InvalidateCpu(std::span<const Range> ranges, bool all) {
     if (!persistent)
-        return;
+        return false;
+    bool changed{};
     for (auto& [key, buffer] : buffers) {
         if (buffer->host || !buffer->resident)
             continue;
+        const auto previous_size = buffer->dirty.size();
         for (const auto& source : buffer->sources) {
             if (all) {
                 buffer->dirty.emplace_back(source.offset, source.size);
@@ -122,6 +124,9 @@ void ResourceCache::InvalidateCpu(std::span<const Range> ranges, bool all) {
                 }
             }
         }
+        if (buffer->dirty.size() == previous_size)
+            continue;
+        changed = true;
         std::ranges::sort(buffer->dirty);
         std::vector<std::pair<u64, u64>> merged;
         for (const auto& [offset, size] : buffer->dirty) {
@@ -134,6 +139,7 @@ void ResourceCache::InvalidateCpu(std::span<const Range> ranges, bool all) {
         }
         buffer->dirty = std::move(merged);
     }
+    return changed;
 }
 bool ResourceCache::CopyResident(VAddr address, u64 size, Buffer& destination, u64 offset,
                                  ID3D12GraphicsCommandList* commands) {

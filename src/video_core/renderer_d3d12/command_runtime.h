@@ -177,7 +177,7 @@ public:
                           bool copy_depth, bool copy_stencil);
     void MaterializeColorClear(const AmdGpu::ColorBuffer& buffer, const VideoCore::ImageInfo& info);
     std::shared_ptr<VideoCore::ResidentFrame> CapturePresentation(const VideoCore::ImageInfo& info);
-    u64 Flush();
+    u64 Flush(bool writeback = true);
     ResourceCache& Resources() {
         return resources;
     }
@@ -261,6 +261,8 @@ private:
     std::vector<ImageCache::Watch> ResourceWatches() const;
     bool buffer_commands_open{};
     void UpdateImageWatches();
+    std::vector<ImageCache::Watch> published_watches;
+    bool watches_published{};
     void SynchronizeImages(std::span<const ResourceCache::Range> ranges, bool invalidate,
                            bool all = false);
     void CompleteImages(std::span<const ResourceCache::Range> cpu_ranges = {});

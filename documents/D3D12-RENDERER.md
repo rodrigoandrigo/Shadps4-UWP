@@ -1,5 +1,13 @@
 # Renderer D3D12: estado de implementação
 
+## Native CPU overhead and submission fixes - 2026-11-12
+
+Read-only CPU access that finds no GPU writeback no longer republishes the complete resource-watch set. Buffer and image invalidation report whether tracked state actually changed; unchanged invalidations avoid protection updates. Published watch sets are sorted, deduplicated, and compared before notifying memory management. Mapping invalidation explicitly republishes the remaining watches before remapping, and callback replacement resets the snapshot. Retained watch metadata is included in the aggregate memory budget.
+
+Normal rasterizer `Flush` drains submitted contexts and their leases without requesting a global buffer/image readback or an extra idle signal. `Finish`, `CpSync`, recovery checkpoints, and destruction retain full synchronization; CPU accesses continue to resolve dirty overlapping resources. No guest commands or draws are skipped. Profiling remains opt-in through `GAME_PROFILE`, with CPU-access and watch-update scopes.
+
+PC Pac-Man throughput increased from 17 to 75 frames in a fixed 60-second run with the same input schedule. This is a frame-count comparison, not an equivalent-scene FPS benchmark; time to the first frame did not improve measurably. Chronicles of Teddy did not present a frame with either the prior or updated DLL, blocking validation of that title. PC measurements and limitations are recorded in `Build/native-performance`. Xbox performance, long gameplay, and rendering fidelity require separate validation; this work does not establish Vulkan performance parity.
+
 ## Reference integration — 2026-11-12
 
 Integrated the production renderer changes from `Shadps4-UWP-D3d12`, together with the required fetch-descriptor, sampler-register, index-prefix, MSAA-transfer, and device-context dependencies from `Shadps4-UWP-UWP`. This includes stricter capability and guest-ISA gates, indirect draw-index forwarding, attachment/view validation, manual sampling and stencil policies, and controlled presentation/device-loss handling. SM6.4 remains supported where the device provides the required operations; wave64-dependent paths are checked rather than assumed. These changes do not establish complete emulation or Xbox validation.

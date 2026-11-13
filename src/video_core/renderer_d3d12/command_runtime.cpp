@@ -303,13 +303,15 @@ u32 CommandRuntime::StrmoutFilledSize() {
     }
     return strmout_filled;
 }
-u64 CommandRuntime::Flush() {
+u64 CommandRuntime::Flush(bool writeback) {
     auto lock = ProfileSample(runtime_profile, "runtime_lock", 512,
                               [&] { return std::unique_lock{mutex}; });
     if (failed)
         throw std::runtime_error(
             "D3D12 command runtime requires recreation after recording failure");
     DrainContexts();
+    if (!writeback)
+        return device.LastSignaledValue();
     for (auto& context : contexts)
         if (!context->failed)
             context->Flush();
@@ -436,6 +438,8 @@ void CommandRuntime::SetImageResidency(ImageWatches callback) {
         const ResourceCache::Range range{address, size};
         SynchronizeBuffers({&range, 1}, true);
     });
+    watches_published = false;
+    published_watches.clear();
     image_watches = std::move(callback);
     BeginImages();
     UpdateImageWatches();
@@ -450,7 +454,9 @@ std::vector<ImageCache::Watch> CommandRuntime::ResourceWatches() const {
 }
 void CommandRuntime::SynchronizeBuffers(std::span<const ResourceCache::Range> ranges,
                                         bool invalidate, bool all) {
+    bool changed{};
     if (resources.RequestDownloads(ranges, all)) {
+        changed = true;
         if (buffer_commands_open)
             throw std::runtime_error("D3D12 buffer ownership must be resolved before recording");
         struct Scope {
@@ -476,23 +482,37 @@ void CommandRuntime::SynchronizeBuffers(std::span<const ResourceCache::Range> ra
         recording.completed = true;
     }
     if (invalidate) {
-        resources.InvalidateCpu(ranges, all);
-        inputs.InvalidateCpu(ranges, all);
+        changed |= resources.InvalidateCpu(ranges, all);
+        changed |= inputs.InvalidateCpu(ranges, all);
     }
-    UpdateImageWatches();
+    if (changed)
+        UpdateImageWatches();
 }
 void CommandRuntime::UpdateImageWatches() {
-    if (!contexts.empty() && image_watches) {
-        auto watches = ResourceWatches();
-        for (auto& context : contexts) {
-            auto next = context->ResourceWatches();
-            watches.insert(watches.end(), next.begin(), next.end());
-        }
-        image_watches(watches);
+    if (!image_watches)
         return;
+    ProfileScope timing{runtime_profile, "watch_update", 128};
+    auto watches = ResourceWatches();
+    for (auto& context : contexts) {
+        auto next = context->ResourceWatches();
+        watches.insert(watches.end(), next.begin(), next.end());
     }
-    if (image_watches)
-        image_watches(ResourceWatches());
+    std::ranges::sort(watches, [](const auto& a, const auto& b) {
+        if (a.address != b.address)
+            return a.address < b.address;
+        if (a.size != b.size)
+            return a.size < b.size;
+        return a.dirty < b.dirty;
+    });
+    const auto same = [](const auto& a, const auto& b) {
+        return a.address == b.address && a.size == b.size && a.dirty == b.dirty;
+    };
+    watches.erase(std::unique(watches.begin(), watches.end(), same), watches.end());
+    if (watches_published && std::ranges::equal(watches, published_watches, same))
+        return;
+    image_watches(watches);
+    published_watches = std::move(watches);
+    watches_published = true;
 }
 void CommandRuntime::BeginImages() {
     const bool enabled = bool(image_watches) && image_mapping_count.load() == 0;
@@ -515,7 +535,9 @@ void CommandRuntime::SynchronizeImages(std::span<const ResourceCache::Range> ran
                                        bool invalidate, bool all) {
     if (synchronizing_images)
         throw std::runtime_error("Recursive D3D12 image synchronization");
+    bool changed{};
     if (images.RequestDownloads(ranges, all)) {
+        changed = true;
         struct Scope {
             bool& value;
             ~Scope() {
@@ -541,10 +563,12 @@ void CommandRuntime::SynchronizeImages(std::span<const ResourceCache::Range> ran
         recording.completed = true;
     }
     if (invalidate)
-        images.InvalidateCpu(ranges, all);
-    UpdateImageWatches();
+        changed |= images.InvalidateCpu(ranges, all);
+    if (changed)
+        UpdateImageWatches();
 }
 std::shared_ptr<void> CommandRuntime::AcquireCpuAccess(VAddr address, u64 size, bool write) {
+    ProfileScope timing{runtime_profile, "cpu_access", 128};
     std::unique_lock parent_lock{mutex};
     const ResourceCache::Range requested{address, size};
     DrainContexts({&requested, 1}, false);
@@ -589,6 +613,7 @@ std::shared_ptr<void> CommandRuntime::AcquireMemoryMappingAccess() {
     SynchronizeBuffers({}, true, true);
     resources.InvalidateMappings();
     inputs.InvalidateMappings();
+    UpdateImageWatches();
     return std::make_shared<ImageMappingAccess>(*this);
 }
 void CommandRuntime::CompleteImages(std::span<const ResourceCache::Range> cpu_ranges) {
