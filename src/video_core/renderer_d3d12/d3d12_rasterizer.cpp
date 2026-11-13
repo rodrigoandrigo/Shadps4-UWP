@@ -782,9 +782,11 @@ Rasterizer::~Rasterizer() {
 }
 std::shared_ptr<VideoCore::ResidentFrame> Rasterizer::CapturePresentation(
     const VideoCore::ImageInfo& info) {
-    Core::MemoryManager::GuestCopyScope scope{&memory};
     std::shared_ptr<VideoCore::ResidentFrame> result;
-    Execute([&] { result = runtime->CapturePresentation(info); });
+    Execute([&] {
+        Core::MemoryManager::GuestCopyScope scope{&memory};
+        result = runtime->CapturePresentation(info);
+    });
     return result;
 }
 void Rasterizer::Read(VAddr address, std::span<u8> data) {
@@ -2479,14 +2481,14 @@ struct RuntimeAccess {
 };
 } // namespace
 std::shared_ptr<void> Rasterizer::AcquireCpuAccess(VAddr address, u64 size, bool write) {
-    Core::MemoryManager::GuestCopyScope scope{&memory};
     auto guard = std::make_shared<RuntimeAccess>(runtime_mutex);
+    Core::MemoryManager::GuestCopyScope scope{&memory};
     guard->access = runtime->AcquireCpuAccess(address, size, write);
     return guard;
 }
 std::shared_ptr<void> Rasterizer::AcquireMemoryMappingAccess() {
-    Core::MemoryManager::GuestCopyScope scope{&memory};
     auto guard = std::make_shared<RuntimeAccess>(runtime_mutex);
+    Core::MemoryManager::GuestCopyScope scope{&memory};
     guard->access = runtime->AcquireMemoryMappingAccess();
     return guard;
 }
@@ -2495,9 +2497,11 @@ void Rasterizer::MapMemory(VAddr address, u64 size) {
     runtime->Resources().MapMemory(address, size);
 }
 u64 Rasterizer::Flush() {
-    Core::MemoryManager::GuestCopyScope scope{&memory};
     u64 ticket{};
-    Execute([&] { ProfileSample(profile, "flush", 64, [&] { ticket = runtime->Flush(false); }); });
+    Execute([&] {
+        Core::MemoryManager::GuestCopyScope scope{&memory};
+        ProfileSample(profile, "flush", 64, [&] { ticket = runtime->Flush(false); });
+    });
     return ticket;
 }
 bool Rasterizer::OcclusionCounter(u64& value, bool reset) {
@@ -2505,8 +2509,10 @@ bool Rasterizer::OcclusionCounter(u64& value, bool reset) {
     return true;
 }
 void Rasterizer::Finish() {
-    Core::MemoryManager::GuestCopyScope scope{&memory};
-    Execute([&] { runtime->Flush(); });
+    Execute([&] {
+        Core::MemoryManager::GuestCopyScope scope{&memory};
+        runtime->Flush();
+    });
 }
 void Rasterizer::CpSync() {
     Finish();

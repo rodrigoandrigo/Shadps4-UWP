@@ -264,7 +264,8 @@ void AddSemanticMember(std::string& source, std::string_view structure,
         throw std::runtime_error("Missing HLSL stage interface structure");
     source.insert(end, std::string(declaration) + "\n");
 }
-void AlignSemanticRows(std::string& source, std::string_view structure) {
+void AlignSemanticRows(std::string& source, std::string_view structure,
+                       bool position_required = false) {
     const auto begin = source.find("struct " + std::string(structure));
     if (begin == std::string::npos)
         return;
@@ -274,6 +275,7 @@ void AlignSemanticRows(std::string& source, std::string_view structure) {
         throw std::runtime_error("Invalid HLSL stage interface structure");
     std::map<u32, std::string> slots;
     std::vector<std::string> others;
+    std::string position;
     u32 span{};
     for (size_t start = brace + 1; start < end;) {
         const auto stop = source.find(";\n", start);
@@ -281,9 +283,14 @@ void AlignSemanticRows(std::string& source, std::string_view structure) {
             break;
         const auto member = source.substr(start, stop - start);
         const auto colon = member.rfind(" : ");
-        if (colon != std::string::npos &&
-            member.compare(colon + 3, std::char_traits<char>::length("TEXCOORD"), "TEXCOORD") ==
-                0) {
+        if (colon != std::string::npos && (member.substr(colon + 3) == "SV_Position" ||
+                                           member.substr(colon + 3) == "SV_POSITION")) {
+            if (!position.empty())
+                throw std::runtime_error("Duplicate HLSL position semantic");
+            position = member;
+        } else if (colon != std::string::npos &&
+                   member.compare(colon + 3, std::char_traits<char>::length("TEXCOORD"),
+                                  "TEXCOORD") == 0) {
             const auto digits =
                 member.substr(colon + 3 + std::char_traits<char>::length("TEXCOORD"));
             u32 index = 0;
@@ -305,9 +312,13 @@ void AlignSemanticRows(std::string& source, std::string_view structure) {
         }
         start = stop + 2;
     }
-    if (!span)
+    if (position_required && span && position.empty())
+        position = "    float4 shadInterfacePosition : SV_Position";
+    if (!span && position.empty())
         return;
     std::string body;
+    if (!position.empty())
+        body += position + ";\n";
     for (u32 index = 0; index < span; ++index) {
         if (const auto found = slots.find(index); found != slots.end()) {
             body += found->second + ";\n";
@@ -1895,6 +1906,10 @@ std::shared_ptr<const ShaderBinary> ShaderCache::CompileHelperHlsl(const std::st
     return result;
 }
 void ShaderCache::CompileHlsl(ShaderBinary& result, Shader::SwStage stage) {
+    if (stage == Shader::SwStage::Vertex)
+        AlignSemanticRows(result.hlsl, "SPIRV_Cross_Output");
+    else if (stage == Shader::SwStage::Fragment)
+        AlignSemanticRows(result.hlsl, "SPIRV_Cross_Input", true);
     if (stage == Shader::SwStage::Geometry)
         RemapGeometryPrimitiveInput(result.hlsl);
     std::vector<std::wstring> arguments;
