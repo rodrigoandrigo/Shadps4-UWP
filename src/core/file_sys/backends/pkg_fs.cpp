@@ -137,11 +137,26 @@ PkgBackend::PkgBackend(std::unique_ptr<IFile> source) {
             files.emplace(Normalize(path), node->size);
     }
     for (const auto& [id, path] :
-         {std::pair{0x1000U, "sce_sys/param.sfo"}, std::pair{0x1200U, "sce_sys/icon0.png"}}) {
+         {std::pair{0x402U, "sce_sys/nptitle.dat"}, std::pair{0x403U, "sce_sys/npbind.dat"},
+          std::pair{0x1000U, "sce_sys/param.sfo"}, std::pair{0x1001U, "sce_sys/playgo-chunk.dat"},
+          std::pair{0x1002U, "sce_sys/playgo-chunk.sha"},
+          std::pair{0x1003U, "sce_sys/playgo-manifest.xml"},
+          std::pair{0x1200U, "sce_sys/icon0.png"}}) {
         if (files.contains(path))
             continue;
         std::vector<u8> bytes;
         if (reader->ReadPkgEntry(id, bytes) >= 0) {
+            files.emplace(path, bytes.size());
+            metadata.emplace(path, std::move(bytes));
+        }
+    }
+    for (u32 index = 0; index < 128; ++index) {
+        const auto number = std::to_string(index);
+        const auto path = "sce_sys/trophy/trophy" + (index < 10 ? "0" + number : number) + ".trp";
+        if (files.contains(path))
+            continue;
+        std::vector<u8> bytes;
+        if (reader->ReadPkgEntry(0x1400U + index, bytes) >= 0) {
             files.emplace(path, bytes.size());
             metadata.emplace(path, std::move(bytes));
         }

@@ -301,6 +301,7 @@ class PfscSource : public DataSource {
 
 struct PkgImpl {
     PackageSource pkg;
+    std::vector<u8> entry_key3;
     std::mutex io;
     std::vector<std::unique_ptr<DataSource>> nodes;
     DataSource* inner = nullptr;
@@ -365,6 +366,7 @@ struct PkgImpl {
         if (dk3.empty())
             return false;
 
+        entry_key3 = dk3;
         std::vector<u8> ivk_in(row20, row20 + 0x20);
         ivk_in.insert(ivk_in.end(), dk3.begin(), dk3.end());
         u8 ivk[32];
@@ -598,8 +600,26 @@ struct PkgImpl {
                 want_id == 0x1000 ? 1u << 20 : (want_id == 0x1200 ? 16u << 20 : UINT32_MAX);
             if (sz == 0 || sz > max_size || static_cast<u64>(off) + sz > pkg.GetSize())
                 return false;
-            out.resize(sz);
-            r(off, sz, out.data());
+            if (Be32(e + 8) & 0x80000000U) {
+                if (((Be32(e + 12) >> 12) & 0xf) != 3 || entry_key3.empty())
+                    return false;
+                const u64 padded_size = (static_cast<u64>(sz) + 15) & ~u64{15};
+                if (padded_size > pkg.GetSize() - off)
+                    return false;
+                std::vector<u8> encrypted(padded_size), decrypted(padded_size);
+                r(off, padded_size, encrypted.data());
+                std::vector<u8> key_input(e, e + 0x20);
+                key_input.insert(key_input.end(), entry_key3.begin(), entry_key3.end());
+                u8 iv_key[32];
+                Sha256(key_input.data(), key_input.size(), iv_key);
+                Aes128CbcDecrypt(iv_key + 16, iv_key, encrypted.data(), padded_size,
+                                 decrypted.data());
+                decrypted.resize(sz);
+                out = std::move(decrypted);
+            } else {
+                out.resize(sz);
+                r(off, sz, out.data());
+            }
             return true;
         }
         return false;

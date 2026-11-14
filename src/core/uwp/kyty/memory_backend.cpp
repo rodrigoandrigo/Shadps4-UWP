@@ -108,16 +108,20 @@ HANDLE GuestMemory::AcquireSection(uint64_t physical) {
     }
     size_t index = section_pools.size();
     size_t empty = index;
+    size_t available = index;
     for (size_t i = 0; i < section_pools.size(); ++i) {
-        if (section_pools[i].section && section_pools[i].used != UINT64_MAX) {
+        const auto& pool = section_pools[i];
+        if (pool.committed & ~pool.used) {
             index = i;
             break;
         }
-        if (!section_pools[i].section && empty == section_pools.size())
+        if (pool.section && pool.used != UINT64_MAX && available == section_pools.size())
+            available = i;
+        if (!pool.section && empty == section_pools.size())
             empty = i;
     }
     if (index == section_pools.size()) {
-        index = empty;
+        index = available != section_pools.size() ? available : empty;
         if (index == section_pools.size())
             section_pools.emplace_back();
     }
