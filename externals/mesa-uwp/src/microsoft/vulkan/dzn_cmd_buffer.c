@@ -1444,7 +1444,8 @@ dzn_cmd_buffer_feedback_attachments(struct dzn_cmd_buffer *cmdbuf, bool prepare)
 {
    for (unsigned i = 0; i < MAX_RTS + 2; i++) {
       struct dzn_rendering_attachment *att = dzn_feedback_attachment(cmdbuf, i);
-      if (!att || !att->iview || !att->feedback_loop)
+      if (!att || !att->iview ||
+          (!att->feedback_loop && att->feedback_layout != VK_IMAGE_LAYOUT_GENERAL))
          continue;
       VkImageLayout layout = prepare ? (i < MAX_RTS ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL :
                                           VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) :
@@ -1652,9 +1653,9 @@ static void
 dzn_cmd_buffer_prepare_feedback(struct dzn_cmd_buffer *cmdbuf)
 {
    cmdbuf->feedback_scope = NULL;
+   dzn_cmd_buffer_feedback_attachments(cmdbuf, true);
    if (!dzn_cmd_buffer_has_feedback(cmdbuf))
       return;
-   dzn_cmd_buffer_feedback_attachments(cmdbuf, true);
    util_dynarray_foreach(&cmdbuf->feedback_images, struct dzn_feedback_image *, entry)
       if (!(*entry)->mixed)
          memset((*entry)->copied, 0, (*entry)->subresource_count);
@@ -7534,6 +7535,7 @@ dzn_CmdBeginRendering(VkCommandBuffer commandBuffer,
       }
    }
 
+   dzn_cmd_buffer_feedback_attachments(cmdbuf, true);
    uint32_t rt_count = pRenderingInfo->colorAttachmentCount;
    while (rt_count && !pRenderingInfo->pColorAttachments[rt_count - 1].imageView)
       rt_count--;
