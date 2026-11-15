@@ -39,6 +39,9 @@ public:
     virtual void CpSync() = 0;
     virtual u64 Flush() = 0;
     virtual void Finish() = 0;
+    virtual void PreparePredicateRead(VAddr, u64) {
+        Finish();
+    }
     virtual void RequestFlush(u64) {
         Flush();
     }

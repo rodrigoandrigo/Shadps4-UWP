@@ -426,6 +426,7 @@ void ImGuiFrontend::ResolveApi() {
     RESOLVE(set_setting, "shadps4_set_setting");
     RESOLVE(reset_settings, "shadps4_reset_settings");
     RESOLVE(mount, "shadps4_mount_storage_folder");
+    RESOLVE(mount_xbox_games, "shadps4_mount_xbox_games");
     RESOLVE(mount_pkg, "shadps4_mount_pkg");
     RESOLVE(mount_pkg_file, "shadps4_mount_pkg_file");
     RESOLVE(unmount, "shadps4_unmount_storage_folder");
@@ -933,8 +934,27 @@ void ImGuiFrontend::Scan() {
     std::vector<std::string> package_paths;
     std::vector<std::pair<std::string, Platform::Agile<StorageFile>>> selected_packages;
     std::unordered_map<std::string, std::string> names;
-    for (size_t index = 0; index < roots.size(); ++index) {
-        const auto& root = roots[index];
+    const auto& scan_roots = roots;
+    if (Windows::System::Profile::AnalyticsInfo::VersionInfo->DeviceFamily == "Windows.Xbox") {
+        const std::string path = "/xboxgames";
+        const auto code = mount_xbox_games(path.c_str());
+        if (!code) {
+            root_mounts.push_back(path);
+            folders.emplace_back(path, 0);
+            names.emplace(path, "D:\\DevelopmentFiles\\Games\\PS4");
+            UwpDiagnostics::Record("xbox_games_directory_mounted");
+        } else {
+            UwpDiagnostics::Record("xbox_games_directory_unavailable", code);
+            throw std::runtime_error("Cannot scan D:\\DevelopmentFiles\\Games\\PS4: " +
+                                     Utf8(core->Error()));
+        }
+    }
+    for (size_t index = 0; index < scan_roots.size(); ++index) {
+        const auto& root = scan_roots[index];
+        if (Windows::System::Profile::AnalyticsInfo::VersionInfo->DeviceFamily == "Windows.Xbox" &&
+            root.folder.Get() &&
+            _wcsicmp(root.folder.Get()->Path->Data(), L"D:\\DevelopmentFiles\\Games\\PS4") == 0)
+            continue;
         const auto label =
             Utf8(root.file.Get() ? root.file.Get()->Name->Data() : root.folder.Get()->Name->Data());
         result->roots.push_back({label, root.token, root.enabled});
@@ -1421,9 +1441,6 @@ void ImGuiFrontend::Draw() {
                                 idle && !scanning.load()) &&
                 choose_folder)
                 choose_folder(L"library");
-            if (ImGui::MenuItem("Add PKG...", nullptr, false, idle && !scanning.load()) &&
-                choose_folder)
-                choose_folder(L"pkg");
             if (ImGui::MenuItem("Start game", nullptr, false, can_play))
                 StartGame();
             if (ImGui::BeginMenu("Import", idle)) {

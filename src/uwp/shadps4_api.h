@@ -154,6 +154,7 @@ SHADPS4_API uint32_t __cdecl shadps4_get_state(void);
 SHADPS4_API uint32_t __cdecl shadps4_get_error(char* destination, uint32_t capacity);
 SHADPS4_API int32_t __cdecl shadps4_mount_storage_folder(const char* mount, void* folder,
                                                          int32_t read_only);
+SHADPS4_API int32_t __cdecl shadps4_mount_xbox_games(const char* mount);
 SHADPS4_API int32_t __cdecl shadps4_unmount_storage_folder(const char* mount);
 SHADPS4_API int32_t __cdecl shadps4_mount_pkg(const char* mount, const char* source,
                                               int32_t* bootable);

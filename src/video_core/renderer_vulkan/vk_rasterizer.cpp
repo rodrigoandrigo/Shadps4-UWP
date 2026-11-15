@@ -1177,6 +1177,24 @@ void Rasterizer::Finish() {
     scheduler.Finish();
 }
 
+void Rasterizer::PreparePredicateRead(VAddr address, u64 size) {
+    bool refreshed = false;
+    while (size) {
+        const u64 chunk =
+            std::min<u64>(size, VideoCore::BYTES_PER_PAGE - address % VideoCore::BYTES_PER_PAGE);
+        if (buffer_cache.IsRegionGpuModified(address, chunk)) {
+            if (!refreshed)
+                DropCopyHold(hold_drops_wait_);
+            buffer_cache.ReadMemory(address, chunk, false, false, true);
+            refreshed = true;
+        }
+        address += chunk;
+        size -= chunk;
+    }
+    if (refreshed)
+        Skipcache::Framework::Instance().BumpMemGen();
+}
+
 void Rasterizer::CpSync() {
     runtime.SynchronizeMemory();
 }

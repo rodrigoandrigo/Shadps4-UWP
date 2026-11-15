@@ -3,6 +3,7 @@
 
 #include <fstream>
 #include <system_error>
+#include <unordered_set>
 
 #include "common/string_util.h"
 #ifdef SHADPS4_UWP
@@ -14,6 +15,32 @@
 namespace Core::FileSys {
 
 namespace {
+
+class MetadataDirectory final : public IDirectory {
+public:
+    MetadataDirectory(std::unique_ptr<IDirectory> primary, std::unique_ptr<IDirectory> fallback)
+        : primary(std::move(primary)), fallback(std::move(fallback)) {}
+
+    bool Next(DirEntry& out) override {
+        while ((primary && primary->Next(out)) || (fallback && fallback->Next(out))) {
+            if (names.emplace(Common::ToLower(out.name)).second)
+                return true;
+        }
+        return false;
+    }
+
+    void Rewind() override {
+        if (primary)
+            primary->Rewind();
+        if (fallback)
+            fallback->Rewind();
+        names.clear();
+    }
+
+private:
+    std::unique_ptr<IDirectory> primary, fallback;
+    std::unordered_set<std::string> names;
+};
 
 FileStat MakeFileStat(const Common::FS::FileInfo& info, u32 inode) {
     return {
@@ -129,7 +156,19 @@ void HostDirectory::Rewind() {
 }
 
 HostFsBackend::HostFsBackend(std::filesystem::path root, bool read_only)
-    : m_root(std::move(root)), m_read_only(read_only) {}
+    : m_root(std::move(root)), m_read_only(read_only) {
+    if (Common::ToLower(m_root.filename().string()) == "image0") {
+        const auto parent = m_root.parent_path();
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(parent, ec)) {
+            if (Common::ToLower(entry.path().filename().string()) == "sc0" &&
+                entry.is_directory(ec)) {
+                m_metadata = std::make_unique<HostFsBackend>(entry.path(), true);
+                break;
+            }
+        }
+    }
+}
 
 std::filesystem::path HostFsBackend::Resolve(std::string_view rel_path) const {
     if (rel_path.empty()) {
@@ -137,15 +176,20 @@ std::filesystem::path HostFsBackend::Resolve(std::string_view rel_path) const {
     }
     std::filesystem::path direct = m_root;
     direct /= rel_path;
-    if constexpr (!NeedsCaseInsensitiveSearch) {
+    std::error_code ec;
+    if (std::filesystem::exists(direct, ec))
         return direct;
-    } else {
-        std::error_code ec;
-        if (std::filesystem::exists(direct, ec)) {
-            return direct;
-        }
-        return ResolveCaseInsensitive(rel_path).value_or(std::move(direct));
+    if constexpr (NeedsCaseInsensitiveSearch) {
+        if (const auto resolved = ResolveCaseInsensitive(rel_path))
+            return *resolved;
     }
+    if (m_metadata && (rel_path == "sce_sys" || rel_path.starts_with("sce_sys/"))) {
+        const auto fallback = m_metadata->Resolve(rel_path == "sce_sys" ? std::string_view{}
+                                                                      : rel_path.substr(8));
+        if (std::filesystem::exists(fallback, ec))
+            return fallback;
+    }
+    return direct;
 }
 
 std::optional<std::filesystem::path> HostFsBackend::ResolveCaseInsensitive(
@@ -223,7 +267,9 @@ bool HostFsBackend::Stat(std::string_view rel_path, FileStat& out) {
 std::unique_ptr<IFile> HostFsBackend::Open(std::string_view rel_path,
                                            Common::FS::FileAccessMode mode) {
     const bool writable = mode != Common::FS::FileAccessMode::Read;
-    if (writable && m_read_only) {
+    if (writable &&
+        (m_read_only ||
+         (m_metadata && (rel_path == "sce_sys" || rel_path.starts_with("sce_sys/"))))) {
         return nullptr;
     }
     const auto path = Resolve(rel_path);
@@ -244,11 +290,18 @@ std::unique_ptr<IDirectory> HostFsBackend::OpenDir(std::string_view rel_path) {
     if (!std::filesystem::is_directory(path, ec)) {
         return nullptr;
     }
-    return std::make_unique<HostDirectory>(path);
+    auto primary = std::make_unique<HostDirectory>(path);
+    if (m_metadata && (rel_path == "sce_sys" || rel_path.starts_with("sce_sys/"))) {
+        auto fallback = m_metadata->OpenDir(rel_path == "sce_sys" ? std::string_view{}
+                                                               : rel_path.substr(8));
+        if (fallback)
+            return std::make_unique<MetadataDirectory>(std::move(primary), std::move(fallback));
+    }
+    return primary;
 }
 
 std::optional<std::vector<u8>> HostFsBackend::ReadFile(std::string_view rel_path) const {
-    const std::filesystem::path full_path = m_root / rel_path;
+    const std::filesystem::path full_path = Resolve(rel_path);
     std::error_code ec;
     if (!std::filesystem::is_regular_file(full_path, ec) || ec) {
         return std::nullopt;

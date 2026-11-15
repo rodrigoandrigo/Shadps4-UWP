@@ -2,7 +2,7 @@ param(
     [ValidateSet('Debug', 'Release')][string]$Configuration = 'Release',
     [string]$SDL3Source = 'C:\Users\rodri\Dev1\Projetos\SDL3-uwp',
     [string]$D3D12Source = '',
-    [int]$Jobs = 6,
+    [ValidateRange(1, 256)][int]$Jobs = 6,
     [string]$PythonExecutable = '',
     [switch]$CoreOnly,
     [switch]$SkipSigning,
@@ -10,6 +10,17 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+function Get-MemoryLimitedJobs([int]$RequestedJobs) {
+    $memory = Get-CimInstance Win32_OperatingSystem
+    $availableBytes = [Math]::Min([double]$memory.FreePhysicalMemory,
+                                  [double]$memory.FreeVirtualMemory) * 1KB
+    $memoryJobs = [Math]::Max(1, [Math]::Floor(($availableBytes - 2GB) / 2GB))
+    return [int][Math]::Min($RequestedJobs, $memoryJobs)
+}
+$requestedJobs = $Jobs
+$Jobs = Get-MemoryLimitedJobs $requestedJobs
+Write-Host "Build parallelism: $Jobs (requested $requestedJobs)."
+
 $repository = Split-Path $PSScriptRoot -Parent
 if (!$D3D12Source) { $D3D12Source = Join-Path $repository 'externals\d3d12-native' }
 $buildDirectory = Join-Path $repository "Build\UWP-$Configuration"
@@ -37,7 +48,7 @@ if (!$PythonExecutable) {
 New-Item -ItemType Directory -Force $buildDirectory, $runtimeDirectory | Out-Null
 $sdlOutput = Join-Path $buildDirectory 'SDL3\'
 $sdlIntermediate = Join-Path $buildDirectory 'SDL3-obj\'
-& $msbuild (Join-Path $SDL3Source 'VisualC-WinRT\SDL-UWP.vcxproj') /m /t:Build "/p:Configuration=$Configuration" /p:Platform=x64 "/p:OutDir=$sdlOutput" "/p:IntDir=$sdlIntermediate" "/p:SolutionDir=$SDL3Source\VisualC-WinRT\" /p:WindowsTargetPlatformVersion=10.0.26100.0 /v:minimal /nologo
+& $msbuild (Join-Path $SDL3Source 'VisualC-WinRT\SDL-UWP.vcxproj') "/m:$Jobs" /t:Build "/p:Configuration=$Configuration" /p:Platform=x64 "/p:OutDir=$sdlOutput" "/p:IntDir=$sdlIntermediate" "/p:SolutionDir=$SDL3Source\VisualC-WinRT\" /p:WindowsTargetPlatformVersion=10.0.26100.0 /v:minimal /nologo
 if ($LASTEXITCODE) { throw "SDL3 UWP build failed: $LASTEXITCODE" }
 $sdlOutput = Join-Path $sdlOutput 'SDL3-UWP'
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'build-dozen.ps1') -PythonExecutable $PythonExecutable -Jobs $Jobs
@@ -49,10 +60,27 @@ Copy-Item -LiteralPath $dozenRuntime -Destination $runtimeDirectory
 Copy-Item -LiteralPath (Join-Path $repository 'Build\Dozen-UWP\src\microsoft\spirv_to_dxil\spirv_to_dxil.dll') -Destination $runtimeDirectory
 & cmake -S $repository -B $buildDirectory -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" "-DCMAKE_C_COMPILER=$clang" "-DCMAKE_CXX_COMPILER=$clang" "-DCMAKE_BUILD_TYPE=$Configuration" "-DPython3_EXECUTABLE=$PythonExecutable" -DSHADPS4_UWP=ON "-DSHADPS4_D3D12_SOURCE_DIR=$D3D12Source" "-DSHADPS4_SDL3_SOURCE_DIR=$SDL3Source" "-DSHADPS4_SDL3_LIBRARY=$sdlOutput\SDL3.lib" "-DSHADPS4_SDL3_RUNTIME=$sdlOutput\SDL3.dll" "-DSHADPS4_UWP_OUTPUT_DIR=$runtimeDirectory" "-DSHADPS4_DXC_RUNTIME_DIR=$dxcRuntime" -DENABLE_TESTS=OFF
 if ($LASTEXITCODE) { throw "Core configuration failed: $LASTEXITCODE" }
-& cmake --build $buildDirectory --target shadps4 --parallel $Jobs
-if ($LASTEXITCODE) { throw "Core build failed: $LASTEXITCODE" }
+$Jobs = Get-MemoryLimitedJobs $requestedJobs
+$buildLog = Join-Path $buildDirectory 'core-build.log'
+$previousErrorAction = $ErrorActionPreference
+try {
+    $ErrorActionPreference = 'Continue'
+    & cmake --build $buildDirectory --target shadps4 --parallel $Jobs 2>&1 |
+        Tee-Object -FilePath $buildLog
+    $coreExitCode = $LASTEXITCODE
+    if ($coreExitCode -and $Jobs -gt 1 -and
+        (Select-String -LiteralPath $buildLog -Quiet -Pattern 'LLVM ERROR: out of memory|Allocation failed|bad_alloc|not enough memory')) {
+        Write-Host 'Compiler memory exhausted; retrying remaining core work with one process.'
+        & cmake --build $buildDirectory --target shadps4 --parallel 1 2>&1 |
+            Tee-Object -FilePath (Join-Path $buildDirectory 'core-build-retry.log')
+        $coreExitCode = $LASTEXITCODE
+    }
+} finally {
+    $ErrorActionPreference = $previousErrorAction
+}
+if ($coreExitCode) { throw "Core build failed: $coreExitCode (see $buildLog)" }
 if (!$CoreOnly) {
-    & $msbuild (Join-Path $repository 'shadPS4-UWP\shadPS4-UWP.vcxproj') /m /t:Build "/p:Configuration=$Configuration" /p:Platform=x64 /p:BuildCore=false "/p:D3D12Source=$D3D12Source" /v:minimal /nologo
+    & $msbuild (Join-Path $repository 'shadPS4-UWP\shadPS4-UWP.vcxproj') "/m:$Jobs" /t:Build "/p:Configuration=$Configuration" /p:Platform=x64 /p:BuildCore=false "/p:D3D12Source=$D3D12Source" /v:minimal /nologo
     if ($LASTEXITCODE) { throw "UWP application build failed: $LASTEXITCODE" }
     if (!$SkipSigning) {
         $bundle = Get-ChildItem (Join-Path $repository 'shadPS4-UWP\AppPackages') -Filter '*.msixbundle' -Recurse |

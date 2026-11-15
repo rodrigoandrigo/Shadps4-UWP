@@ -821,8 +821,11 @@ bool Liverpool::TrySetPredication(const PM4Header* header) {
     if (!address || address % alignment)
         throw std::runtime_error("Invalid SET_PREDICATION address");
     VideoCore::StreamCopyLane::Instance().DrainProducer();
-    if (rasterizer)
-        rasterizer->Finish();
+    if (rasterizer) {
+        const u64 size = operation == 1 ? num_counter_pairs * 16 :
+                         operation == 2 ? 32 : operation == 3 ? 8 : 4;
+        rasterizer->PreparePredicateRead(address, size);
+    }
     bool visible{}, ready = true;
     const auto* values = reinterpret_cast<const volatile u64*>(address);
     constexpr u64 valid = u64{1} << 63;

@@ -4,6 +4,8 @@
 #include <unordered_map>
 #include <objbase.h>
 #include <windows.h>
+#include <fileapifromapp.h>
+#include <winrt/Windows.System.Profile.h>
 #include <winrt/Windows.Storage.h>
 #include "common/singleton.h"
 #include "core/file_sys/fs.h"
@@ -170,6 +172,31 @@ void ClearStorage() {
     packages.clear();
 }
 } // namespace Core::Uwp
+
+int32_t shadps4_mount_xbox_games(const char* mount) {
+    return StorageCall([&] {
+        RequireIdle();
+        Require(winrt::Windows::System::Profile::AnalyticsInfo::VersionInfo().DeviceFamily() ==
+                    L"Windows.Xbox", E_ACCESSDENIED);
+        const auto name = MountName(mount);
+        for (const auto path : {L"D:\\DevelopmentFiles\\Games", L"D:\\DevelopmentFiles\\Games\\PS4"}) {
+            if (!CreateDirectoryFromAppW(path, nullptr)) {
+                const DWORD error = GetLastError();
+                Require(error == ERROR_ALREADY_EXISTS, HRESULT_FROM_WIN32(error));
+            }
+            WIN32_FILE_ATTRIBUTE_DATA attributes{};
+            if (!GetFileAttributesExFromAppW(path, GetFileExInfoStandard, &attributes))
+                winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
+            Require(attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY,
+                    HRESULT_FROM_WIN32(ERROR_DIRECTORY));
+        }
+        auto backend = std::make_shared<BrokeredFsBackend>(
+            std::filesystem::path{L"D:\\DevelopmentFiles\\Games\\PS4"});
+        Require(backend->IsDirectory({}), HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND));
+        Mounts()->MountBackend(backend, name);
+        folders.insert_or_assign(name, std::move(backend));
+    });
+}
 
 int32_t shadps4_mount_storage_folder(const char* mount, void* folder, int32_t read_only) {
     return StorageCall([&] {
