@@ -610,7 +610,11 @@ std::optional<u64> BufferCache::StreamViaLane(VAddr device_addr, u32 size) {
         return std::nullopt;
     }
     Core::MemoryManager::BackingSpan spans[2];
+#ifdef SHADPS4_UWP
+    constexpr bool hardened = true;
+#else
     const bool hardened = lane.Hardened();
+#endif
     const u32 num_spans = memory->ResolveBackingSpans(device_addr, size, spans, 2, hardened);
     if (num_spans == 0) {
         lane.NoteInlineUnresolved();
@@ -619,7 +623,12 @@ std::optional<u64> BufferCache::StreamViaLane(VAddr device_addr, u32 size) {
     // 64-byte slots keep each job's cache lines on one core.
     const u64 alignment = std::max<u64>(instance.UniformMinAlignment(), 64);
     auto [dst, offset] = stream_buffer.Map(size, alignment);
+#ifdef SHADPS4_UWP
+    // The pager serializes backing copies; worker handoffs only contend on its lock.
+    bool queued = false;
+#else
     bool queued = true;
+#endif
     for (u32 i = 0; i < num_spans; ++i) {
         if (queued) {
             queued = lane.Push(spans[i].ptr, dst, static_cast<u32>(spans[i].size));

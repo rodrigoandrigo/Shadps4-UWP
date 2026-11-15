@@ -877,6 +877,8 @@ bool GuestMemory::ProtectRange(uintptr_t address, uint64_t bytes, int protection
         regions.Touch(Logical(page->physical) / WindowSize, *this);
         const auto index = (at - page->address) / 4096;
         const auto previous = page->protection[index];
+        if (previous == protection)
+            continue;
         page->protection[index] = static_cast<uint8_t>(protection);
         if (!ApplyProtection(*page)) {
             page->protection[index] = previous;
@@ -1018,6 +1020,15 @@ bool GuestMemory::CopyPhysical(uint64_t physical, void* data, uint64_t bytes, bo
         auto& owner = Owner(offset - page_offset);
         if (!Ensure(owner))
             return false;
+        if (state.section) {
+            auto* memory = static_cast<uint8_t*>(SectionData(offset)) + offset % WindowSize;
+            if (write)
+                std::memcpy(memory, target + done, count);
+            else
+                std::memcpy(target + done, memory, count);
+            done += count;
+            continue;
+        }
         const auto first_page = page_offset / 4096;
         const auto last_page = (page_offset + count - 1) / 4096;
         const bool accessible =
@@ -1036,13 +1047,14 @@ bool GuestMemory::CopyPhysical(uint64_t physical, void* data, uint64_t bytes, bo
         }
         std::array<DWORD, 4> previous{};
         size_t changed{};
-        for (; changed < previous.size(); ++changed) {
-            if (!VirtualProtectFromApp(reinterpret_cast<void*>(owner.address + changed * 4096),
-                                       4096, write ? PAGE_READWRITE : PAGE_READONLY,
-                                       &previous[changed]))
+        const auto protection_count = last_page - first_page + 1;
+        for (; changed < protection_count; ++changed) {
+            if (!VirtualProtectFromApp(
+                    reinterpret_cast<void*>(owner.address + (first_page + changed) * 4096), 4096,
+                    write ? PAGE_READWRITE : PAGE_READONLY, &previous[changed]))
                 break;
         }
-        const bool copied = changed == previous.size();
+        const bool copied = changed == protection_count;
         if (copied) {
             auto* memory = reinterpret_cast<uint8_t*>(owner.address + page_offset);
             if (write)
@@ -1051,9 +1063,15 @@ bool GuestMemory::CopyPhysical(uint64_t physical, void* data, uint64_t bytes, bo
                 std::memcpy(target + done, memory, count);
         }
         const auto error = GetLastError();
-        if (changed && !ApplyProtection(owner)) {
-            AllocationFailed("VirtualProtectFromApp.restore_copy", owner.address, nullptr);
-            std::terminate();
+        while (changed) {
+            --changed;
+            DWORD ignored{};
+            const auto address = owner.address + (first_page + changed) * 4096;
+            if (!VirtualProtectFromApp(reinterpret_cast<void*>(address), 4096, previous[changed],
+                                       &ignored)) {
+                AllocationFailed("VirtualProtectFromApp.restore_copy", address, nullptr);
+                std::terminate();
+            }
         }
         if (!copied) {
             SetLastError(error);
@@ -1078,7 +1096,7 @@ bool GuestMemory::Copy(void* destination, const void* source, uint64_t bytes) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return false;
     }
-    std::array<uint8_t, PageSize> buffer{};
+    std::array<uint8_t, PageSize> buffer;
     uint64_t done{};
     while (done < bytes) {
         auto count = std::min(bytes - done, PageSize);
@@ -1098,16 +1116,24 @@ bool GuestMemory::Copy(void* destination, const void* source, uint64_t bytes) {
             const auto physical = src_physical
                                       ? src + done - canonical
                                       : source_page->physical + src + done - source_page->address;
-            if (!CopyPhysical(physical, buffer.data(), count, false))
+            auto* output = !dst_physical && !destination_page ? reinterpret_cast<void*>(dst + done)
+                                                              : buffer.data();
+            if (!CopyPhysical(physical, output, count, false))
                 return false;
-        } else {
+            if (output != buffer.data()) {
+                done += count;
+                continue;
+            }
+        } else if (!dst_physical && !destination_page) {
             std::memcpy(buffer.data(), reinterpret_cast<const void*>(src + done), count);
         }
         if (dst_physical || destination_page) {
             const auto physical =
                 dst_physical ? dst + done - canonical
                              : destination_page->physical + dst + done - destination_page->address;
-            if (!CopyPhysical(physical, buffer.data(), count, true))
+            auto* input =
+                !src_physical && !source_page ? reinterpret_cast<void*>(src + done) : buffer.data();
+            if (!CopyPhysical(physical, input, count, true))
                 return false;
         } else {
             std::memcpy(reinterpret_cast<void*>(dst + done), buffer.data(), count);

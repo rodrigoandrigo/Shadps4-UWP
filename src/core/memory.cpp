@@ -159,9 +159,10 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
                                   : nullptr;
     GuestCopyScope scope{this};
     auto access_lock = LockGpuAccess();
-    const auto measured = getenv("GAME_PROFILE") != nullptr;
+    static const bool measured = getenv("GAME_PROFILE") != nullptr;
     const auto requested_size = size;
-    const auto start = std::chrono::steady_clock::now();
+    const auto start =
+        measured ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto& backing_pages = impl.BackingPages();
     while (size) {
         const u64 page = virtual_addr >> GUEST_PAGE_BITS;
