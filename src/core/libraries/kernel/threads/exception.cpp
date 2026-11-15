@@ -11,10 +11,12 @@
 #include "core/libraries/libs.h"
 #include "core/signals.h"
 #ifdef SHADPS4_UWP
+#include <array>
 #include "core/memory.h"
 #endif
 
 #ifdef _WIN64
+#include <intrin.h>
 #include "common/ntapi.h"
 #else
 #include <csignal>
@@ -640,7 +642,79 @@ s32 PS4_SYSV_ABI sceKernelRaiseException(PthreadT thread, s32 signum) {
     return ret;
 }
 
-s32 PS4_SYSV_ABI sceKernelDebugRaiseException(u32 error, s64 unk) {
+static void LogDebugRaiseException(const char* api, u32 error, s64 argument, void* caller,
+                                   void* frame, void* return_slot) {
+    LOG_CRITICAL(Debug,
+                 "[GuestDebugException] api={} error={:#x} argument={} argument_hex={:#x} "
+                 "return_pc={:#x} api_frame={:#x}",
+                 api, error, argument, static_cast<u64>(argument),
+                 reinterpret_cast<uintptr_t>(caller), reinterpret_cast<uintptr_t>(frame));
+#ifdef SHADPS4_UWP
+    using ReadMemory = LONG(NTAPI*)(HANDLE, const void*, void*, SIZE_T, SIZE_T*);
+    static const auto read_memory = reinterpret_cast<ReadMemory>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtReadVirtualMemory"));
+    if (!read_memory || !g_curthread) {
+        LOG_CRITICAL(Debug, "[GuestDebugException] stack_unavailable reader={} thread={}",
+                     read_memory != nullptr, g_curthread != nullptr);
+        return;
+    }
+    const auto base = reinterpret_cast<uintptr_t>(g_curthread->attr.stackaddr_attr);
+    const auto size = g_curthread->attr.stacksize_attr;
+    LOG_CRITICAL(Debug, "[GuestDebugException] stack_base={:#x} stack_size={:#x}", base, size);
+    const auto read = [&](uintptr_t address, void* output, size_t bytes) {
+        if (address < base || bytes > size || address - base > size - bytes)
+            return false;
+        SIZE_T copied{};
+        return read_memory(GetCurrentProcess(), reinterpret_cast<const void*>(address), output,
+                           bytes, &copied) >= 0 &&
+               copied == bytes;
+    };
+    std::array<uintptr_t, 2> record{};
+    const auto api_frame = reinterpret_cast<uintptr_t>(return_slot) - sizeof(uintptr_t);
+    if (!read(api_frame, record.data(), sizeof(record))) {
+        LOG_CRITICAL(Debug, "[GuestDebugException] stack_unreadable address={:#x}", api_frame);
+        return;
+    }
+    const auto guest_rsp = api_frame + sizeof(record);
+    LOG_CRITICAL(Debug, "[GuestDebugException] guest_rsp={:#x} guest_rbp={:#x}", guest_rsp,
+                 record[0]);
+    auto previous = api_frame;
+    auto next = record[0];
+    for (u32 depth = 0; depth < 32; ++depth) {
+        if (next <= previous || next % alignof(uintptr_t) != 0 ||
+            !read(next, record.data(), sizeof(record))) {
+            LOG_CRITICAL(Debug, "[GuestDebugException] frame_chain_end depth={} address={:#x}",
+                         depth, next);
+            break;
+        }
+        LOG_CRITICAL(Debug, "[GuestDebugException] frame={} fp={:#x} return_pc={:#x}", depth, next,
+                     record[1]);
+        previous = next;
+        next = record[0];
+    }
+    for (u32 index = 0; index < 64; ++index) {
+        uintptr_t word{};
+        const auto address = guest_rsp + index * sizeof(word);
+        if (!read(address, &word, sizeof(word))) {
+            LOG_CRITICAL(Debug, "[GuestDebugException] stack_words_end index={} address={:#x}",
+                         index, address);
+            break;
+        }
+        LOG_CRITICAL(Debug, "[GuestDebugException] stack_word={} address={:#x} value={:#x}", index,
+                     address, word);
+    }
+#endif
+}
+
+SHAD_NO_INLINE s32 PS4_SYSV_ABI sceKernelDebugRaiseException(u32 error, s64 unk) {
+    LogDebugRaiseException(__func__, error, unk, __builtin_return_address(0),
+                           __builtin_frame_address(0),
+#ifdef _WIN64
+                           _AddressOfReturnAddress()
+#else
+                           nullptr
+#endif
+    );
     if (unk != 0) {
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
@@ -648,7 +722,15 @@ s32 PS4_SYSV_ABI sceKernelDebugRaiseException(u32 error, s64 unk) {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceKernelDebugRaiseExceptionOnReleaseMode(u32 error, s64 unk) {
+SHAD_NO_INLINE s32 PS4_SYSV_ABI sceKernelDebugRaiseExceptionOnReleaseMode(u32 error, s64 unk) {
+    LogDebugRaiseException(__func__, error, unk, __builtin_return_address(0),
+                           __builtin_frame_address(0),
+#ifdef _WIN64
+                           _AddressOfReturnAddress()
+#else
+                           nullptr
+#endif
+    );
     if (unk != 0) {
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
