@@ -1162,6 +1162,24 @@ void Rasterizer::Finish() {
     scheduler.Finish();
 }
 
+void Rasterizer::PreparePredicateRead(VAddr address, u64 size) {
+    bool refreshed = false;
+    while (size) {
+        const u64 chunk =
+            std::min<u64>(size, VideoCore::BYTES_PER_PAGE - address % VideoCore::BYTES_PER_PAGE);
+        if (buffer_cache.IsRegionGpuModified(address, chunk)) {
+            if (!refreshed)
+                DropCopyHold(hold_drops_wait_);
+            buffer_cache.ReadMemory(address, chunk, false, false, true);
+            refreshed = true;
+        }
+        address += chunk;
+        size -= chunk;
+    }
+    if (refreshed)
+        Skipcache::Framework::Instance().BumpMemGen();
+}
+
 void Rasterizer::CpSync() {
     runtime.SynchronizeMemory();
 }
@@ -3490,31 +3508,7 @@ bool Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
 void Rasterizer::UpdateViewportScissorState() const {
     const auto& regs = liverpool->regs;
 
-    const auto combined_scissor_value_tl = [](s16 scr, s16 win, s16 gen, s16 win_offset) {
-        return std::max({scr, s16(win + win_offset), s16(gen + win_offset)});
-    };
-    const auto combined_scissor_value_br = [](s16 scr, s16 win, s16 gen, s16 win_offset) {
-        return std::min({scr, s16(win + win_offset), s16(gen + win_offset)});
-    };
-    const bool enable_offset = !regs.window_scissor.window_offset_disable;
-
-    AmdGpu::Scissor scsr{};
-    scsr.top_left_x = combined_scissor_value_tl(
-        regs.screen_scissor.top_left_x, s16(regs.window_scissor.top_left_x),
-        s16(regs.generic_scissor.top_left_x),
-        enable_offset ? regs.window_offset.window_x_offset : 0);
-    scsr.top_left_y = combined_scissor_value_tl(
-        regs.screen_scissor.top_left_y, s16(regs.window_scissor.top_left_y),
-        s16(regs.generic_scissor.top_left_y),
-        enable_offset ? regs.window_offset.window_y_offset : 0);
-    scsr.bottom_right_x = combined_scissor_value_br(
-        regs.screen_scissor.bottom_right_x, regs.window_scissor.bottom_right_x,
-        regs.generic_scissor.bottom_right_x,
-        enable_offset ? regs.window_offset.window_x_offset : 0);
-    scsr.bottom_right_y = combined_scissor_value_br(
-        regs.screen_scissor.bottom_right_y, regs.window_scissor.bottom_right_y,
-        regs.generic_scissor.bottom_right_y,
-        enable_offset ? regs.window_offset.window_y_offset : 0);
+    const AmdGpu::Scissor scsr = regs.GetCombinedScissor();
 
     boost::container::static_vector<vk::Viewport, AmdGpu::NUM_VIEWPORTS> viewports;
     boost::container::static_vector<vk::Rect2D, AmdGpu::NUM_VIEWPORTS> scissors;

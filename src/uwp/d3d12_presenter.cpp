@@ -16,6 +16,7 @@
 #include "uwp/resident_conversion.h"
 #include "uwp/session.h"
 #include "video_core/renderer_d3d12/profile.h"
+#include "video_core/renderer_d3d12/native_capabilities_query.h"
 #include "video_core/renderer_d3d12/temporal_jitter.h"
 #include "video_core/texture_cache/cpu_tiling.h"
 
@@ -295,6 +296,7 @@ void D3D12Presenter::SetGamma(float value) {
 void D3D12Presenter::CheckEnvironment() {
     D3D12DeviceContext device;
     device.Initialize();
+    static_cast<void>(D3D12::QueryNativeDeviceCapabilities(device.Device()));
     D3D12ResourceAllocator allocator;
     allocator.Initialize(device.Device(), 1024 * 1024);
     D3D12Resource upload;
@@ -349,6 +351,7 @@ void D3D12Presenter::CheckEnvironment() {
 
 void D3D12Presenter::Initialize(const ShadPS4Config& config) {
     context.Initialize();
+    static_cast<void>(D3D12::QueryNativeDeviceCapabilities(context.Device()));
     resources.Initialize(context.Device(), 512ULL * 1024 * 1024);
     descriptors.Initialize(context.Device(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, false);
     static_cast<void>(descriptors.Allocate(2));
@@ -548,11 +551,8 @@ void D3D12Presenter::RenderFrame() {
     }
     ResizeBuffers(output_width, output_height,
                   floating_point ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM);
-    const float scale = std::min(float(display_width) / width, float(display_height) / height);
-    const DXGI_MATRIX_3X2_F transform{
-        scale / composition_scale_x, 0, 0, scale / composition_scale_y,
-        (display_width - width * scale) * 0.5f / composition_scale_x,
-        (display_height - height * scale) * 0.5f / composition_scale_y};
+    const DXGI_MATRIX_3X2_F transform{float(display_width) / width / composition_scale_x,   0, 0,
+                                      float(display_height) / height / composition_scale_y, 0, 0};
     winrt::check_hresult(swapchain->SetMatrixTransform(&transform));
     const auto index = swapchain->GetCurrentBackBufferIndex();
     auto& command_frame = command_frames[index];
@@ -747,6 +747,11 @@ void D3D12Presenter::ResizeBuffers(uint32_t new_width, uint32_t new_height, DXGI
     }
     context.WaitForGpu();
     for (auto& command_frame : command_frames) {
+        // ResizeBuffers also requires releasing indirect back-buffer references held by command
+        // lists.
+        winrt::check_hresult(command_frame.allocator->Reset());
+        winrt::check_hresult(command_frame.commands->Reset(command_frame.allocator.Get(), nullptr));
+        winrt::check_hresult(command_frame.commands->Close());
         command_frame.fence = 0;
         command_frame.submitted_frame.reset();
         command_frame.fsr.ResetImages();

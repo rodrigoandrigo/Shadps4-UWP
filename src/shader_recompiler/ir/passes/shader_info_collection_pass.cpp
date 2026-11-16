@@ -60,6 +60,8 @@ void Visit(Info& info, const IR::Inst& inst) {
     case IR::Opcode::SharedAtomicUMax32:
     case IR::Opcode::SharedAtomicInc32:
     case IR::Opcode::SharedAtomicDec32:
+    case IR::Opcode::SharedAtomicIncLimit32:
+    case IR::Opcode::SharedAtomicDecLimit32:
     case IR::Opcode::SharedAtomicAnd32:
     case IR::Opcode::SharedAtomicOr32:
     case IR::Opcode::SharedAtomicXor32:
@@ -217,7 +219,7 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
         }
     }
 
-    if (!EmulatorSettings.IsDirectMemoryAccessEnabled()) {
+    if (!EmulatorSettings.IsDirectMemoryAccessEnabled() || !profile.support_bda) {
         info.uses_dma = false;
         info.readconst_types = Info::ReadConstType::None;
     }

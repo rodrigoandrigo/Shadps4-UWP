@@ -14,12 +14,25 @@
 #include "video_core/renderer_d3d12/msaa_transfer.h"
 #include "video_core/renderer_d3d12/resource_cache.h"
 #include "video_core/renderer_d3d12/shader_cache.h"
+#include "video_core/renderer_d3d12/storage_image_msaa_policy.h"
+#include "video_core/renderer_d3d12/storage_image_policy.h"
 #include "video_core/texture_cache/cpu_tiling.h"
 
 namespace D3D12 {
 namespace {
 namespace IR = Shader::IR;
 namespace Optimization = Shader::Optimization;
+
+constexpr bool IsWriteOnlyTypedStoreFormat(AmdGpu::DataFormat format,
+                                           AmdGpu::NumberFormat number_format) noexcept {
+    const bool r32_format = format == AmdGpu::DataFormat::Format32 ||
+                            format == AmdGpu::DataFormat::Format32_32 ||
+                            format == AmdGpu::DataFormat::Format32_32_32 ||
+                            format == AmdGpu::DataFormat::Format32_32_32_32;
+    return r32_format && (number_format == AmdGpu::NumberFormat::Uint ||
+                          number_format == AmdGpu::NumberFormat::Sint ||
+                          number_format == AmdGpu::NumberFormat::Float);
+}
 
 struct ImageAlias {
     VideoCore::ImageInfo info;
@@ -38,10 +51,18 @@ struct FmaskFormat {
 FmaskFormat GetFmaskFormat(AmdGpu::DataFormat format) {
     using D = AmdGpu::DataFormat;
     constexpr std::array<FmaskFormat, 13> formats{{
-        {2, 1, D::Format8},      {4, 1, D::Format8},    {8, 1, D::Format8},
-        {2, 1, D::Format8},      {4, 2, D::Format8},    {4, 2, D::Format8},
-        {16, 1, D::Format16},    {8, 2, D::Format16},   {16, 2, D::Format32},
-        {8, 4, D::Format32},     {8, 4, D::Format32},   {16, 4, D::Format32_32},
+        {2, 1, D::Format8},
+        {4, 1, D::Format8},
+        {8, 1, D::Format8},
+        {2, 1, D::Format8},
+        {4, 2, D::Format8},
+        {4, 2, D::Format8},
+        {16, 1, D::Format16},
+        {8, 2, D::Format16},
+        {16, 2, D::Format32},
+        {8, 4, D::Format32},
+        {8, 4, D::Format32},
+        {16, 4, D::Format32_32},
         {16, 4, D::Format32_32},
     }};
     return formats.at(u32(format) - u32(D::FormatFmask8_S2_F1));
@@ -132,7 +153,9 @@ IR::U32 Address(IR::IREmitter& ir, const ImageAlias& image, const IR::Value& coo
         const auto sample_index =
             sample.IsEmpty()
                 ? ir.Imm32(0u)
-                : IR::U32{ir.BitwiseAnd(IR::U32{sample}, ir.Imm32(image.info.num_samples - 1))};
+                : IR::U32{ir.BitwiseAnd(
+                      IR::U32{sample},
+                      ir.Imm32(StorageImageMsaaPolicy::SampleMask(image.info.num_samples)))};
         const IR::U32 plane{
             ir.IAdd(ir.IMul(absolute_slice, ir.Imm32(image.info.num_samples)), sample_index)};
         const u32 planes =
@@ -168,8 +191,8 @@ IR::Value LoadFmask(IR::IREmitter& ir, const ImageAlias& image, const IR::Value&
             32, ir.LoadBufferU16(handle, ir.ShiftRightLogical(safe_address, ir.Imm32(1u)), {}));
         break;
     case 32:
-        raw[0] = IR::U32{ir.LoadBufferU32(1, handle,
-                                        ir.ShiftRightLogical(safe_address, ir.Imm32(2u)), {})};
+        raw[0] = IR::U32{
+            ir.LoadBufferU32(1, handle, ir.ShiftRightLogical(safe_address, ir.Imm32(2u)), {})};
         break;
     case 64: {
         const auto words =
@@ -194,6 +217,49 @@ IR::Value LoadFmask(IR::IREmitter& ir, const ImageAlias& image, const IR::Value&
         ir.BitCast<IR::F32>(IR::U32{ir.Select(valid, packed[1], ir.Imm32(0u))}), ir.Imm32(0.f),
         ir.BitCast<IR::F32>(IR::U32{ir.Select(valid, ir.Imm32(1u), ir.Imm32(0u))}));
     return IR::ApplySwizzle(ir, value, image.sharp.DstSelect(), true);
+}
+
+void StoreFmask(IR::IREmitter& ir, const ImageAlias& image, const IR::Value& coords,
+                const IR::Value& value) {
+    const auto format = GetFmaskFormat(image.sharp.GetDataFmt());
+    if (format.samples * format.bits_per_sample > image.info.num_bits)
+        throw std::runtime_error("D3D12 FMASK map exceeds its storage element");
+    const std::array<IR::U32, 2> maps{
+        IR::U32{ir.BitCast<IR::U32>(IR::F32{ir.CompositeExtract(value, 0)})},
+        IR::U32{ir.BitCast<IR::U32>(IR::F32{ir.CompositeExtract(value, 1)})},
+    };
+    std::array<IR::U32, 2> packed{ir.Imm32(0u), ir.Imm32(0u)};
+    const u32 fragment_mask = (1u << format.bits_per_sample) - 1;
+    for (u32 sample = 0; sample < format.samples; ++sample) {
+        const auto fragment =
+            ir.BitFieldExtract(maps[sample / 8], ir.Imm32((sample % 8) * 4), ir.Imm32(4), false);
+        const auto encoded = IR::U32{ir.BitwiseAnd(fragment, ir.Imm32(fragment_mask))};
+        const u32 bit_offset = sample * format.bits_per_sample;
+        auto& word = packed[bit_offset / 32];
+        word = IR::U32{ir.BitwiseOr(word, ir.ShiftLeftLogical(encoded, ir.Imm32(bit_offset % 32)))};
+    }
+
+    const auto byte_address = Address(ir, image, coords, {}, {});
+    const auto handle = ir.Imm32(image.data);
+    switch (image.info.num_bits) {
+    case 8:
+        ir.StoreBufferU8(handle, byte_address, ir.UConvert(8, packed[0]), {});
+        break;
+    case 16:
+        ir.StoreBufferU16(handle, ir.ShiftRightLogical(byte_address, ir.Imm32(1u)),
+                          ir.UConvert(16, packed[0]), {});
+        break;
+    case 32:
+        ir.StoreBufferU32(1, handle, ir.ShiftRightLogical(byte_address, ir.Imm32(2u)), packed[0],
+                          {});
+        break;
+    case 64:
+        ir.StoreBufferU32(2, handle, ir.ShiftRightLogical(byte_address, ir.Imm32(2u)),
+                          ir.CompositeConstruct(packed[0], packed[1]), {});
+        break;
+    default:
+        throw std::runtime_error("Invalid D3D12 FMASK storage element size");
+    }
 }
 
 Optimization::FormatInfo Format(const ImageAlias& image) {
@@ -222,7 +288,7 @@ std::optional<PackedChannels> PackedFormat(AmdGpu::DataFormat format) {
     case AmdGpu::DataFormat::Format1_5_5_5:
         return PackedChannels{{5, 5, 5, 1}, {10, 5, 0, 15}};
     case AmdGpu::DataFormat::Format4_4_4_4:
-        return PackedChannels{{4, 4, 4, 4}, {8, 4, 0, 12}};
+        return PackedChannels{{4, 4, 4, 4}, {4, 8, 12, 0}};
     case AmdGpu::DataFormat::Format8_24:
         return PackedChannels{{24, 8, 0, 0}, {0, 24, 0, 0}};
     case AmdGpu::DataFormat::Format24_8:
@@ -677,8 +743,8 @@ SampleAxis BuildSampleAxis(IR::IREmitter& ir, const IR::U32& mode, const IR::F32
     }
     auto s = IR::F32{ir.FPMul(WrapCoord(ir, mode, u), dims_f)};
     if (round_point) {
-        const auto rounded = IR::F32{
-            ir.FPMul(ir.FPRoundEven(ir.FPMul(s, ir.Imm32(64.f))), ir.Imm32(1.f / 64.f))};
+        const auto rounded =
+            IR::F32{ir.FPMul(ir.FPRoundEven(ir.FPMul(s, ir.Imm32(64.f))), ir.Imm32(1.f / 64.f))};
         s = IR::F32{ir.Select(linear, s, rounded)};
     }
     const auto shift = IR::F32{ir.Select(linear, ir.Imm32(0.5f), ir.Imm32(0.f))};
@@ -686,9 +752,8 @@ SampleAxis BuildSampleAxis(IR::IREmitter& ir, const IR::U32& mode, const IR::F32
     const auto base_f = IR::F32{ir.FPFloor(f)};
     auto fraction = IR::F32{ir.FPSub(f, base_f)};
     if (truncate_weight) {
-        fraction =
-            IR::F32{ir.Select(ir.FPGreaterThanEqual(fraction, ir.Imm32(0.5f)), ir.Imm32(0.5f),
-                              ir.Imm32(0.f))};
+        fraction = IR::F32{ir.Select(ir.FPGreaterThanEqual(fraction, ir.Imm32(0.5f)),
+                                     ir.Imm32(0.5f), ir.Imm32(0.f))};
     }
     const auto low = IR::U32{ir.ConvertFToS(32, base_f)};
     const auto next = IR::U32{ir.IAdd(low, ir.Imm32(1u))};
@@ -765,7 +830,7 @@ IR::Value Sample(IR::IREmitter& ir, IR::Inst& inst, const ImageAlias& image, u32
                                    : inst.Arg(gather                ? 2u
                                               : gradient || is_dref ? 4u
                                                                     : 3u);
-    const IR::F32 dref = !is_dref  ? IR::F32{}
+    const IR::F32 dref = !is_dref   ? IR::F32{}
                          : gradient ? IR::F32{ir.CompositeExtract(inst.Arg(5), 0)}
                                     : IR::F32{inst.Arg(gather ? 3u : 2u)};
     const u32 view_base =
@@ -888,8 +953,10 @@ IR::Value Sample(IR::IREmitter& ir, IR::Inst& inst, const ImageAlias& image, u32
         return value;
     };
     const auto unclamped_lod = lod;
+    // Keep min/mag selection on the pre-anisotropy LOD, distinct from mip LOD below.
+    const auto lod_for_xy_filter = clamp_lod(lod);
     const auto selected_filter = IR::U32{
-        ir.Select(ir.FPGreaterThan(clamp_lod(lod), ir.Imm32(0.f)), field(2, 3), field(0, 3))};
+        ir.Select(ir.FPGreaterThan(lod_for_xy_filter, ir.Imm32(0.f)), field(2, 3), field(0, 3))};
     const u32 max_taps = !gather && !explicit_lod && (gradient || fragment_stage) &&
                                  (AmdGpu::IsAnisoFilter(sampler.xy_min_filter) ||
                                   AmdGpu::IsAnisoFilter(sampler.xy_mag_filter))
@@ -910,8 +977,8 @@ IR::Value Sample(IR::IREmitter& ir, IR::Inst& inst, const ImageAlias& image, u32
                 determinant = IR::F32{ir.FPAdd(determinant, ir.FPMul(area, area))};
             }
         }
-        const auto minor2 = IR::F32{
-            ir.FPDiv(determinant, IR::F32{ir.FPMax(major2, ir.Imm32(0x1p-64f))})};
+        const auto minor2 =
+            IR::F32{ir.FPDiv(determinant, IR::F32{ir.FPMax(major2, ir.Imm32(0x1p-64f))})};
         const auto major = ir.FPSqrt(major2);
         const auto minor = IR::F32{ir.FPMaxTri(
             ir.FPSqrt(minor2), ir.FPDiv(major, ir.Imm32(float(max_taps))), ir.Imm32(1.f))};
@@ -943,8 +1010,7 @@ IR::Value Sample(IR::IREmitter& ir, IR::Inst& inst, const ImageAlias& image, u32
             direction[axis] = IR::F32{ir.Select(
                 enabled, ir.FPAdd(ir.FPMul(dx[axis], vx), ir.FPMul(dy[axis], vy)), ir.Imm32(0.f))};
     }
-    const auto filtered_lod =
-        sampler.mip_filter == AmdGpu::MipFilter::None ? ir.Imm32(0.f) : clamp_lod(lod);
+    const auto filtered_lod = clamp_lod(lod);
     if (query)
         return ir.CompositeConstruct(IR::F32{ir.FPMin(filtered_lod, last_lod)}, unclamped_lod,
                                      ir.Imm32(0.f), ir.Imm32(0.f));
@@ -956,6 +1022,7 @@ IR::Value Sample(IR::IREmitter& ir, IR::Inst& inst, const ImageAlias& image, u32
                               : ir.Imm1(sampler.z_filter == AmdGpu::ZFilter::Linear);
     const bool point_preclamp =
         sampler.mip_filter == AmdGpu::MipFilter::Point && sampler.mip_point_preclamp;
+    // Sea Islands ISA 8.2.7: for point mip filtering, add 0.5 before LOD clamping.
     lod = IR::F32{
         ir.FPMin(point_preclamp ? clamp_lod(IR::F32{ir.FPAdd(lod, ir.Imm32(0.5f))}) : filtered_lod,
                  last_lod)};
@@ -997,9 +1064,9 @@ IR::Value Sample(IR::IREmitter& ir, IR::Inst& inst, const ImageAlias& image, u32
                                   const std::array<IR::F32, 3>& position) -> IR::Value {
         const auto coord_axis = [&](u32 axis) { return position[axis]; };
         const auto mip_u = Mip(ir, image, raw_mip);
-        const SampleAxis axis_x =
-            BuildSampleAxis(ir, wrap_x, coord_axis(0), offset_axis(0),
-                            SampleSize(ir, image, mip_u, 0), linear_xy, round_point, truncate_weight);
+        const SampleAxis axis_x = BuildSampleAxis(ir, wrap_x, coord_axis(0), offset_axis(0),
+                                                  SampleSize(ir, image, mip_u, 0), linear_xy,
+                                                  round_point, truncate_weight);
         const SampleAxis axis_y =
             axes == 1 ? SampleAxis{.low = ir.Imm32(0u), .high = ir.Imm32(0u), .frac = ir.Imm32(0.f)}
                       : BuildSampleAxis(ir, wrap_y, coord_axis(1), offset_axis(1),
@@ -1131,7 +1198,8 @@ IR::Value Sample(IR::IREmitter& ir, IR::Inst& inst, const ImageAlias& image, u32
         auto value =
             sample_level(mip_lo, {base_coord_axis(0), axes > 1 ? base_coord_axis(1) : ir.Imm32(0.f),
                                   axes > 2 ? base_coord_axis(2) : ir.Imm32(0.f)});
-        if (!gather && !image.resource.is_written && !image.resource.is_feedback)
+        // Raw sampling bypasses SRV swizzle; storage classification must not change sample results.
+        if (!gather)
             value = IR::ApplySwizzle(ir, value, image.sharp.DstSelect(), integer);
         return value;
     }
@@ -1162,7 +1230,7 @@ IR::Value Sample(IR::IREmitter& ir, IR::Inst& inst, const ImageAlias& image, u32
         }
     }
     const auto value = ir.CompositeConstruct(result[0], result[1], result[2], result[3]);
-    if (!gather && !image.resource.is_written && !image.resource.is_feedback)
+    if (!gather)
         return IR::ApplySwizzle(ir, value, image.sharp.DstSelect(),
                                 AmdGpu::IsInteger(image.sharp.GetNumberFmt()));
     return value;
@@ -1174,8 +1242,7 @@ bool LowerIndexFetch(CompiledShader& shader, IR::Program& program, const IndexFe
     if (!indices.address)
         return false;
     if (shader.info.sw_stage != Shader::SwStage::Vertex ||
-        (indices.element_size != 2 && indices.element_size != 4) ||
-        indices.size <= indices.prefix)
+        (indices.element_size != 2 && indices.element_size != 4) || indices.size <= indices.prefix)
         throw std::runtime_error("Invalid D3D12 programmable index fetch");
     const auto handle = IR::Value{
         AddBuffer(shader.info, indices.address, indices.size, false, Shader::BufferType::Guest)};
@@ -1198,10 +1265,11 @@ bool LowerIndexFetch(CompiledShader& shader, IR::Program& program, const IndexFe
                 const auto value = IR::U32{ir.Select(valid, loaded, ir.Imm32(0u))};
                 index = ir.BitwiseOr(index, ir.ShiftLeftLogical(value, ir.Imm32(byte * 8)));
             }
-            const auto valid_index = ir.ILessThan(
-                vertex, ir.Imm32(std::min(indices.count,
-                                          (indices.size - indices.prefix) / indices.element_size)),
-                false);
+            const auto valid_index =
+                ir.ILessThan(vertex,
+                             ir.Imm32(std::min(indices.count, (indices.size - indices.prefix) /
+                                                                  indices.element_size)),
+                             false);
             index = IR::U32{ir.Select(valid_index, index, ir.Imm32(0u))};
             inst.ReplaceUsesWithAndRemove(
                 ir.IAdd(index, ir.GetAttributeU32(IR::Attribute::BaseVertex)));
@@ -1214,10 +1282,11 @@ VideoCore::ImageInfo ShaderImageLayout(const AmdGpu::Image& sharp,
     const auto format = sharp.GetDataFmt();
     if (AmdGpu::IsFmask(format)) {
         const auto type = sharp.GetType();
-        if (sharp.compression_en || resource.is_written || resource.is_feedback ||
-            sharp.base_level || sharp.last_level || sharp.GetNumberFmt() != AmdGpu::NumberFormat::Uint ||
+        if (sharp.compression_en || resource.is_feedback || sharp.base_level || sharp.last_level ||
+            sharp.GetNumberFmt() != AmdGpu::NumberFormat::Uint ||
             (type != AmdGpu::ImageType::Color2D && type != AmdGpu::ImageType::Color2DArray))
-            throw std::runtime_error("D3D12 FMASK read requires an uncompressed integer 2D view");
+            throw std::runtime_error(
+                "D3D12 FMASK access requires an uncompressed integer 2D view without feedback");
         auto storage = sharp;
         storage.data_format = u64(GetFmaskFormat(format).storage);
         return VideoCore::ImageInfo{storage, false};
@@ -1295,10 +1364,27 @@ bool LowerImageBufferAliases(CompiledShader& shader, IR::Program& program,
     std::vector<VideoCore::ImageInfo> layouts;
     for (const auto& image : info.images)
         layouts.push_back(ShaderImageLayout(image.GetSharp(info), image));
-    const auto supports_view = [&](u32 index, D3D12_FORMAT_SUPPORT1 usage) {
+    std::vector<StorageImagePolicy::Operations> image_operations(info.images.size());
+    for (const auto* block : program.blocks) {
+        for (const auto& inst : block->Instructions()) {
+            const auto opcode = inst.GetOpcode();
+            if (opcode == IR::Opcode::ImageRead) {
+                image_operations[inst.Arg(0).U32()].load = true;
+            } else if (opcode == IR::Opcode::ImageWrite) {
+                image_operations[inst.Arg(0).U32()].store = true;
+            } else if (Optimization::IsImageAtomicInstruction(inst)) {
+                image_operations[inst.Arg(0).U32()].atomic = true;
+            } else if (IsSampledInstruction(opcode)) {
+                image_operations[inst.Arg(0).U32() & 0xffff].load = true;
+            }
+        }
+    }
+    const auto supports_view = [&](u32 index, D3D12_FORMAT_SUPPORT1 usage,
+                                   bool allow_write_only_typed_store = false) {
         if (!device)
-            return true;
+            return !allow_write_only_typed_store;
         const auto& resource = info.images[index];
+        const auto sharp = resource.GetSharp(info);
         DXGI_FORMAT format{};
         try {
             format = ConvertFormat(layouts[index].pixel_format);
@@ -1315,9 +1401,8 @@ bool LowerImageBufferAliases(CompiledShader& shader, IR::Program& program,
             return false;
         }
         if (resource.is_depth)
-            format = resource.GetSharp(info).GetDataFmt() == AmdGpu::DataFormat::Format16
-                         ? DXGI_FORMAT_R16_UNORM
-                         : DXGI_FORMAT_R32_FLOAT;
+            format = sharp.GetDataFmt() == AmdGpu::DataFormat::Format16 ? DXGI_FORMAT_R16_UNORM
+                                                                        : DXGI_FORMAT_R32_FLOAT;
         if ((resource.is_written || resource.is_feedback) &&
             format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
             format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -1327,16 +1412,35 @@ bool LowerImageBufferAliases(CompiledShader& shader, IR::Program& program,
             return false;
         if ((support.Support1 & usage) != usage)
             return false;
-        if (resource.is_written || resource.is_feedback || resource.is_atomic)
-            return (support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) &&
-                   (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD) &&
-                   (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
+        if (resource.is_written || resource.is_feedback || resource.is_atomic) {
+            const bool typed_view =
+                (support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) != 0;
+            const bool typed_load = (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD) != 0;
+            const bool typed_store =
+                (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0;
+            const bool format_supported =
+                IsWriteOnlyTypedStoreFormat(sharp.GetDataFmt(), sharp.GetNumberFmt());
+            const bool store_only =
+                allow_write_only_typed_store && resource.is_written &&
+                StorageImagePolicy::IsWriteOnlyTypedStoreCandidate(
+                    format_supported, resource.is_depth,
+                    {.load = image_operations[index].load,
+                     .store = image_operations[index].store,
+                     .feedback = resource.is_feedback,
+                     .atomic = resource.is_atomic || image_operations[index].atomic});
+            const StorageImagePolicy::TypedUavSupport typed_support{typed_view, typed_load,
+                                                                    typed_store};
+            return store_only ? StorageImagePolicy::SupportsWriteOnlyTypedUav(device != nullptr,
+                                                                              typed_support)
+                              : StorageImagePolicy::SupportsTypedUav(typed_support, true, true);
+        }
         return true;
     };
     const u32 original_buffers = info.buffers.size();
     for (u32 i = 0; i < info.images.size(); ++i) {
         const auto sharp = info.images[i].GetSharp(info);
         const auto format = sharp.GetDataFmt();
+        const auto number_format = sharp.GetNumberFmt();
         const auto type = sharp.GetViewType(info.images[i].is_array);
         const bool storage =
             info.images[i].is_written || info.images[i].is_feedback || info.images[i].is_atomic;
@@ -1344,11 +1448,28 @@ bool LowerImageBufferAliases(CompiledShader& shader, IR::Program& program,
             type == AmdGpu::ImageType::Color2DMsaa || type == AmdGpu::ImageType::Color2DMsaaArray;
         const auto dimension = type == AmdGpu::ImageType::Color3D ? D3D12_FORMAT_SUPPORT1_TEXTURE3D
                                                                   : D3D12_FORMAT_SUPPORT1_TEXTURE2D;
+        const StorageImagePolicy::Operations operations{
+            .load = image_operations[i].load,
+            .store = image_operations[i].store,
+            .feedback = info.images[i].is_feedback,
+            .atomic = info.images[i].is_atomic || image_operations[i].atomic,
+        };
+        const bool typed_store_format_supported =
+            IsWriteOnlyTypedStoreFormat(format, number_format);
+        const bool write_only_typed_store =
+            info.images[i].is_written && layouts[i].num_samples == 1 &&
+            StorageImagePolicy::IsWriteOnlyTypedStoreCandidate(typed_store_format_supported,
+                                                               info.images[i].is_depth, operations);
+        const bool force_shared_r16_store_fallback =
+            StorageImagePolicy::RequiresSharedR16StoreFallback(
+                format == AmdGpu::DataFormat::Format16, typed_store_format_supported,
+                info.images[i].is_depth, layouts[i].num_samples == 1, operations);
         selected[i] =
-            AmdGpu::IsFmask(format) ||
-            (multisampled && (storage || sharp.NumSamples() == 1)) ||
+            AmdGpu::IsFmask(format) || (multisampled && (storage || sharp.NumSamples() == 1)) ||
             (storage && type == AmdGpu::ImageType::Cube) || info.images[i].is_atomic ||
-            !supports_view(i, dimension) || format == AmdGpu::DataFormat::FormatGB_GR ||
+            image_operations[i].atomic || force_shared_r16_store_fallback ||
+            !supports_view(i, dimension, write_only_typed_store) ||
+            format == AmdGpu::DataFormat::FormatGB_GR ||
             format == AmdGpu::DataFormat::FormatBG_RG || format == AmdGpu::DataFormat::Format8_24 ||
             format == AmdGpu::DataFormat::Format24_8 ||
             format == AmdGpu::DataFormat::FormatX24_8_32 ||
@@ -1395,8 +1516,8 @@ bool LowerImageBufferAliases(CompiledShader& shader, IR::Program& program,
                                             : D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE;
             if (!supports_view(handle & 0xffff, usage))
                 selected[handle & 0xffff] = true;
-            if (gradient_compare ||
-                (inst.GetOpcode() == IR::Opcode::ImageSampleDrefImplicitLod && !inst.Arg(5).IsEmpty()))
+            if (gradient_compare || (inst.GetOpcode() == IR::Opcode::ImageSampleDrefImplicitLod &&
+                                     !inst.Arg(5).IsEmpty()))
                 selected[handle & 0xffff] = true;
             const auto sampler = info.samplers[handle >> 16].GetSharp(info);
             const auto manual_mode = [](AmdGpu::ClampMode mode) {
@@ -1597,10 +1718,18 @@ bool LowerImageBufferAliases(CompiledShader& shader, IR::Program& program,
                 continue;
             }
             if (AmdGpu::IsFmask(image.sharp.GetDataFmt())) {
-                if (opcode != IR::Opcode::ImageRead || !inst.Arg(2).IsEmpty())
+                if (opcode == IR::Opcode::ImageRead && inst.Arg(2).IsEmpty()) {
+                    ir.DeviceMemoryBarrier();
+                    inst.ReplaceUsesWithAndRemove(LoadFmask(ir, image, inst.Arg(1)));
+                } else if (opcode == IR::Opcode::ImageWrite && inst.Arg(2).IsEmpty() &&
+                           inst.Arg(3).IsEmpty()) {
+                    ir.DeviceMemoryBarrier();
+                    StoreFmask(ir, image, inst.Arg(1), inst.Arg(4));
+                    ir.DeviceMemoryBarrier();
+                    inst.Invalidate();
+                } else {
                     throw std::runtime_error("Unsupported D3D12 FMASK access");
-                ir.DeviceMemoryBarrier();
-                inst.ReplaceUsesWithAndRemove(LoadFmask(ir, image, inst.Arg(1)));
+                }
                 continue;
             }
             const auto sampled = IsSampledInstruction(opcode);
@@ -1638,6 +1767,7 @@ bool LowerImageBufferAliases(CompiledShader& shader, IR::Program& program,
             const auto data = ir.Imm32(image.data);
             ir.DeviceMemoryBarrier();
             if (opcode == IR::Opcode::ImageRead) {
+                const auto read_info = inst.Flags<IR::TextureInstInfo>();
                 auto value = [&] {
                     if (!image.info.props.is_block)
                         return LoadTexel(ir, image, IR::U32{address});
@@ -1654,7 +1784,10 @@ bool LowerImageBufferAliases(CompiledShader& shader, IR::Program& program,
                 };
                 value =
                     ir.CompositeConstruct(component(0), component(1), component(2), component(3));
-                if (!image.resource.is_written && !image.resource.is_feedback) {
+                // ImageSampleRaw MSAA reaches this alias as ImageRead and bypasses
+                // the shared storage swizzle.
+                if ((!image.resource.is_written && !image.resource.is_feedback) ||
+                    read_info.is_sampled_read) {
                     if (image.sharp.GetNumberFmt() == AmdGpu::NumberFormat::Srgb)
                         value = IR::ApplyForceDegamma(ir, value);
                     value = IR::ApplySwizzle(ir, value, image.sharp.DstSelect(),

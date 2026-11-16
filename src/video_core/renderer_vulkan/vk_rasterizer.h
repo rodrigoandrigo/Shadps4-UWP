@@ -102,6 +102,7 @@ public:
 
     u64 Flush() override;
     void Finish() override;
+    void PreparePredicateRead(VAddr address, u64 size) override;
     void RequestFlush(u64 tick) override;
     void FlushRequested(bool force = false) override;
     void MarkAsGuestMemoryChanged(VAddr address, const void* data, u64 size) override;

@@ -105,6 +105,7 @@ private:
     std::optional<std::filesystem::path> ResolveCaseInsensitive(std::string_view rel_path) const;
     std::filesystem::path m_root;
     bool m_read_only;
+    std::unique_ptr<HostFsBackend> m_metadata;
     mutable std::mutex m_case_cache_mutex;
     mutable tsl::robin_map<std::string, std::filesystem::path> m_case_cache;
 };

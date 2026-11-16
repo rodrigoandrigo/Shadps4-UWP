@@ -93,6 +93,8 @@ bool Inst::MayHaveSideEffects() const noexcept {
     case Opcode::SharedAtomicUMax32:
     case Opcode::SharedAtomicInc32:
     case Opcode::SharedAtomicDec32:
+    case Opcode::SharedAtomicIncLimit32:
+    case Opcode::SharedAtomicDecLimit32:
     case Opcode::SharedAtomicAnd32:
     case Opcode::SharedAtomicOr32:
     case Opcode::SharedAtomicXor32:

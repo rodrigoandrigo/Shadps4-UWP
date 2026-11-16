@@ -48,8 +48,9 @@
 #include "core/libraries/ime/ime_dialog.h"
 #endif
 #include "core/libraries/music/music_player_service.h"
-#include "core/libraries/np/np_handler/np_handler.h"
+#include "core/libraries/net/net_discovery.h"
 #include "core/libraries/np/np_auth/np_auth.h"
+#include "core/libraries/np/np_handler/np_handler.h"
 #include "core/libraries/np/np_trophy.h"
 #include "core/libraries/save_data/save_backup.h"
 #include "core/libraries/usbd/usbstorage.h"
@@ -110,6 +111,7 @@ Emulator::Emulator() {
 }
 
 Emulator::~Emulator() {
+    Libraries::Net::DiscoveryResponder::Instance().Stop();
 #ifdef SHADPS4_UWP
     WSACleanup();
 #endif
@@ -120,6 +122,7 @@ void Emulator::Shutdown() {
     if (exit_done) {
         return;
     }
+    Libraries::Net::DiscoveryResponder::Instance().Stop();
     Common::Log::Flush();
     Libraries::SaveData::Backup::StopThread();
     Libraries::MusicPlayerService::Shutdown();
@@ -844,6 +847,10 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
 #endif
 
+    if (EmulatorSettings.IsConnectedToNetwork() && EmulatorSettings.IsDeviceDiscoveryEnabled()) {
+        Libraries::Net::DiscoveryResponder::Instance().Start();
+    }
+
     if (!id.empty()) {
         start_time = std::chrono::steady_clock::now();
 
@@ -872,6 +879,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
 #ifdef SHADPS4_UWP
 void Emulator::StopGuest() {
+    Libraries::Net::DiscoveryResponder::Instance().Stop();
     AddressSpace::StopPager();
     Uwp::SetGuestReady(false);
     Uwp::StopGuestWorkers();

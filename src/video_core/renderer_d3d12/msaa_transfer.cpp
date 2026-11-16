@@ -138,8 +138,8 @@ std::vector<u8> MsaaTransfer::Compile(std::string_view source, const wchar_t* ta
 MsaaTransfer::Pipeline& MsaaTransfer::GetPipeline(DXGI_FORMAT format, u32 samples, bool integer,
                                                   bool depth, bool upload, bool stencil,
                                                   DXGI_FORMAT dsv_format, bool resolve) {
-    const auto key = std::tuple{format, samples, integer, depth, upload, stencil, dsv_format,
-                                resolve};
+    const auto key =
+        std::tuple{format, samples, integer, depth, upload, stencil, dsv_format, resolve};
     if (const auto found = pipelines.find(key); found != pipelines.end())
         return found->second;
     if (pipelines.size() >= 128)
@@ -240,13 +240,13 @@ void MsaaTransfer::RecordResolve(ID3D12GraphicsCommandList* commands, ID3D12Reso
                                  ID3D12Resource* fmask, DXGI_FORMAT format, u32 width, u32 height,
                                  u32 layers) {
     const u32 samples = source->GetDesc().SampleDesc.Count;
-    auto& pipeline = GetPipeline(format, samples, false, false, false, false,
-                                 DXGI_FORMAT_UNKNOWN, true);
+    auto& pipeline =
+        GetPipeline(format, samples, false, false, false, false, DXGI_FORMAT_UNKNOWN, true);
     if (!resources.resolve_descriptors.Heap()) {
-        resources.resolve_descriptors.Initialize(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                                                  2, true);
+        resources.resolve_descriptors.Initialize(device.Get(),
+                                                 D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, true);
         resources.resolve_targets.Initialize(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, layers,
-                                              false);
+                                             false);
     }
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;

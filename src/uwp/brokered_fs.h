@@ -45,6 +45,7 @@ private:
 class BrokeredFsBackend final : public FileSys::IBackend {
 public:
     BrokeredFsBackend(void* folder, bool read_only);
+    explicit BrokeredFsBackend(std::filesystem::path directory);
     bool Exists(std::string_view relative) override;
     bool IsDirectory(std::string_view relative) override;
     std::unique_ptr<FileSys::IFile> Open(std::string_view relative,
@@ -68,6 +69,7 @@ private:
     winrt::Windows::Storage::StorageFolder root{nullptr};
     winrt::com_ptr<IStorageFolderHandleAccess> folder_access;
     std::filesystem::path direct_root;
+    std::shared_ptr<FileSys::IBackend> native_backend;
     std::shared_ptr<BrokeredFsBackend> metadata;
     bool read_only;
 };

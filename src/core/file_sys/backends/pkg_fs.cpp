@@ -17,7 +17,7 @@ std::string Normalize(std::string_view path) {
         const auto part =
             path.substr(start, end == std::string_view::npos ? path.size() - start : end - start);
         if (part == ".." || part.find_first_of("\\:\0", 0, 3) != std::string_view::npos)
-            throw std::invalid_argument("Caminho PKG inválido.");
+            throw std::invalid_argument("Invalid PKG path.");
         if (!part.empty() && part != ".") {
             if (!result.empty())
                 result += '/';
@@ -137,11 +137,26 @@ PkgBackend::PkgBackend(std::unique_ptr<IFile> source) {
             files.emplace(Normalize(path), node->size);
     }
     for (const auto& [id, path] :
-         {std::pair{0x1000U, "sce_sys/param.sfo"}, std::pair{0x1200U, "sce_sys/icon0.png"}}) {
+         {std::pair{0x402U, "sce_sys/nptitle.dat"}, std::pair{0x403U, "sce_sys/npbind.dat"},
+          std::pair{0x1000U, "sce_sys/param.sfo"}, std::pair{0x1001U, "sce_sys/playgo-chunk.dat"},
+          std::pair{0x1002U, "sce_sys/playgo-chunk.sha"},
+          std::pair{0x1003U, "sce_sys/playgo-manifest.xml"},
+          std::pair{0x1200U, "sce_sys/icon0.png"}}) {
         if (files.contains(path))
             continue;
         std::vector<u8> bytes;
         if (reader->ReadPkgEntry(id, bytes) >= 0) {
+            files.emplace(path, bytes.size());
+            metadata.emplace(path, std::move(bytes));
+        }
+    }
+    for (u32 index = 0; index < 128; ++index) {
+        const auto number = std::to_string(index);
+        const auto path = "sce_sys/trophy/trophy" + (index < 10 ? "0" + number : number) + ".trp";
+        if (files.contains(path))
+            continue;
+        std::vector<u8> bytes;
+        if (reader->ReadPkgEntry(0x1400U + index, bytes) >= 0) {
             files.emplace(path, bytes.size());
             metadata.emplace(path, std::move(bytes));
         }
@@ -219,7 +234,7 @@ FileStat PkgBackend::Stat(std::string_view relative) const {
     else if (const auto found = files.find(path); found != files.end())
         result.size = found->second;
     else
-        throw std::runtime_error("Arquivo não encontrado no PKG.");
+        throw std::runtime_error("File not found in PKG.");
     result.inode = GetGuestInode(FileIdentity{
         .kind = FileIdentity::Kind::VirtualFile,
         .host = {.device = source_inode},

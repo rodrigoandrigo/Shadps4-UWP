@@ -7,7 +7,6 @@
 #include "uwp/session.h"
 #include "uwp/shadps4_api.h"
 #endif
-#include <xxhash.h>
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
@@ -15,11 +14,12 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include <xxhash.h>
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 22u;
-static constexpr u32 ShaderMetaVersion = 15u;
+static constexpr u32 ShaderBinaryVersion = 24u;
+static constexpr u32 ShaderMetaVersion = 17u;
 static constexpr u32 PipelineKeyVersion = 6u;
 } // namespace Serialization
 
@@ -148,9 +148,8 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     modules.fill({});
     runtime_infos = {};
     compute_key.Deserialize(ar);
-    if (const auto found = compute_pipelines.find(compute_key); found != compute_pipelines.end()) {
+    if (const auto found = compute_pipelines.find(compute_key); found != compute_pipelines.end())
         return found->second != nullptr;
-    }
 
     ComputePipeline::SerializationSupport sdata{};
     sdata.Deserialize(ar);
@@ -226,10 +225,8 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     modules.fill({});
     runtime_infos = {};
     graphics_key.Deserialize(ar);
-    if (const auto found = graphics_pipelines.find(graphics_key);
-        found != graphics_pipelines.end()) {
+    if (const auto found = graphics_pipelines.find(graphics_key); found != graphics_pipelines.end())
         return found->second != nullptr;
-    }
 
     GraphicsPipeline::SerializationSupport sdata{};
     sdata.Deserialize(ar);
@@ -378,6 +375,8 @@ void PipelineCache::WarmUp() {
             });
         }
 #ifdef SHADPS4_UWP
+        if (Core::Uwp::StopRequested())
+            throw std::runtime_error("Shader compilation canceled");
         completed = true;
 #endif
     };
@@ -478,7 +477,7 @@ void PipelineCache::WarmUp() {
 }
 
 void PipelineCache::Sync() {
-    ReapPendingPipelines(true);
+    DrainCompileTasks();
     SaveDriverCache();
     Storage::DataBase::Instance().Close();
 }
@@ -511,6 +510,7 @@ void PipelineCache::LoadDriverCache() {
 }
 
 void PipelineCache::SaveDriverCache() {
+    std::scoped_lock lock{driver_cache_mutex};
     auto& storage = Storage::DataBase::Instance();
     if (!storage.IsOpened() || !pipeline_cache)
         return;

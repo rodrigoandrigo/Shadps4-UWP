@@ -381,6 +381,15 @@ U32U64 IREmitter::SharedAtomicXor(const U32& address, const U32U64& data, bool i
     }
 }
 
+U32 IREmitter::SharedAtomicSwap(const U32& address, const U32& value, bool is_gds) {
+    return Inst<U32>(Opcode::SharedAtomicSwap32, Flags{is_gds}, address, value);
+}
+
+U32 IREmitter::SharedAtomicMskor32(const U32& address, const U32& data0, const U32& data1,
+                                   bool is_gds) {
+    return Inst<U32>(Opcode::SharedAtomicMskor32, Flags{is_gds}, address, data0, data1);
+}
+
 U32U64 IREmitter::SharedAtomicISub(const U32& address, const U32U64& data, bool is_gds) {
     switch (data.Type()) {
     case Type::U32:
@@ -417,6 +426,14 @@ U64 IREmitter::SharedAtomicInc(const U32& address, bool is_gds) {
 template <>
 U32 IREmitter::SharedAtomicDec(const U32& address, bool is_gds) {
     return Inst<U32>(Opcode::SharedAtomicDec32, Flags{is_gds}, address);
+}
+
+U32 IREmitter::SharedAtomicIncLimit32(const U32& address, const U32& limit, bool is_gds) {
+    return Inst<U32>(Opcode::SharedAtomicIncLimit32, Flags{is_gds}, address, limit);
+}
+
+U32 IREmitter::SharedAtomicDecLimit32(const U32& address, const U32& limit, bool is_gds) {
+    return Inst<U32>(Opcode::SharedAtomicDecLimit32, Flags{is_gds}, address, limit);
 }
 
 template <>
@@ -631,6 +648,11 @@ Value IREmitter::BufferAtomicXor(const Value& handle, const Value& address, cons
 Value IREmitter::BufferAtomicSwap(const Value& handle, const Value& address, const Value& value,
                                   BufferInstInfo info) {
     return Inst(Opcode::BufferAtomicSwap32, Flags{info}, handle, address, value);
+}
+
+Value IREmitter::BufferAtomicMskor(const Value& handle, const Value& address, const Value& data0,
+                                   const Value& data1, BufferInstInfo info) {
+    return Inst(Opcode::BufferAtomicMskor32, Flags{info}, handle, address, data0, data1);
 }
 
 Value IREmitter::BufferAtomicCmpSwap(const Value& handle, const Value& address, const Value& vdata,

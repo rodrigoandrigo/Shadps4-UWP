@@ -821,8 +821,11 @@ bool Liverpool::TrySetPredication(const PM4Header* header) {
     if (!address || address % alignment)
         throw std::runtime_error("Invalid SET_PREDICATION address");
     VideoCore::StreamCopyLane::Instance().DrainProducer();
-    if (rasterizer)
-        rasterizer->Finish();
+    if (rasterizer) {
+        const u64 size = operation == 1 ? num_counter_pairs * 16 :
+                         operation == 2 ? 32 : operation == 3 ? 8 : 4;
+        rasterizer->PreparePredicateRead(address, size);
+    }
     bool visible{}, ready = true;
     const auto* values = reinterpret_cast<const volatile u64*>(address);
     constexpr u64 valid = u64{1} << 63;
@@ -1100,10 +1103,11 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
             }
             if (rasterizer) {
                 marked("DrawIndirectCountMulti", header, [&] {
-                    rasterizer->DrawIndirect(false, indirect_args_addr, offset,
-                                             draw_indirect->stride, draw_indirect->count,
-                                             draw_indirect->count_addr, draw_indirect->base_vtx_loc,
-                                             draw_indirect->start_inst_loc);
+                    rasterizer->DrawIndirectWithDrawIndex(
+                        false, indirect_args_addr, offset, draw_indirect->stride,
+                        draw_indirect->count, draw_indirect->count_addr,
+                        draw_indirect->base_vtx_loc, draw_indirect->start_inst_loc,
+                        draw_indirect->draw_index_loc, draw_indirect->draw_index_enable.Value());
                 });
             }
             break;
@@ -1174,13 +1178,15 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
             }
             if (rasterizer) {
                 marked("DrawIndexIndirectCountMulti", header, [&] {
-                    rasterizer->DrawIndirect(
+                    rasterizer->DrawIndirectWithDrawIndex(
                         true, indirect_args_addr, offset, draw_index_indirect->stride,
                         draw_index_indirect->count,
                         draw_index_indirect->count_indirect_enable.Value()
                             ? draw_index_indirect->count_addr
                             : 0,
-                        draw_index_indirect->base_vtx_loc, draw_index_indirect->start_inst_loc);
+                        draw_index_indirect->base_vtx_loc, draw_index_indirect->start_inst_loc,
+                        draw_index_indirect->draw_index_loc,
+                        draw_index_indirect->draw_index_enable.Value());
                 });
             }
             break;

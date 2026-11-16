@@ -102,6 +102,14 @@ Id AtomicUpdate(EmitContext& ctx, Id pointer, Update update) {
     return ctx.OpPhi(ctx.U32[1], expected, body);
 }
 
+Id AtomicMskor(EmitContext& ctx, Id pointer, Id data0, Id data1) {
+    return AtomicUpdate(ctx, pointer, [&](Id old) {
+        const Id inverted_data0 = ctx.OpNot(ctx.U32[1], data0);
+        const Id xnor = ctx.OpBitwiseXor(ctx.U32[1], old, inverted_data0);
+        return ctx.OpBitwiseOr(ctx.U32[1], xnor, data1);
+    });
+}
+
 Id FloatCompare(EmitContext& ctx, Id lhs, Id rhs, bool equal, bool maximum = false) {
     const Id lhs_mag = ctx.OpBitwiseAnd(ctx.U32[1], lhs, ctx.ConstU32(0x7fffffffu));
     const Id rhs_mag = ctx.OpBitwiseAnd(ctx.U32[1], rhs, ctx.ConstU32(0x7fffffffu));
@@ -331,6 +339,17 @@ Id EmitSharedAtomicXor64(EmitContext& ctx, Id offset, Id value) {
     return SharedAtomicU64(ctx, offset, value, &Sirit::Module::OpAtomicXor);
 }
 
+Id EmitSharedAtomicSwap32(EmitContext& ctx, Id offset, Id value) {
+    return SharedAtomicU32(ctx, offset, value, &Sirit::Module::OpAtomicExchange);
+}
+
+Id EmitSharedAtomicMskor32(EmitContext& ctx, Id offset, Id data0, Id data1) {
+    const Id shift_id{ctx.ConstU32(2U)};
+    const Id index{ctx.OpShiftRightLogical(ctx.U32[1], offset, shift_id)};
+    const Id pointer{ctx.EmitSharedMemoryAccess(ctx.shared_u32, ctx.shared_memory_u32, index)};
+    return AtomicMskor(ctx, pointer, data0, data1);
+}
+
 Id EmitSharedAtomicISub32(EmitContext& ctx, Id offset, Id value) {
     return SharedAtomicU32(ctx, offset, value, &Sirit::Module::OpAtomicISub);
 }
@@ -357,6 +376,20 @@ Id EmitSharedAtomicInc64(EmitContext& ctx, Id offset) {
 
 Id EmitSharedAtomicDec32(EmitContext& ctx, Id offset) {
     return SharedAtomicU32IncDec(ctx, offset, &Sirit::Module::OpAtomicIDecrement);
+}
+
+Id EmitSharedAtomicIncLimit32(EmitContext& ctx, Id offset, Id limit) {
+    const Id shift_id{ctx.ConstU32(2U)};
+    const Id index{ctx.OpShiftRightLogical(ctx.U32[1], offset, shift_id)};
+    const Id pointer{ctx.EmitSharedMemoryAccess(ctx.shared_u32, ctx.shared_memory_u32, index)};
+    return AtomicIncDec(ctx, pointer, limit, false);
+}
+
+Id EmitSharedAtomicDecLimit32(EmitContext& ctx, Id offset, Id limit) {
+    const Id shift_id{ctx.ConstU32(2U)};
+    const Id index{ctx.OpShiftRightLogical(ctx.U32[1], offset, shift_id)};
+    const Id pointer{ctx.EmitSharedMemoryAccess(ctx.shared_u32, ctx.shared_memory_u32, index)};
+    return AtomicIncDec(ctx, pointer, limit, true);
 }
 
 Id EmitSharedAtomicDec64(EmitContext& ctx, Id offset) {
@@ -451,6 +484,11 @@ Id EmitBufferAtomicXor32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id addres
 
 Id EmitBufferAtomicSwap32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
     return BufferAtomicU32(ctx, inst, handle, address, value, &Sirit::Module::OpAtomicExchange);
+}
+
+Id EmitBufferAtomicMskor32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id data0,
+                           Id data1) {
+    return AtomicMskor(ctx, BufferAtomicPointer(ctx, handle, address), data0, data1);
 }
 
 Id EmitBufferAtomicCmpSwap32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value,

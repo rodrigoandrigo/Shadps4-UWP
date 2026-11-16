@@ -320,8 +320,7 @@ Id EmitImageQueryLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, co
 }
 
 Id EmitImageGradient(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id derivatives_dx,
-                     Id derivatives_dy, const IR::Value& offset,
-                     const IR::Value& depth_and_clamp) {
+                     Id derivatives_dy, const IR::Value& offset, const IR::Value& depth_and_clamp) {
     RequireSampledReadOnly(ctx, handle);
     const auto& texture = ctx.images[handle & 0xFFFF];
     const auto flags = inst->Flags<IR::TextureInstInfo>();
@@ -345,8 +344,8 @@ Id EmitImageGradient(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id
     }
     if (comparison) {
         const Id dref = ctx.OpCompositeExtract(ctx.F32[1], ctx.Def(depth_and_clamp), 0);
-        const Id sample = ctx.OpImageSampleDrefExplicitLod(
-            result_type, sampled_image, fixed_coords, dref, operands.mask, operands.operands);
+        const Id sample = ctx.OpImageSampleDrefExplicitLod(result_type, sampled_image, fixed_coords,
+                                                           dref, operands.mask, operands.operands);
         const Id value = texture.is_integer ? ctx.OpBitcast(ctx.F32[1], sample) : sample;
         return ctx.OpCompositeConstruct(ctx.F32[4], value, ctx.f32_zero_value, ctx.f32_zero_value,
                                         ctx.f32_zero_value);

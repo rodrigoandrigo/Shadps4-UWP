@@ -8,6 +8,7 @@ $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer
 $visualStudio = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 Import-Module (Join-Path $visualStudio 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
 Enter-VsDevShell -VsInstallPath $visualStudio -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64 -vcvars_ver=$VCToolsVersion" | Out-Null
+$env:VSLANG = '1033'
 if (!$env:VCToolsVersion -or !$env:VCToolsVersion.StartsWith($VCToolsVersion)) {
     throw "MSVC toolset $VCToolsVersion is required for Dozen."
 }

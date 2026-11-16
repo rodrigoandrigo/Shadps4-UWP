@@ -127,13 +127,11 @@ Id EmitFPLog2(EmitContext& ctx, Id value) {
 }
 
 Id EmitFPDdx(EmitContext& ctx, Id value) {
-    ctx.AddCapability(spv::Capability::DerivativeControl);
-    return ctx.OpDPdxCoarse(ctx.F32[1], value);
+    return ctx.OpDPdx(ctx.F32[1], value);
 }
 
 Id EmitFPDdy(EmitContext& ctx, Id value) {
-    ctx.AddCapability(spv::Capability::DerivativeControl);
-    return ctx.OpDPdyCoarse(ctx.F32[1], value);
+    return ctx.OpDPdy(ctx.F32[1], value);
 }
 
 Id EmitFPRecip32(EmitContext& ctx, Id value) {

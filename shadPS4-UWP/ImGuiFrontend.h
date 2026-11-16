@@ -212,6 +212,7 @@ class ImGuiFrontend : public std::enable_shared_from_this<ImGuiFrontend> {
     decltype(&shadps4_set_setting) set_setting{};
     decltype(&shadps4_reset_settings) reset_settings{};
     decltype(&shadps4_mount_storage_folder) mount{};
+    decltype(&shadps4_mount_xbox_games) mount_xbox_games{};
     decltype(&shadps4_mount_pkg) mount_pkg{};
     decltype(&shadps4_mount_pkg_file) mount_pkg_file{};
     decltype(&shadps4_storage_enumerate) enumerate{};

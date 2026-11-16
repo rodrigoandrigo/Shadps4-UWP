@@ -341,13 +341,19 @@ void EmitContext::DefineInputs() {
 
         std::vector<VertexInputSnapshot> live_inputs;
         if (!vertex_inputs) {
-            Shader::Gcn::FetchShaderData fetch_shader;
-            if (info.has_inline_fetch_shader || !Gcn::ParseFetchShader(info, fetch_shader)) {
+            Shader::Gcn::FetchShaderData parsed_fetch_shader;
+            const auto* fetch_shader = info.emit_fetch_shader;
+            if (info.has_inline_fetch_shader ||
+                (!fetch_shader && !Gcn::ParseFetchShader(info, parsed_fetch_shader))) {
                 break;
             }
-            for (const auto& attrib : fetch_shader.attributes) {
-                live_inputs.push_back(
-                    {attrib.GetSharp(info), attrib.GetStepRate() != Gcn::VertexAttribute::None});
+            if (!fetch_shader)
+                fetch_shader = &parsed_fetch_shader;
+            for (u32 index = 0; index < fetch_shader->attributes.size(); ++index) {
+                const auto& attrib = fetch_shader->attributes[index];
+                live_inputs.push_back({info.emit_fetch_shader ? info.emit_vertex_sharps[index]
+                                                              : attrib.GetSharp(info),
+                                       attrib.GetStepRate() != Gcn::VertexAttribute::None});
             }
         }
         const auto& inputs = vertex_inputs ? *vertex_inputs : live_inputs;

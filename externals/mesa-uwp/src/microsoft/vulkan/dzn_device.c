@@ -741,7 +741,7 @@ dzn_physical_device_init_uuids(struct dzn_physical_device *pdev)
    _mesa_blake3_update(&blake3_ctx, &pdev->shader_model,
       offsetof(struct dzn_physical_device, options21) + sizeof(pdev->options21) -
                      offsetof(struct dzn_physical_device, shader_model));
-   const uint32_t runtime_layout_version = 34;
+   const uint32_t runtime_layout_version = 35;
    _mesa_blake3_update(&blake3_ctx, &runtime_layout_version, sizeof(runtime_layout_version));
    bool raw_lowering = dzn_raw_image_lowering_enabled();
    _mesa_blake3_update(&blake3_ctx, &raw_lowering, sizeof(raw_lowering));
@@ -1401,13 +1401,40 @@ dzn_physical_device_get_api_version(const struct dzn_physical_device *pdev)
    return VK_MAKE_VERSION(1, 2, VK_HEADER_VERSION);
 }
 
+static VkSampleCountFlags
+dzn_physical_device_get_sample_counts(const struct dzn_physical_device *pdev,
+                                      DXGI_FORMAT format)
+{
+   VkSampleCountFlags counts = VK_SAMPLE_COUNT_1_BIT;
+   for (uint32_t samples = 2; samples <= 32; samples <<= 1) {
+      D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS info = {
+         .Format = format,
+         .SampleCount = samples,
+      };
+      HRESULT result = ID3D12Device1_CheckFeatureSupport(
+         pdev->dev, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &info, sizeof(info));
+      if (SUCCEEDED(result) && info.NumQualityLevels)
+         counts |= samples;
+   }
+   return counts;
+}
+
 static void
 dzn_physical_device_get_properties(const struct dzn_physical_device *pdev,
                                    struct vk_properties *properties)
 {
    struct dzn_instance *instance = container_of(pdev->vk.instance, struct dzn_instance, vk);
-   /* minimum from the D3D and Vulkan specs */
-   const VkSampleCountFlags supported_sample_counts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
+   const VkSampleCountFlags color_sample_counts =
+      dzn_physical_device_get_sample_counts(pdev, DXGI_FORMAT_R8G8B8A8_UNORM) &
+      dzn_physical_device_get_sample_counts(pdev, DXGI_FORMAT_R16G16B16A16_FLOAT);
+   const VkSampleCountFlags depth_sample_counts =
+      dzn_physical_device_get_sample_counts(pdev, DXGI_FORMAT_D16_UNORM) &
+      dzn_physical_device_get_sample_counts(pdev, DXGI_FORMAT_D32_FLOAT);
+   const VkSampleCountFlags stencil_sample_counts =
+      dzn_physical_device_get_sample_counts(pdev, DXGI_FORMAT_D24_UNORM_S8_UINT) &
+      dzn_physical_device_get_sample_counts(pdev, DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
+   const VkSampleCountFlags supported_sample_counts =
+      color_sample_counts & depth_sample_counts & stencil_sample_counts;
 
    VkPhysicalDeviceType devtype = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
    if (pdev->desc.is_warp)
@@ -1543,15 +1570,15 @@ dzn_physical_device_get_properties(const struct dzn_physical_device *pdev,
       .maxFramebufferWidth = D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION,
       .maxFramebufferHeight = D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION,
       .maxFramebufferLayers = D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION,
-      .framebufferColorSampleCounts = supported_sample_counts,
-      .framebufferDepthSampleCounts = supported_sample_counts,
-      .framebufferStencilSampleCounts = supported_sample_counts,
+      .framebufferColorSampleCounts = color_sample_counts,
+      .framebufferDepthSampleCounts = depth_sample_counts,
+      .framebufferStencilSampleCounts = stencil_sample_counts,
       .framebufferNoAttachmentsSampleCounts = supported_sample_counts,
       .maxColorAttachments = MAX_RTS,
-      .sampledImageColorSampleCounts = supported_sample_counts,
+      .sampledImageColorSampleCounts = color_sample_counts,
       .sampledImageIntegerSampleCounts = VK_SAMPLE_COUNT_1_BIT,
-      .sampledImageDepthSampleCounts = supported_sample_counts,
-      .sampledImageStencilSampleCounts = supported_sample_counts,
+      .sampledImageDepthSampleCounts = depth_sample_counts,
+      .sampledImageStencilSampleCounts = stencil_sample_counts,
       .storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT,
       .maxSampleMaskWords = 1,
       .timestampComputeAndGraphics = true,

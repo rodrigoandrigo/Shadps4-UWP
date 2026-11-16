@@ -1,6 +1,8 @@
 #include <unknwn.h>
 #include "uwp/brokered_fs.h"
 #include "core/address_space.h"
+#include "core/file_sys/backends/host_fs.h"
+#include "common/string_util.h"
 
 #include <algorithm>
 #include <array>
@@ -537,6 +539,11 @@ std::unique_ptr<BrokeredFile> BrokeredFsBackend::OpenReadHandle(std::string_view
     result->SetInode(inode);
     return result;
 }
+BrokeredFsBackend::BrokeredFsBackend(std::filesystem::path directory)
+    : direct_root(std::move(directory)), read_only(true) {
+    native_backend = std::make_shared<FileSys::HostFsBackend>(direct_root, true);
+}
+
 StorageFolder BrokeredFsBackend::Folder(std::string_view relative) const {
     const auto path = RelativePath(relative);
     try {
@@ -555,6 +562,10 @@ StorageFolder BrokeredFsBackend::Folder(std::string_view relative) const {
 
 std::shared_ptr<BrokeredFsBackend> BrokeredFsBackend::Subdirectory(
     std::string_view relative) const {
+    if (native_backend) {
+        ValidateStorageRelativePath(relative);
+        return std::make_shared<BrokeredFsBackend>(direct_root / relative);
+    }
     const auto folder = Folder(relative);
     auto backend = std::make_shared<BrokeredFsBackend>(winrt::get_abi(folder), read_only);
     if (relative.empty())
@@ -564,7 +575,9 @@ std::shared_ptr<BrokeredFsBackend> BrokeredFsBackend::Subdirectory(
 std::shared_ptr<BrokeredFsBackend> BrokeredFsBackend::GameDirectory(
     std::string_view relative) const {
     auto game = Subdirectory(relative);
-    if (game->root.Name() != L"Image0")
+    if (native_backend)
+        return game;
+    if (Common::ToLower(winrt::to_string(game->root.Name())) != "image0")
         return game;
     try {
         StorageFolder parent{nullptr};
@@ -601,6 +614,10 @@ IStorageItem BrokeredFsBackend::Item(std::string_view relative) const {
     }
 }
 bool BrokeredFsBackend::Exists(std::string_view relative) {
+    if (native_backend) {
+        ValidateStorageRelativePath(relative);
+        return native_backend->Exists(relative);
+    }
     try {
         if (OpenReadHandle(relative))
             return true;
@@ -613,6 +630,10 @@ bool BrokeredFsBackend::Exists(std::string_view relative) {
     }
 }
 bool BrokeredFsBackend::IsDirectory(std::string_view relative) {
+    if (native_backend) {
+        ValidateStorageRelativePath(relative);
+        return native_backend->IsDirectory(relative);
+    }
     try {
         if (OpenReadHandle(relative))
             return false;
@@ -626,6 +647,10 @@ bool BrokeredFsBackend::IsDirectory(std::string_view relative) {
 }
 std::unique_ptr<FileSys::IFile> BrokeredFsBackend::Open(std::string_view relative,
                                                         Common::FS::FileAccessMode mode) {
+    if (native_backend) {
+        ValidateStorageRelativePath(relative);
+        return native_backend->Open(relative, mode);
+    }
     const bool writable = mode != Common::FS::FileAccessMode::Read;
     if (writable &&
         (read_only || (metadata && (relative == "sce_sys" || relative.starts_with("sce_sys/"))))) {
@@ -657,6 +682,10 @@ std::unique_ptr<FileSys::IFile> BrokeredFsBackend::Open(std::string_view relativ
     return OpenStorageFile(winrt::get_abi(file), public_mode);
 }
 std::unique_ptr<FileSys::IDirectory> BrokeredFsBackend::OpenDir(std::string_view relative) {
+    if (native_backend) {
+        ValidateStorageRelativePath(relative);
+        return native_backend->OpenDir(relative);
+    }
     StorageFolder fallback{nullptr};
     if (metadata && (relative == "sce_sys" || relative.starts_with("sce_sys/"))) {
         try {
@@ -676,6 +705,10 @@ std::filesystem::path BrokeredFsBackend::RootPath() const {
     return {};
 }
 std::optional<std::vector<u8>> BrokeredFsBackend::ReadFile(std::string_view relative) const {
+    if (native_backend) {
+        ValidateStorageRelativePath(relative);
+        return native_backend->ReadFile(relative);
+    }
     auto file = OpenReadHandle(relative);
     if (!file) {
         const auto item = Item(relative).as<StorageFile>();
@@ -692,6 +725,13 @@ std::optional<std::vector<u8>> BrokeredFsBackend::ReadFile(std::string_view rela
     return result;
 }
 FileSys::FileStat BrokeredFsBackend::Stat(std::string_view relative) const {
+    if (native_backend) {
+        ValidateStorageRelativePath(relative);
+        FileSys::FileStat result{};
+        if (!native_backend->Stat(relative, result))
+            winrt::throw_hresult(HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND));
+        return result;
+    }
     if (auto file = OpenReadHandle(relative)) {
         FileSys::FileStat result{};
         file->Stat(result);

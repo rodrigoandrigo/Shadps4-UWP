@@ -167,6 +167,13 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
     }
 }
 
+vk::BufferUsageFlags SupportedUsage(const Vulkan::Instance& instance, vk::BufferUsageFlags usage) {
+    if (!instance.IsBufferDeviceAddressSupported()) {
+        usage &= ~vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    }
+    return usage;
+}
+
 Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes_,
                MemoryType mem_type_, std::string_view debug_name)
     : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, mem_type{mem_type_},
@@ -178,7 +185,7 @@ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes
     const bool shared = mem_type == MemoryType::Sparse && !instance.GetCopyQueues().empty();
     vk::BufferCreateInfo buffer_ci = {
         .size = size_bytes,
-        .usage = AllFlags,
+        .usage = SupportedUsage(instance, AllFlags),
         .sharingMode = shared ? vk::SharingMode::eConcurrent : vk::SharingMode::eExclusive,
         .queueFamilyIndexCount = shared ? 2u : 0u,
         .pQueueFamilyIndices = queue_families,

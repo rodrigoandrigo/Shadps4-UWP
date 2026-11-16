@@ -54,6 +54,7 @@ inline bool IsBufferAtomic(const IR::Inst& inst) {
     case IR::Opcode::BufferAtomicOr32:
     case IR::Opcode::BufferAtomicXor32:
     case IR::Opcode::BufferAtomicSwap32:
+    case IR::Opcode::BufferAtomicMskor32:
     case IR::Opcode::BufferAtomicCmpSwap32:
     case IR::Opcode::BufferAtomicFCmpSwap32:
         return true;
@@ -115,8 +116,12 @@ inline bool IsDataRingInstruction(const IR::Inst& inst) {
     case IR::Opcode::SharedAtomicInc64:
     case IR::Opcode::SharedAtomicDec32:
     case IR::Opcode::SharedAtomicDec64:
+    case IR::Opcode::SharedAtomicIncLimit32:
+    case IR::Opcode::SharedAtomicDecLimit32:
     case IR::Opcode::SharedAtomicCmpSwap32:
     case IR::Opcode::SharedAtomicCmpSwap64:
+    case IR::Opcode::SharedAtomicSwap32:
+    case IR::Opcode::SharedAtomicMskor32:
         return inst.Flags<bool>(); // is_gds
     default:
         return false;

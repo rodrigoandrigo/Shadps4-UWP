@@ -83,6 +83,7 @@ public:
         Shader::RuntimeInfo hull_runtime{}, domain_runtime{};
         std::vector<u32> converted_indices;
         bool converted_indices_are_ordinals{};
+        bool converted_indices_require_static_restart{};
         std::optional<GpuCommands::Arguments> indirect;
         std::optional<GpuCommands::Expansion> expansion;
         u32 source_index_count{};
@@ -90,6 +91,8 @@ public:
         u32 index_read_count{UINT32_MAX};
         u32 index_prefix{};
         bool rectangles{};
+        bool quad_expansion{};
+        bool quad_strip{};
         bool rectangle_points{};
         std::vector<VideoCore::ImageInfo> colors;
         std::vector<AmdGpu::ColorBuffer> color_clear_buffers;
@@ -107,6 +110,7 @@ public:
         bool clear_stencil{};
         bool clear_only{};
         bool flat_last{}, viewport_transform{};
+        bool viewport_index_enabled{};
         std::array<std::array<float, 4>, 16> viewport_xy{};
         std::array<u32, 16> viewport_flags{};
         std::vector<u32> flat_vertices;
@@ -170,6 +174,9 @@ public:
     void Resolve(const VideoCore::ImageInfo& source, const VideoCore::ImageInfo& destination,
                  u32 source_layer = 0, u32 destination_layer = 0, u32 layers = 0,
                  const AmdGpu::ColorBuffer* fmask = nullptr);
+    void CopyDepthStencil(const VideoCore::ImageInfo& source,
+                          const VideoCore::ImageInfo& destination, u32 base_layer, u32 layers,
+                          bool copy_depth, bool copy_stencil);
     void MaterializeColorClear(const AmdGpu::ColorBuffer& buffer, const VideoCore::ImageInfo& info);
     std::shared_ptr<VideoCore::ResidentFrame> CapturePresentation(const VideoCore::ImageInfo& info);
     u64 Flush();
@@ -226,6 +233,7 @@ private:
                                    const VideoCore::ImageInfo& info);
     void DrawClearOnly(const DrawRequest& request);
     bool failed{}, trimming_memory{}, recovery_abandoned{}, destruction_drained{};
+    bool output_merger_logic_op_supported{}, uint4_render_target_supported{};
     MemoryBudget memory_budget;
     std::function<u64()> external_memory;
     std::function<void()> trim_external_memory;

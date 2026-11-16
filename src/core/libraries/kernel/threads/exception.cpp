@@ -11,10 +11,12 @@
 #include "core/libraries/libs.h"
 #include "core/signals.h"
 #ifdef SHADPS4_UWP
+#include <array>
 #include "core/memory.h"
 #endif
 
 #ifdef _WIN64
+#include <intrin.h>
 #include "common/ntapi.h"
 #else
 #include <csignal>
@@ -26,10 +28,17 @@
 namespace Libraries::Kernel {
 
 #ifndef _WIN32
-Ucontext::Ucontext(siginfo_t const* inf, ucontext_t* raw_context) : Ucontext{} {
+static thread_local ucontext_t* s_current_host_context = nullptr;
+#else
+static thread_local PCONTEXT s_current_host_context = nullptr;
+#endif
+
+#ifndef _WIN32
+Ucontext::Ucontext(siginfo_t const* inf, ucontext_t* raw_context) {
     if (!inf || !raw_context) {
         return;
     }
+    s_current_host_context = raw_context;
 #ifdef ARCH_X86_64
 #ifdef __APPLE__
     const auto& regs = raw_context->uc_mcontext->__ss;
@@ -103,10 +112,11 @@ Ucontext::Ucontext(siginfo_t const* inf, ucontext_t* raw_context) : Ucontext{} {
 #endif
 }
 #else
-Ucontext::Ucontext(PCONTEXT context) : Ucontext{} {
+Ucontext::Ucontext(PCONTEXT context) {
     if (!context) {
         return;
     }
+    s_current_host_context = context;
     uc_mcontext.mc_r8 = context->R8;
     uc_mcontext.mc_r9 = context->R9;
     uc_mcontext.mc_r10 = context->R10;
@@ -129,39 +139,34 @@ Ucontext::Ucontext(PCONTEXT context) : Ucontext{} {
 }
 #endif
 
-void Ucontext::SyncHostFromGuest(void* host_context) const {
-#ifdef _WIN32
-    auto* native_context = static_cast<CONTEXT*>(host_context);
-#else
-    auto* native_context = static_cast<ucontext_t*>(host_context);
-#endif
-    if (!native_context) {
+void Ucontext::SyncHostFromGuest() {
+    if (!s_current_host_context) {
         return;
     }
 
 #ifdef ARCH_X86_64
 #ifdef _WIN32
-    native_context->R8 = uc_mcontext.mc_r8;
-    native_context->R9 = uc_mcontext.mc_r9;
-    native_context->R10 = uc_mcontext.mc_r10;
-    native_context->R11 = uc_mcontext.mc_r11;
-    native_context->R12 = uc_mcontext.mc_r12;
-    native_context->R13 = uc_mcontext.mc_r13;
-    native_context->R14 = uc_mcontext.mc_r14;
-    native_context->R15 = uc_mcontext.mc_r15;
-    native_context->Rdi = uc_mcontext.mc_rdi;
-    native_context->Rsi = uc_mcontext.mc_rsi;
-    native_context->Rbp = uc_mcontext.mc_rbp;
-    native_context->Rbx = uc_mcontext.mc_rbx;
-    native_context->Rdx = uc_mcontext.mc_rdx;
-    native_context->Rax = uc_mcontext.mc_rax;
-    native_context->Rcx = uc_mcontext.mc_rcx;
-    native_context->Rsp = uc_mcontext.mc_rsp;
-    native_context->Rip = uc_mcontext.mc_rip;
-    // native_context->SegFs = static_cast<DWORD>(uc_mcontext.mc_fs);
-    // native_context->SegGs = static_cast<DWORD>(uc_mcontext.mc_gs);
+    s_current_host_context->R8 = uc_mcontext.mc_r8;
+    s_current_host_context->R9 = uc_mcontext.mc_r9;
+    s_current_host_context->R10 = uc_mcontext.mc_r10;
+    s_current_host_context->R11 = uc_mcontext.mc_r11;
+    s_current_host_context->R12 = uc_mcontext.mc_r12;
+    s_current_host_context->R13 = uc_mcontext.mc_r13;
+    s_current_host_context->R14 = uc_mcontext.mc_r14;
+    s_current_host_context->R15 = uc_mcontext.mc_r15;
+    s_current_host_context->Rdi = uc_mcontext.mc_rdi;
+    s_current_host_context->Rsi = uc_mcontext.mc_rsi;
+    s_current_host_context->Rbp = uc_mcontext.mc_rbp;
+    s_current_host_context->Rbx = uc_mcontext.mc_rbx;
+    s_current_host_context->Rdx = uc_mcontext.mc_rdx;
+    s_current_host_context->Rax = uc_mcontext.mc_rax;
+    s_current_host_context->Rcx = uc_mcontext.mc_rcx;
+    s_current_host_context->Rsp = uc_mcontext.mc_rsp;
+    s_current_host_context->Rip = uc_mcontext.mc_rip;
+    // s_current_host_context->SegFs = static_cast<DWORD>(uc_mcontext.mc_fs);
+    // s_current_host_context->SegGs = static_cast<DWORD>(uc_mcontext.mc_gs);
 #elif __APPLE__
-    auto& regs = native_context->uc_mcontext->__ss;
+    auto& regs = s_current_host_context->uc_mcontext->__ss;
     regs.__r8 = uc_mcontext.mc_r8;
     regs.__r9 = uc_mcontext.mc_r9;
     regs.__r10 = uc_mcontext.mc_r10;
@@ -182,7 +187,7 @@ void Ucontext::SyncHostFromGuest(void* host_context) const {
     regs.__gs = uc_mcontext.mc_gs;
     regs.__rip = uc_mcontext.mc_rip;
 #elif defined(__FreeBSD__)
-    auto& regs = native_context->uc_mcontext;
+    auto& regs = s_current_host_context->uc_mcontext;
     regs.mc_r8 = uc_mcontext.mc_r8;
     regs.mc_r9 = uc_mcontext.mc_r9;
     regs.mc_r10 = uc_mcontext.mc_r10;
@@ -203,7 +208,7 @@ void Ucontext::SyncHostFromGuest(void* host_context) const {
     regs.mc_gs = uc_mcontext.mc_gs;
     regs.mc_rip = uc_mcontext.mc_rip;
 #else
-    auto& regs = native_context->uc_mcontext.gregs;
+    auto& regs = s_current_host_context->uc_mcontext.gregs;
     regs[REG_R8] = uc_mcontext.mc_r8;
     regs[REG_R9] = uc_mcontext.mc_r9;
     regs[REG_R10] = uc_mcontext.mc_r10;
@@ -637,7 +642,79 @@ s32 PS4_SYSV_ABI sceKernelRaiseException(PthreadT thread, s32 signum) {
     return ret;
 }
 
-s32 PS4_SYSV_ABI sceKernelDebugRaiseException(u32 error, s64 unk) {
+static void LogDebugRaiseException(const char* api, u32 error, s64 argument, void* caller,
+                                   void* frame, void* return_slot) {
+    LOG_CRITICAL(Debug,
+                 "[GuestDebugException] api={} error={:#x} argument={} argument_hex={:#x} "
+                 "return_pc={:#x} api_frame={:#x}",
+                 api, error, argument, static_cast<u64>(argument),
+                 reinterpret_cast<uintptr_t>(caller), reinterpret_cast<uintptr_t>(frame));
+#ifdef SHADPS4_UWP
+    using ReadMemory = LONG(NTAPI*)(HANDLE, const void*, void*, SIZE_T, SIZE_T*);
+    static const auto read_memory = reinterpret_cast<ReadMemory>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtReadVirtualMemory"));
+    if (!read_memory || !g_curthread) {
+        LOG_CRITICAL(Debug, "[GuestDebugException] stack_unavailable reader={} thread={}",
+                     read_memory != nullptr, g_curthread != nullptr);
+        return;
+    }
+    const auto base = reinterpret_cast<uintptr_t>(g_curthread->attr.stackaddr_attr);
+    const auto size = g_curthread->attr.stacksize_attr;
+    LOG_CRITICAL(Debug, "[GuestDebugException] stack_base={:#x} stack_size={:#x}", base, size);
+    const auto read = [&](uintptr_t address, void* output, size_t bytes) {
+        if (address < base || bytes > size || address - base > size - bytes)
+            return false;
+        SIZE_T copied{};
+        return read_memory(GetCurrentProcess(), reinterpret_cast<const void*>(address), output,
+                           bytes, &copied) >= 0 &&
+               copied == bytes;
+    };
+    std::array<uintptr_t, 2> record{};
+    const auto api_frame = reinterpret_cast<uintptr_t>(return_slot) - sizeof(uintptr_t);
+    if (!read(api_frame, record.data(), sizeof(record))) {
+        LOG_CRITICAL(Debug, "[GuestDebugException] stack_unreadable address={:#x}", api_frame);
+        return;
+    }
+    const auto guest_rsp = api_frame + sizeof(record);
+    LOG_CRITICAL(Debug, "[GuestDebugException] guest_rsp={:#x} guest_rbp={:#x}", guest_rsp,
+                 record[0]);
+    auto previous = api_frame;
+    auto next = record[0];
+    for (u32 depth = 0; depth < 32; ++depth) {
+        if (next <= previous || next % alignof(uintptr_t) != 0 ||
+            !read(next, record.data(), sizeof(record))) {
+            LOG_CRITICAL(Debug, "[GuestDebugException] frame_chain_end depth={} address={:#x}",
+                         depth, next);
+            break;
+        }
+        LOG_CRITICAL(Debug, "[GuestDebugException] frame={} fp={:#x} return_pc={:#x}", depth, next,
+                     record[1]);
+        previous = next;
+        next = record[0];
+    }
+    for (u32 index = 0; index < 64; ++index) {
+        uintptr_t word{};
+        const auto address = guest_rsp + index * sizeof(word);
+        if (!read(address, &word, sizeof(word))) {
+            LOG_CRITICAL(Debug, "[GuestDebugException] stack_words_end index={} address={:#x}",
+                         index, address);
+            break;
+        }
+        LOG_CRITICAL(Debug, "[GuestDebugException] stack_word={} address={:#x} value={:#x}", index,
+                     address, word);
+    }
+#endif
+}
+
+SHAD_NO_INLINE s32 PS4_SYSV_ABI sceKernelDebugRaiseException(u32 error, s64 unk) {
+    LogDebugRaiseException(__func__, error, unk, __builtin_return_address(0),
+                           __builtin_frame_address(0),
+#ifdef _WIN64
+                           _AddressOfReturnAddress()
+#else
+                           nullptr
+#endif
+    );
     if (unk != 0) {
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
@@ -645,7 +722,15 @@ s32 PS4_SYSV_ABI sceKernelDebugRaiseException(u32 error, s64 unk) {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceKernelDebugRaiseExceptionOnReleaseMode(u32 error, s64 unk) {
+SHAD_NO_INLINE s32 PS4_SYSV_ABI sceKernelDebugRaiseExceptionOnReleaseMode(u32 error, s64 unk) {
+    LogDebugRaiseException(__func__, error, unk, __builtin_return_address(0),
+                           __builtin_frame_address(0),
+#ifdef _WIN64
+                           _AddressOfReturnAddress()
+#else
+                           nullptr
+#endif
+    );
     if (unk != 0) {
         return ORBIS_KERNEL_ERROR_EINVAL;
     }

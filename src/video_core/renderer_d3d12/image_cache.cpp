@@ -28,6 +28,8 @@ bool CompatibleTypelessView(DXGI_FORMAT resource, DXGI_FORMAT view) {
                view == DXGI_FORMAT_R8G8B8A8_SNORM;
     case DXGI_FORMAT_B8G8R8A8_TYPELESS:
         return view == DXGI_FORMAT_B8G8R8A8_UNORM || view == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+        return view == DXGI_FORMAT_B8G8R8X8_UNORM || view == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
     case DXGI_FORMAT_R16_TYPELESS:
         return view == DXGI_FORMAT_R16_FLOAT || view == DXGI_FORMAT_R16_UNORM ||
                view == DXGI_FORMAT_R16_SNORM || view == DXGI_FORMAT_R16_UINT ||
@@ -48,6 +50,18 @@ bool CompatibleTypelessView(DXGI_FORMAT resource, DXGI_FORMAT view) {
         return false;
     }
 }
+DXGI_FORMAT PresentationFormat(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8X8_UNORM;
+    default:
+        return format;
+    }
+}
 bool CompatibleImageViews(DXGI_FORMAT resource, DXGI_FORMAT first, DXGI_FORMAT second) {
     return CompatibleTypelessView(resource, first) && CompatibleTypelessView(resource, second);
 }
@@ -58,8 +72,7 @@ ImageCache::Image* ImageCache::FindPresentation(const VideoCore::ImageInfo& info
     for (auto& [key, image] : images) {
         const auto& source = image->info;
         if (!image->resident || image->cpu_dirty || image->logic_op || source.props.is_depth ||
-            source.props.is_volume || source.pixel_format != info.pixel_format ||
-            source.num_samples != 1 || image->base_layer != 0 ||
+            source.props.is_volume || source.num_samples != 1 || image->base_layer != 0 ||
             source.size.width != info.size.width || source.size.height != info.size.height ||
             source.num_bits != info.num_bits || source.pitch != info.pitch ||
             source.mips_layout[0].pitch != info.mips_layout[0].pitch ||
@@ -74,7 +87,9 @@ ImageCache::Image* ImageCache::FindPresentation(const VideoCore::ImageInfo& info
         if (first.address != second.address || first.physical != second.physical)
             continue;
         const auto format = image->Native()->GetDesc().Format;
-        const bool compatible = CompatibleTypelessView(format, ConvertFormat(info.pixel_format));
+        const auto target_format = ConvertFormat(info.pixel_format);
+        const bool compatible = CompatibleTypelessView(format, target_format) ||
+                                PresentationFormat(format) == PresentationFormat(target_format);
         if (compatible &&
             (!result ||
              (image->written != result->written ? image->written : image->age > result->age)))
@@ -430,6 +445,21 @@ ImageCache::Image& ImageCache::GetImage(const VideoCore::ImageInfo& info, DXGI_F
             format = DXGI_FORMAT_R16_TYPELESS;
         else if (view_format == DXGI_FORMAT_D32_FLOAT)
             format = DXGI_FORMAT_R32_TYPELESS;
+    }
+    if (!info.props.is_depth && !multisampled && !logic_op) {
+        switch (PresentationFormat(format)) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+            format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+            break;
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+            format = DXGI_FORMAT_B8G8R8A8_TYPELESS;
+            break;
+        case DXGI_FORMAT_B8G8R8X8_UNORM:
+            format = DXGI_FORMAT_B8G8R8X8_TYPELESS;
+            break;
+        default:
+            break;
+        }
     }
     DXGI_FORMAT resource_format = format;
     DXGI_FORMAT depth_footprint = DXGI_FORMAT_UNKNOWN;
@@ -1469,9 +1499,8 @@ void ImageCache::Resolve(Image& source, Image& destination, ID3D12GraphicsComman
                          ID3D12Resource* fmask) {
     const bool multisampled = bool(source.msaa);
     if (destination.msaa || (fmask && !multisampled) ||
-        (multisampled && destination.info.props.is_volume) ||
-        source.info.props.is_depth || destination.info.props.is_depth ||
-        source.info.size.width != destination.info.size.width ||
+        (multisampled && destination.info.props.is_volume) || source.info.props.is_depth ||
+        destination.info.props.is_depth || source.info.size.width != destination.info.size.width ||
         source.info.size.height != destination.info.size.height ||
         source.native_layers != destination.native_layers ||
         source.info.pixel_format != destination.info.pixel_format)
@@ -1525,6 +1554,72 @@ void ImageCache::Resolve(Image& source, Image& destination, ID3D12GraphicsComman
         }
     }
     destination.written = true;
+}
+void ImageCache::CopyDepthStencil(Image& source, Image& destination,
+                                  ID3D12GraphicsCommandList* commands, bool copy_depth,
+                                  bool copy_stencil) {
+    if (!copy_depth && !copy_stencil)
+        return;
+    const auto source_desc = source.Native()->GetDesc();
+    const auto destination_desc = destination.Native()->GetDesc();
+    if (!source.info.props.is_depth || !destination.info.props.is_depth ||
+        source.info.pixel_format != destination.info.pixel_format ||
+        source.info.size.width != destination.info.size.width ||
+        source.info.size.height != destination.info.size.height ||
+        source.info.num_samples != destination.info.num_samples ||
+        source.info.resources.levels != destination.info.resources.levels ||
+        source.native_layers != destination.native_layers ||
+        source.base_layer != destination.base_layer || source.has_depth != destination.has_depth ||
+        source.has_stencil != destination.has_stencil ||
+        source_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        destination_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        source_desc.Width != destination_desc.Width ||
+        source_desc.Height != destination_desc.Height ||
+        source_desc.DepthOrArraySize != destination_desc.DepthOrArraySize ||
+        source_desc.MipLevels != destination_desc.MipLevels ||
+        source_desc.Format != destination_desc.Format ||
+        source_desc.SampleDesc.Count != destination_desc.SampleDesc.Count ||
+        source_desc.SampleDesc.Quality != destination_desc.SampleDesc.Quality)
+        throw std::runtime_error("Invalid D3D12 depth/stencil override copy source or destination");
+    if ((copy_depth && (!source.has_depth || !destination.has_depth)) ||
+        (copy_stencil && (!source.has_stencil || !destination.has_stencil)))
+        throw std::runtime_error("D3D12 depth/stencil override copy requires a missing plane");
+    if (source.Native() == destination.Native())
+        return;
+
+    Upload(source, commands);
+    Upload(destination, commands);
+    Barrier(source, commands, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Barrier(destination, commands, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    const auto copy_subresource = [&](u32 source_subresource, u32 destination_subresource) {
+        D3D12_TEXTURE_COPY_LOCATION source_location{};
+        source_location.pResource = source.Native();
+        source_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        source_location.SubresourceIndex = source_subresource;
+        D3D12_TEXTURE_COPY_LOCATION destination_location{};
+        destination_location.pResource = destination.Native();
+        destination_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        destination_location.SubresourceIndex = destination_subresource;
+        // Depth/stencil and MSAA copies must cover the entire subresource.
+        commands->CopyTextureRegion(&destination_location, 0, 0, 0, &source_location, nullptr);
+    };
+    for (u32 layer = 0; layer < source.native_layers; ++layer) {
+        if (copy_depth) {
+            copy_subresource(DepthSubresource(0, layer, source.info.resources.levels),
+                             DepthSubresource(0, layer, destination.info.resources.levels));
+        }
+        if (copy_stencil) {
+            copy_subresource(
+                StencilSubresource(0, layer, source.info.resources.levels, source.native_layers),
+                StencilSubresource(0, layer, destination.info.resources.levels,
+                                   destination.native_layers));
+        }
+    }
+    if (copy_depth)
+        destination.written = true;
+    if (copy_stencil)
+        destination.stencil_written = true;
 }
 void ImageCache::RetireUploads(u64 fence) {
     transfer_fence = fence;

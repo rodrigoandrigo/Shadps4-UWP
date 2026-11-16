@@ -3,6 +3,7 @@
 
 #include "shader_recompiler/frontend/translate/translate.h"
 #include "shader_recompiler/ir/reg.h"
+#include "shader_recompiler/profile.h"
 #include "shader_recompiler/runtime_info.h"
 
 namespace Shader::Gcn {
@@ -17,8 +18,14 @@ void Translator::EmitDataShare(const GcnInst& inst) {
     case Opcode::DS_SUB_U32:
         return DS_OP(inst, AtomicOp::Sub, false);
     case Opcode::DS_INC_U32:
+        if (profile.is_d3d12_profile) {
+            return DS_INC_DEC(false, false, inst);
+        }
         return DS_OP(inst, AtomicOp::Inc, false);
     case Opcode::DS_DEC_U32:
+        if (profile.is_d3d12_profile) {
+            return DS_INC_DEC(true, false, inst);
+        }
         return DS_OP(inst, AtomicOp::Dec, false);
     case Opcode::DS_MIN_I32:
         return DS_OP(inst, AtomicOp::Smin, false);
@@ -48,12 +55,43 @@ void Translator::EmitDataShare(const GcnInst& inst) {
         return DS_OP(inst, AtomicOp::Umin, true);
     case Opcode::DS_MAX_RTN_U32:
         return DS_OP(inst, AtomicOp::Umax, true);
+    case Opcode::DS_INC_RTN_U32:
+        if (!profile.is_d3d12_profile) {
+            return LogMissingOpcode(inst);
+        }
+        return DS_INC_DEC(false, true, inst);
+    case Opcode::DS_DEC_RTN_U32:
+        if (!profile.is_d3d12_profile) {
+            return LogMissingOpcode(inst);
+        }
+        return DS_INC_DEC(true, true, inst);
+    case Opcode::DS_MIN_RTN_I32:
+        if (!profile.is_d3d12_profile) {
+            return LogMissingOpcode(inst);
+        }
+        return DS_OP(inst, AtomicOp::Smin, true);
+    case Opcode::DS_MAX_RTN_I32:
+        if (!profile.is_d3d12_profile) {
+            return LogMissingOpcode(inst);
+        }
+        return DS_OP(inst, AtomicOp::Smax, true);
     case Opcode::DS_AND_RTN_B32:
         return DS_OP(inst, AtomicOp::And, true);
     case Opcode::DS_OR_RTN_B32:
         return DS_OP(inst, AtomicOp::Or, true);
     case Opcode::DS_XOR_RTN_B32:
         return DS_OP(inst, AtomicOp::Xor, true);
+    case Opcode::DS_MSKOR_B32:
+    case Opcode::DS_MSKOR_RTN_B32:
+        if (!profile.is_d3d12_profile) {
+            return LogMissingOpcode(inst);
+        }
+        return DS_MSKOR(inst.opcode == Opcode::DS_MSKOR_RTN_B32, inst);
+    case Opcode::DS_WRXCHG_RTN_B32:
+        if (!profile.is_d3d12_profile) {
+            return LogMissingOpcode(inst);
+        }
+        return DS_OP(inst, AtomicOp::Swap, true);
     case Opcode::DS_CMPST_B32:
         return DS_CMPST(32, false, inst);
     case Opcode::DS_CMPST_RTN_B32:
@@ -154,6 +192,12 @@ void Translator::DS_OP(const GcnInst& inst, AtomicOp op, bool rtn) {
             return ir.SharedAtomicOr(addr_offset, data, is_gds);
         case AtomicOp::Xor:
             return ir.SharedAtomicXor(addr_offset, data, is_gds);
+        case AtomicOp::Swap:
+            if constexpr (std::is_same_v<T, IR::U32>) {
+                return ir.SharedAtomicSwap(addr_offset, data, is_gds);
+            } else {
+                UNREACHABLE();
+            }
         case AtomicOp::Sub:
             return ir.SharedAtomicISub(addr_offset, data, is_gds);
         case AtomicOp::Inc:
@@ -170,6 +214,34 @@ void Translator::DS_OP(const GcnInst& inst, AtomicOp op, bool rtn) {
         } else {
             SetDst64(inst.dst[0], original_val);
         }
+    }
+}
+
+void Translator::DS_INC_DEC(bool decrement, bool rtn, const GcnInst& inst) {
+    const bool is_gds = inst.control.ds.gds;
+    const IR::U32 addr{GetSrc(inst.src[0])};
+    const IR::U32 limit{GetSrc(inst.src[1])};
+    const IR::U32 offset =
+        ir.Imm32((u32(inst.control.ds.offset1) << 8u) + u32(inst.control.ds.offset0));
+    const IR::U32 addr_offset = ir.IAdd(addr, offset);
+    const IR::U32 original_val = decrement ? ir.SharedAtomicDecLimit32(addr_offset, limit, is_gds)
+                                           : ir.SharedAtomicIncLimit32(addr_offset, limit, is_gds);
+    if (rtn) {
+        SetDst(inst.dst[0], original_val);
+    }
+}
+
+void Translator::DS_MSKOR(bool rtn, const GcnInst& inst) {
+    const bool is_gds = inst.control.ds.gds;
+    const IR::U32 addr{GetSrc(inst.src[0])};
+    const IR::U32 data0{GetSrc(inst.src[1])};
+    const IR::U32 data1{GetSrc(inst.src[2])};
+    const IR::U32 offset =
+        ir.Imm32((u32(inst.control.ds.offset1) << 8u) + u32(inst.control.ds.offset0));
+    const IR::U32 addr_offset = ir.IAdd(addr, offset);
+    const IR::U32 original_val = ir.SharedAtomicMskor32(addr_offset, data0, data1, is_gds);
+    if (rtn) {
+        SetDst(inst.dst[0], original_val);
     }
 }
 

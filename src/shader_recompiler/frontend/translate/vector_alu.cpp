@@ -1,13 +1,202 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <limits>
+#include <stdexcept>
 #include "shader_recompiler/frontend/opcodes.h"
 #include "shader_recompiler/frontend/translate/translate.h"
 #include "shader_recompiler/ir/attribute.h"
 #include "shader_recompiler/profile.h"
 
 namespace Shader::Gcn {
+
+namespace {
+
+bool HasUnsupportedVop3InputModifier(const InstOperand& operand) {
+    return operand.input_modifier.neg || operand.input_modifier.neg_hi ||
+           operand.input_modifier.abs || operand.input_modifier.sext || operand.op_sel.op_sel ||
+           operand.op_sel.op_sel_hi || operand.sdwa_present || operand.sdwa_reserved_bits ||
+           operand.dpp.has_value();
+}
+
+bool HasUnsupportedVop3OutputModifier(const InstOperand& operand, bool allow_clamp) {
+    return operand.op_sel.op_sel || operand.op_sel.op_sel_hi || operand.sdwa_present ||
+           operand.sdwa_reserved_bits || operand.sdwa_sel != SdwaSelector::Invalid ||
+           operand.dpp.has_value() || operand.output_modifier.multiplier != 0.0f ||
+           (!allow_clamp && operand.output_modifier.clamp);
+}
+
+bool IsCarryMaskRegister(OperandField field) {
+    return field == OperandField::ScalarGPR || field == OperandField::VccLo;
+}
+
+void ValidateVop3CoU32(const GcnInst& inst) {
+    if (inst.encoding != InstEncoding::VOP3 || inst.src_count != 2 || inst.dst_count != 2 ||
+        inst.dst[0].field != OperandField::VectorGPR || !IsCarryMaskRegister(inst.dst[1].field)) {
+        throw std::runtime_error("VOP3B CO_U32 requires two sources, a VGPR result, and an "
+                                 "SGPR-pair/VCC mask destination");
+    }
+    if (HasUnsupportedVop3InputModifier(inst.src[0]) ||
+        HasUnsupportedVop3InputModifier(inst.src[1]) ||
+        HasUnsupportedVop3OutputModifier(inst.dst[0], true)) {
+        throw std::runtime_error(
+            "VOP3B CO_U32 does not accept input modifiers or output modifiers other than CLMP");
+    }
+}
+
+void ValidateVop3Mad64(const GcnInst& inst) {
+    if (inst.encoding != InstEncoding::VOP3 || inst.src_count != 3 || inst.dst_count != 2 ||
+        inst.dst[0].field != OperandField::VectorGPR || inst.dst[1].field != OperandField::VccLo) {
+        throw std::runtime_error("GCN2 VOP3a MAD64 requires three sources, a VGPR-pair result, "
+                                 "and its implicit VCC_OUT carry destination");
+    }
+    if (HasUnsupportedVop3InputModifier(inst.src[0]) ||
+        HasUnsupportedVop3InputModifier(inst.src[1]) ||
+        HasUnsupportedVop3InputModifier(inst.src[2]) ||
+        HasUnsupportedVop3OutputModifier(inst.dst[0], false)) {
+        throw std::runtime_error("GCN2 VOP3a MAD64 does not accept modifiers outside the "
+                                 "unmodified subset");
+    }
+}
+
+void ValidateVop3Sad(const GcnInst& inst) {
+    if (inst.encoding != InstEncoding::VOP3 || inst.src_count != 3 || inst.dst_count != 1 ||
+        inst.dst[0].field != OperandField::VectorGPR) {
+        throw std::runtime_error("VOP3 SAD requires three sources and one VGPR destination");
+    }
+    if (HasUnsupportedVop3InputModifier(inst.src[0]) ||
+        HasUnsupportedVop3InputModifier(inst.src[1]) ||
+        HasUnsupportedVop3InputModifier(inst.src[2]) ||
+        HasUnsupportedVop3OutputModifier(inst.dst[0], false)) {
+        throw std::runtime_error(
+            "VOP3 SAD does not accept modifiers outside the unmodified subset");
+    }
+}
+
+bool IsSupportedVop3LerpU8SourceField(OperandField field) {
+    switch (field) {
+    case OperandField::ScalarGPR:
+    case OperandField::VectorGPR:
+    case OperandField::ConstZero:
+    case OperandField::SignedConstIntPos:
+    case OperandField::SignedConstIntNeg:
+    case OperandField::ConstFloatPos_0_5:
+    case OperandField::ConstFloatNeg_0_5:
+    case OperandField::ConstFloatPos_1_0:
+    case OperandField::ConstFloatNeg_1_0:
+    case OperandField::ConstFloatPos_2_0:
+    case OperandField::ConstFloatNeg_2_0:
+    case OperandField::ConstFloatPos_4_0:
+    case OperandField::ConstFloatNeg_4_0:
+    case OperandField::VccLo:
+    case OperandField::VccHi:
+    case OperandField::M0:
+    case OperandField::ExecLo:
+    case OperandField::ExecHi:
+    case OperandField::Scc:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void ValidateVop3LerpU8(const GcnInst& inst) {
+    if (inst.encoding != InstEncoding::VOP3 || inst.src_count != 3 || inst.dst_count != 1 ||
+        inst.src[0].type != ScalarType::Uint32 || inst.src[1].type != ScalarType::Uint32 ||
+        inst.src[2].type != ScalarType::Uint32 || inst.dst[0].type != ScalarType::Uint32 ||
+        inst.dst[0].field != OperandField::VectorGPR) {
+        throw std::runtime_error(
+            "GCN2 VOP3a V_LERP_U8 requires three U32 sources and one U32 VGPR destination");
+    }
+
+    bool has_scalar_source = false;
+    u32 scalar_source_code = 0;
+    for (u32 index = 0; index < 3; ++index) {
+        const auto& source = inst.src[index];
+        if (!IsSupportedVop3LerpU8SourceField(source.field)) {
+            throw std::runtime_error(
+                "GCN2 VOP3a V_LERP_U8 source field is unsupported by the U32 IR path");
+        }
+        if (source.field == OperandField::ScalarGPR) {
+            if (has_scalar_source && scalar_source_code != source.code) {
+                throw std::runtime_error("GCN2 VOP3a V_LERP_U8 may read at most one distinct SGPR");
+            }
+            has_scalar_source = true;
+            scalar_source_code = source.code;
+        }
+        if (HasUnsupportedVop3InputModifier(source)) {
+            throw std::runtime_error(
+                "GCN2 VOP3a V_LERP_U8 does not accept input modifiers or extensions");
+        }
+    }
+    if (HasUnsupportedVop3OutputModifier(inst.dst[0], false)) {
+        throw std::runtime_error(
+            "GCN2 VOP3a V_LERP_U8 does not accept output modifiers or extensions");
+    }
+}
+
+void ValidateVop3PackedSad(const GcnInst& inst) {
+    if (inst.encoding != InstEncoding::VOP3 || inst.src_count != 3 || inst.dst_count != 1 ||
+        inst.src[0].type != ScalarType::Uint64 || inst.src[1].type != ScalarType::Uint32 ||
+        inst.src[2].type != ScalarType::Uint64 || inst.dst[0].type != ScalarType::Uint64 ||
+        inst.dst[0].field != OperandField::VectorGPR) {
+        throw std::runtime_error(
+            "VOP3 packed SAD requires U64/U32/U64 sources and one U64 VGPR-pair destination");
+    }
+    if (HasUnsupportedVop3InputModifier(inst.src[0]) ||
+        HasUnsupportedVop3InputModifier(inst.src[1]) ||
+        HasUnsupportedVop3InputModifier(inst.src[2]) ||
+        HasUnsupportedVop3OutputModifier(inst.dst[0], false)) {
+        throw std::runtime_error(
+            "VOP3 packed SAD does not accept modifiers outside the unmodified subset");
+    }
+}
+
+void ValidateVop3MqsadU32U8(const GcnInst& inst) {
+    constexpr u32 MaxVgprIndex{VectorGPRMax - VectorGPRMin};
+    const bool src0_pair_out_of_range =
+        (inst.src[0].field == OperandField::VectorGPR && inst.src[0].code > MaxVgprIndex - 1) ||
+        (inst.src[0].field == OperandField::ScalarGPR && inst.src[0].code >= ScalarGPRMax);
+    // B128 S2/D are four contiguous dwords, represented as individual U32 VGPRs.
+    if (inst.encoding != InstEncoding::VOP3 || inst.src_count != 3 || inst.dst_count != 1 ||
+        inst.src[0].type != ScalarType::Uint64 || inst.src[1].type != ScalarType::Uint32 ||
+        inst.src[2].type != ScalarType::Uint32 || inst.dst[0].type != ScalarType::Uint32 ||
+        inst.src[2].field != OperandField::VectorGPR || inst.src[2].code > MaxVgprIndex - 3 ||
+        inst.dst[0].field != OperandField::VectorGPR || inst.dst[0].code > MaxVgprIndex - 3 ||
+        src0_pair_out_of_range) {
+        throw std::runtime_error(
+            "VOP3 MQSAD_U32_U8 requires a valid B64 source and four-dword VGPR accumulator/result");
+    }
+    if (HasUnsupportedVop3InputModifier(inst.src[0]) ||
+        HasUnsupportedVop3InputModifier(inst.src[1]) ||
+        HasUnsupportedVop3InputModifier(inst.src[2]) ||
+        HasUnsupportedVop3OutputModifier(inst.dst[0], false)) {
+        throw std::runtime_error(
+            "VOP3 MQSAD_U32_U8 does not accept modifiers outside the unmodified subset");
+    }
+}
+
+void ValidateCarryInU32(const GcnInst& inst) {
+    const bool vop2 =
+        inst.encoding == InstEncoding::VOP2 && inst.src_count == 2 && inst.dst_count == 1;
+    const bool vop3b = inst.encoding == InstEncoding::VOP3 && inst.src_count == 3 &&
+                       inst.dst_count == 2 && IsCarryMaskRegister(inst.dst[1].field) &&
+                       IsCarryMaskRegister(inst.src[2].field);
+    if ((!vop2 && !vop3b) || inst.dst[0].field != OperandField::VectorGPR) {
+        throw std::runtime_error(
+            "U32 carry-in operation requires VOP2/VCC or VOP3B/SGPR-pair mask operands");
+    }
+    if (HasUnsupportedVop3InputModifier(inst.src[0]) ||
+        HasUnsupportedVop3InputModifier(inst.src[1]) ||
+        (vop3b && HasUnsupportedVop3InputModifier(inst.src[2])) ||
+        HasUnsupportedVop3OutputModifier(inst.dst[0], true)) {
+        throw std::runtime_error("U32 carry-in operation does not accept input modifiers or output "
+                                 "modifiers other than CLMP");
+    }
+}
+
+} // namespace
 
 void Translator::EmitVectorAlu(const GcnInst& inst) {
     switch (inst.opcode) {
@@ -34,6 +223,16 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
         return V_MUL_I32_I24(inst, true);
     case Opcode::V_MUL_U32_U24:
         return V_MUL_I32_I24(inst, false);
+    case Opcode::V_MUL_HI_I32_I24:
+        if (!profile.supports_mul_hi_24_subset) {
+            return LogMissingOpcode(inst);
+        }
+        return V_MUL_HI_24(inst, true);
+    case Opcode::V_MUL_HI_U32_U24:
+        if (!profile.supports_mul_hi_24_subset) {
+            return LogMissingOpcode(inst);
+        }
+        return V_MUL_HI_24(inst, false);
     case Opcode::V_MIN_LEGACY_F32:
         return V_MIN_F32(inst, true);
     case Opcode::V_MAX_LEGACY_F32:
@@ -88,6 +287,21 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
         return V_SUB_I32(inst);
     case Opcode::V_SUBREV_I32:
         return V_SUBREV_I32(inst);
+    case Opcode::V_ADD_CO_U32:
+        if (!profile.supports_vop3_co_u32_subset) {
+            return LogMissingOpcode(inst);
+        }
+        return V_ADD_CO_U32(inst);
+    case Opcode::V_SUB_CO_U32:
+        if (!profile.supports_vop3_co_u32_subset) {
+            return LogMissingOpcode(inst);
+        }
+        return V_SUB_CO_U32(inst);
+    case Opcode::V_SUBREV_CO_U32:
+        if (!profile.supports_vop3_co_u32_subset) {
+            return LogMissingOpcode(inst);
+        }
+        return V_SUBREV_CO_U32(inst);
     case Opcode::V_ADDC_U32:
         return V_ADDC_U32(inst);
     case Opcode::V_SUBB_U32:
@@ -106,6 +320,8 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
         return V_ADD_F16(inst);
     case Opcode::V_SUB_F16:
         return V_SUB_F16(inst);
+    case Opcode::V_SUBREV_F16:
+        return V_SUBREV_F16(inst);
     case Opcode::V_MUL_F16:
         return V_MUL_F16(inst);
     case Opcode::V_MAX_F16:
@@ -440,6 +656,14 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
         return V_FMA_F32(inst);
     case Opcode::V_FMA_F64:
         return V_FMA_F64(inst);
+    case Opcode::V_LERP_U8:
+        if (!profile.is_d3d12_profile ||
+            profile.guest_isa_generation != GuestIsaGeneration::Gcn2SeaIslands ||
+            !profile.supports_vop3_lerp_u8_subset) {
+            return LogMissingOpcode(inst);
+        }
+        ValidateVop3LerpU8(inst);
+        return V_LERP_U8(inst);
     case Opcode::V_MIN3_F32:
         return V_MIN3_F32(inst);
     case Opcode::V_MIN3_I32:
@@ -460,6 +684,34 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
         return V_MED3_U32(false, inst);
     case Opcode::V_SAD_U32:
         return V_SAD_U32(inst);
+    case Opcode::V_MSAD_U8:
+    case Opcode::V_SAD_U8:
+    case Opcode::V_SAD_HI_U8:
+    case Opcode::V_SAD_U16:
+        if (!profile.is_d3d12_profile || !profile.supports_vop3_sad_subset) {
+            return LogMissingOpcode(inst);
+        }
+        ValidateVop3Sad(inst);
+        if (inst.opcode == Opcode::V_MSAD_U8) {
+            return V_MSAD_U8(inst);
+        }
+        if (inst.opcode == Opcode::V_SAD_U16) {
+            return V_SAD_U16(inst);
+        }
+        return V_SAD_U8(inst, inst.opcode == Opcode::V_SAD_HI_U8);
+    case Opcode::V_QSAD_U8:
+    case Opcode::V_MQSAD_U8:
+        if (!profile.is_d3d12_profile || !profile.supports_vop3_sad_packed_subset) {
+            return LogMissingOpcode(inst);
+        }
+        ValidateVop3PackedSad(inst);
+        return V_QSAD_PK_U16_U8(inst, inst.opcode == Opcode::V_MQSAD_U8);
+    case Opcode::V_MQSAD_U32_U8:
+        if (!profile.is_d3d12_profile || !profile.supports_vop3_sad_packed_subset) {
+            return LogMissingOpcode(inst);
+        }
+        ValidateVop3MqsadU32U8(inst);
+        return V_MQSAD_U32_U8(inst);
     case Opcode::V_CVT_PK_U16_U32:
         return V_CVT_PK_U16_U32(inst);
     case Opcode::V_CVT_PK_I16_I32:
@@ -494,6 +746,11 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
         return V_MUL_HI_U32(true, inst);
     case Opcode::V_MAD_U64_U32:
         return V_MAD_U64_U32(inst);
+    case Opcode::V_MAD_I64_I32:
+        if (!profile.is_d3d12_profile || !profile.supports_vop3_mad64_subset) {
+            return LogMissingOpcode(inst);
+        }
+        return V_MAD_I64_I32(inst);
     case Opcode::V_LSHRREV_B16:
         return V_LSHRREV_B16(inst);
     case Opcode::V_ASHRREV_I16:
@@ -581,7 +838,8 @@ void Translator::V_CNDMASK_B32(const GcnInst& inst) {
 void Translator::V_ADD_F32(const GcnInst& inst) {
     const IR::F32 src0{GetSrc<IR::F32>(inst.src[0])};
     const IR::F32 src1{GetSrc<IR::F32>(inst.src[1])};
-    SetDst(inst.dst[0], ir.FPAdd(src0, src1));
+    const IR::F32 result{ir.FPAdd(src0, src1)};
+    SetDst(inst.dst[0], result);
 }
 
 void Translator::V_ADD_F64(const GcnInst& inst) {
@@ -761,6 +1019,11 @@ void Translator::V_MBCNT_U32_B32(bool hi, const GcnInst& inst) {
 }
 
 void Translator::V_ADD_I32(const GcnInst& inst) {
+    if (HasUnsupportedVop3InputModifier(inst.src[0]) ||
+        HasUnsupportedVop3InputModifier(inst.src[1]) ||
+        HasUnsupportedVop3OutputModifier(inst.dst[0], false)) {
+        throw std::runtime_error("V_ADD_I32 carry-out subset rejects unrepresented modifiers");
+    }
     const IR::U32 src0{GetSrc(inst.src[0])};
     const IR::U32 src1{GetSrc(inst.src[1])};
     const IR::U32 result{ir.IAdd(src0, src1)};
@@ -771,6 +1034,11 @@ void Translator::V_ADD_I32(const GcnInst& inst) {
 
 void Translator::V_SUB_I32(const GcnInst& inst) {
     // Unsigned components
+    if (HasUnsupportedVop3InputModifier(inst.src[0]) ||
+        HasUnsupportedVop3InputModifier(inst.src[1]) ||
+        HasUnsupportedVop3OutputModifier(inst.dst[0], false)) {
+        throw std::runtime_error("V_SUB_I32 carry-out subset rejects unrepresented modifiers");
+    }
     const IR::U32 src0{GetSrc(inst.src[0])};
     const IR::U32 src1{GetSrc(inst.src[1])};
     const IR::U32 result{ir.ISub(src0, src1)};
@@ -782,6 +1050,11 @@ void Translator::V_SUB_I32(const GcnInst& inst) {
 
 void Translator::V_SUBREV_I32(const GcnInst& inst) {
     // Unsigned components
+    if (HasUnsupportedVop3InputModifier(inst.src[0]) ||
+        HasUnsupportedVop3InputModifier(inst.src[1]) ||
+        HasUnsupportedVop3OutputModifier(inst.dst[0], false)) {
+        throw std::runtime_error("V_SUBREV_I32 carry-out subset rejects unrepresented modifiers");
+    }
     const IR::U32 src0{GetSrc(inst.src[0])};
     const IR::U32 src1{GetSrc(inst.src[1])};
     const IR::U32 result{ir.ISub(src1, src0)};
@@ -791,7 +1064,58 @@ void Translator::V_SUBREV_I32(const GcnInst& inst) {
     SetCarryOut(inst, did_underflow);
 }
 
+void Translator::V_ADD_CO_U32(const GcnInst& inst) {
+    if (!profile.supports_vop3_co_u32_subset) {
+        throw std::runtime_error("VOP3B ADD_CO_U32 is disabled for this shader profile");
+    }
+    ValidateVop3CoU32(inst);
+    const IR::U32 src0{GetSrc(inst.src[0])};
+    const IR::U32 src1{GetSrc(inst.src[1])};
+    const IR::U32 result{ir.IAdd(src0, src1)};
+    const IR::U1 did_carry{ir.ILessThan(result, src0, false)};
+    const IR::U32 clamped_result{inst.dst[0].output_modifier.clamp
+                                     ? IR::U32{ir.Select(did_carry, ir.Imm32(0xFFFFFFFFU), result)}
+                                     : result};
+    SetDst(inst.dst[0], clamped_result);
+    SetCarryOut(inst, did_carry);
+}
+
+void Translator::V_SUB_CO_U32(const GcnInst& inst) {
+    if (!profile.supports_vop3_co_u32_subset) {
+        throw std::runtime_error("VOP3B SUB_CO_U32 is disabled for this shader profile");
+    }
+    ValidateVop3CoU32(inst);
+    const IR::U32 src0{GetSrc(inst.src[0])};
+    const IR::U32 src1{GetSrc(inst.src[1])};
+    const IR::U32 result{ir.ISub(src0, src1)};
+    // The ISA's unsigned borrow mask is true when src1 > src0. CLMP saturates
+    // only the vector result; the scalar mask still reports the original borrow.
+    const IR::U1 did_borrow{ir.IGreaterThan(src1, src0, false)};
+    const IR::U32 clamped_result{inst.dst[0].output_modifier.clamp
+                                     ? IR::U32{ir.Select(did_borrow, ir.Imm32(0), result)}
+                                     : result};
+    SetDst(inst.dst[0], clamped_result);
+    SetCarryOut(inst, did_borrow);
+}
+
+void Translator::V_SUBREV_CO_U32(const GcnInst& inst) {
+    if (!profile.supports_vop3_co_u32_subset) {
+        throw std::runtime_error("VOP3B SUBREV_CO_U32 is disabled for this shader profile");
+    }
+    ValidateVop3CoU32(inst);
+    const IR::U32 src0{GetSrc(inst.src[0])};
+    const IR::U32 src1{GetSrc(inst.src[1])};
+    const IR::U32 result{ir.ISub(src1, src0)};
+    const IR::U1 did_borrow{ir.IGreaterThan(src0, src1, false)};
+    const IR::U32 clamped_result{inst.dst[0].output_modifier.clamp
+                                     ? IR::U32{ir.Select(did_borrow, ir.Imm32(0), result)}
+                                     : result};
+    SetDst(inst.dst[0], clamped_result);
+    SetCarryOut(inst, did_borrow);
+}
+
 void Translator::V_ADDC_U32(const GcnInst& inst) {
+    ValidateCarryInU32(inst);
     const IR::U32 src0{GetSrc(inst.src[0])};
     const IR::U32 src1{GetSrc(inst.src[1])};
     const IR::U32 carry{GetCarryIn(inst)};
@@ -799,36 +1123,47 @@ void Translator::V_ADDC_U32(const GcnInst& inst) {
     const IR::U32 result2{ir.IAdd(result1, carry)};
     const IR::U1 carry_out1{ir.ILessThan(result1, src0, false)};
     const IR::U1 carry_out2{ir.ILessThan(result2, result1, false)};
-    SetDst(inst.dst[0], result2);
-
     const IR::U1 did_overflow{ir.LogicalOr(carry_out1, carry_out2)};
+    const IR::U32 clamped_result{
+        inst.dst[0].output_modifier.clamp
+            ? IR::U32{ir.Select(did_overflow, ir.Imm32(0xFFFFFFFFU), result2)}
+            : result2};
+    SetDst(inst.dst[0], clamped_result);
     SetCarryOut(inst, did_overflow);
 }
 
 void Translator::V_SUBB_U32(const GcnInst& inst) {
+    ValidateCarryInU32(inst);
     const IR::U32 src0{GetSrc(inst.src[0])};
     const IR::U32 src1{GetSrc(inst.src[1])};
     const IR::U32 carry{GetCarryIn(inst)};
     const IR::U32 result{ir.ISub(ir.ISub(src0, src1), carry)};
-    SetDst(inst.dst[0], result);
-
     const IR::U1 underflow{ir.IGreaterThan(src1, src0, false)};
     const IR::U32 difference{ir.ISub(src0, src1)};
     const IR::U1 borrow_underflow{ir.IGreaterThan(carry, difference, false)};
-    SetCarryOut(inst, ir.LogicalOr(underflow, borrow_underflow));
+    const IR::U1 did_borrow{ir.LogicalOr(underflow, borrow_underflow)};
+    const IR::U32 clamped_result{inst.dst[0].output_modifier.clamp
+                                     ? IR::U32{ir.Select(did_borrow, ir.Imm32(0), result)}
+                                     : result};
+    SetDst(inst.dst[0], clamped_result);
+    SetCarryOut(inst, did_borrow);
 }
 
 void Translator::V_SUBBREV_U32(const GcnInst& inst) {
+    ValidateCarryInU32(inst);
     const IR::U32 src0{GetSrc(inst.src[0])};
     const IR::U32 src1{GetSrc(inst.src[1])};
     const IR::U32 carry{GetCarryIn(inst)};
     const IR::U32 result{ir.ISub(ir.ISub(src1, src0), carry)};
-    SetDst(inst.dst[0], result);
-
     const IR::U1 underflow{ir.IGreaterThan(src0, src1, false)};
     const IR::U32 difference{ir.ISub(src1, src0)};
     const IR::U1 borrow_underflow{ir.IGreaterThan(carry, difference, false)};
-    SetCarryOut(inst, ir.LogicalOr(underflow, borrow_underflow));
+    const IR::U1 did_borrow{ir.LogicalOr(underflow, borrow_underflow)};
+    const IR::U32 clamped_result{inst.dst[0].output_modifier.clamp
+                                     ? IR::U32{ir.Select(did_borrow, ir.Imm32(0), result)}
+                                     : result};
+    SetDst(inst.dst[0], clamped_result);
+    SetCarryOut(inst, did_borrow);
 }
 
 void Translator::V_LDEXP_F32(const GcnInst& inst) {
@@ -856,48 +1191,57 @@ void Translator::V_CVT_PKRTZ_F16_F32(const GcnInst& inst) {
 }
 
 void Translator::V_ADD_F16(const GcnInst& inst) {
-    const auto src0 = GetSrc16<IR::F32>(inst.src[0]);
-    const auto src1 = GetSrc16<IR::F32>(inst.src[1]);
+    const auto src0 = GetSrc16<IR::F32>(inst.src[0], true);
+    const auto src1 = GetSrc16<IR::F32>(inst.src[1], true);
 
     const auto result = ir.FPAdd(src0, src1);
 
-    SetDst16(inst.dst[0], result);
+    SetDst16(inst.dst[0], result, true);
 }
 
 void Translator::V_SUB_F16(const GcnInst& inst) {
-    const auto src0 = GetSrc16<IR::F32>(inst.src[0]);
-    const auto src1 = GetSrc16<IR::F32>(inst.src[1]);
+    const auto src0 = GetSrc16<IR::F32>(inst.src[0], true);
+    const auto src1 = GetSrc16<IR::F32>(inst.src[1], true);
 
     const auto result = ir.FPSub(src0, src1);
 
-    SetDst16(inst.dst[0], result);
+    SetDst16(inst.dst[0], result, true);
+}
+
+void Translator::V_SUBREV_F16(const GcnInst& inst) {
+    const auto src0 = GetSrc16<IR::F32>(inst.src[0], true);
+    const auto src1 = GetSrc16<IR::F32>(inst.src[1], true);
+
+    const auto result = ir.FPSub(src1, src0);
+
+    SetDst16(inst.dst[0], result, true);
 }
 
 void Translator::V_MUL_F16(const GcnInst& inst) {
-    const auto src0 = GetSrc16<IR::F32>(inst.src[0]);
-    const auto src1 = GetSrc16<IR::F32>(inst.src[1]);
+    const auto src0 = GetSrc16<IR::F32>(inst.src[0], true);
+    const auto src1 = GetSrc16<IR::F32>(inst.src[1], true);
 
     const auto result = ir.FPMul(src0, src1);
 
-    SetDst16(inst.dst[0], result);
+    SetDst16(inst.dst[0], result, true);
 }
 
 void Translator::V_MAX_F16(const GcnInst& inst) {
-    const auto src0 = GetSrc16<IR::F32>(inst.src[0]);
-    const auto src1 = GetSrc16<IR::F32>(inst.src[1]);
+    const auto src0 = GetSrc16<IR::F32>(inst.src[0], true);
+    const auto src1 = GetSrc16<IR::F32>(inst.src[1], true);
 
     const auto result = ir.FPMax(src0, src1);
 
-    SetDst16(inst.dst[0], result);
+    SetDst16(inst.dst[0], result, true);
 }
 
 void Translator::V_MIN_F16(const GcnInst& inst) {
-    const auto src0 = GetSrc16<IR::F32>(inst.src[0]);
-    const auto src1 = GetSrc16<IR::F32>(inst.src[1]);
+    const auto src0 = GetSrc16<IR::F32>(inst.src[0], true);
+    const auto src1 = GetSrc16<IR::F32>(inst.src[1], true);
 
     const auto result = ir.FPMin(src0, src1);
 
-    SetDst16(inst.dst[0], result);
+    SetDst16(inst.dst[0], result, true);
 }
 
 // VOP1
@@ -1474,6 +1818,23 @@ void Translator::V_FMA_F64(const GcnInst& inst) {
     SetDst64(inst.dst[0], ir.FPFma(src0, src1, src2));
 }
 
+void Translator::V_LERP_U8(const GcnInst& inst) {
+    const IR::U32 src0{GetSrc<IR::U32>(inst.src[0])};
+    const IR::U32 src1{GetSrc<IR::U32>(inst.src[1])};
+    const IR::U32 src2{GetSrc<IR::U32>(inst.src[2])};
+    IR::U32 result{ir.Imm32(0U)};
+    for (u32 shift = 0; shift < 32; shift += 8) {
+        const IR::U32 lhs{ir.BitFieldExtract(src0, ir.Imm32(shift), ir.Imm32(8U))};
+        const IR::U32 rhs{ir.BitFieldExtract(src1, ir.Imm32(shift), ir.Imm32(8U))};
+        // S2 contributes the low bit of each corresponding byte as the tie-rounding control.
+        const IR::U32 round_up{ir.BitFieldExtract(src2, ir.Imm32(shift), ir.Imm32(1U))};
+        const IR::U32 sum{ir.IAdd(ir.IAdd(lhs, rhs), round_up)};
+        const IR::U32 average{ir.ShiftRightLogical(sum, ir.Imm32(1U))};
+        result = ir.BitwiseOr(result, ir.ShiftLeftLogical(average, ir.Imm32(shift)));
+    }
+    SetDst(inst.dst[0], result);
+}
+
 void Translator::V_MIN3_F32(const GcnInst& inst) {
     const IR::F32 src0{GetSrc<IR::F32>(inst.src[0])};
     const IR::F32 src1{GetSrc<IR::F32>(inst.src[1])};
@@ -1536,6 +1897,156 @@ void Translator::V_SAD_U32(const GcnInst& inst) {
         result = ir.ISub(max, min);
     }
     SetDst(inst.dst[0], ir.IAdd(result, src2));
+}
+
+void Translator::V_SAD_U8(const GcnInst& inst, bool high_accumulate) {
+    const IR::U32 src0{GetSrc<IR::U32>(inst.src[0])};
+    const IR::U32 src1{GetSrc<IR::U32>(inst.src[1])};
+    const IR::U32 src2{GetSrc<IR::U32>(inst.src[2])};
+    const auto byte_at = [this](const IR::U32& value, u32 shift) {
+        return IR::U32{ir.BitwiseAnd(ir.ShiftRightLogical(value, ir.Imm32(shift)), ir.Imm32(0xFF))};
+    };
+    const auto abs_diff = [this](const IR::U32& lhs, const IR::U32& rhs) {
+        const IR::U32 max{ir.IMax(lhs, rhs, false)};
+        const IR::U32 min{ir.IMin(lhs, rhs, false)};
+        return IR::U32{ir.ISub(max, min)};
+    };
+    IR::U32 sad{ir.Imm32(0)};
+    for (u32 shift = 0; shift < 32; shift += 8) {
+        sad = ir.IAdd(sad, abs_diff(byte_at(src0, shift), byte_at(src1, shift)));
+    }
+    if (high_accumulate) {
+        sad = ir.ShiftLeftLogical(sad, ir.Imm32(16));
+    }
+    SetDst(inst.dst[0], ir.IAdd(sad, src2));
+}
+
+void Translator::V_MSAD_U8(const GcnInst& inst) {
+    const IR::U32 src0{GetSrc<IR::U32>(inst.src[0])};
+    const IR::U32 src1{GetSrc<IR::U32>(inst.src[1])};
+    const IR::U32 src2{GetSrc<IR::U32>(inst.src[2])};
+    const auto byte_at = [this](const IR::U32& value, u32 shift) {
+        return IR::U32{ir.BitwiseAnd(ir.ShiftRightLogical(value, ir.Imm32(shift)), ir.Imm32(0xFF))};
+    };
+    const auto abs_diff = [this](const IR::U32& lhs, const IR::U32& rhs) {
+        const IR::U32 max{ir.IMax(lhs, rhs, false)};
+        const IR::U32 min{ir.IMin(lhs, rhs, false)};
+        return IR::U32{ir.ISub(max, min)};
+    };
+    IR::U32 sad{ir.Imm32(0)};
+    for (u32 shift = 0; shift < 32; shift += 8) {
+        const IR::U32 input_byte{byte_at(src0, shift)};
+        const IR::U32 reference_byte{byte_at(src1, shift)};
+        const IR::U32 term{ir.Select(ir.IEqual(reference_byte, ir.Imm32(0)), ir.Imm32(0),
+                                     abs_diff(input_byte, reference_byte))};
+        sad = ir.IAdd(sad, term);
+    }
+    SetDst(inst.dst[0], ir.IAdd(sad, src2));
+}
+
+void Translator::V_QSAD_PK_U16_U8(const GcnInst& inst, bool masked) {
+    const IR::U64 src0{GetSrc64<IR::U64>(inst.src[0])};
+    const IR::U32 src1{GetSrc<IR::U32>(inst.src[1])};
+    const IR::U64 src2{GetSrc64<IR::U64>(inst.src[2])};
+    const auto byte_at_u64 = [this](const IR::U64& value, u32 shift) {
+        const IR::U64 shifted{ir.ShiftRightLogical(value, ir.Imm32(shift))};
+        return IR::U32{ir.BitwiseAnd(ir.UConvert(32, shifted), ir.Imm32(0xFF))};
+    };
+    const auto byte_at_u32 = [this](const IR::U32& value, u32 shift) {
+        return IR::U32{ir.BitwiseAnd(ir.ShiftRightLogical(value, ir.Imm32(shift)), ir.Imm32(0xFF))};
+    };
+    const auto abs_diff = [this](const IR::U32& lhs, const IR::U32& rhs) {
+        const IR::U32 max{ir.IMax(lhs, rhs, false)};
+        const IR::U32 min{ir.IMin(lhs, rhs, false)};
+        return IR::U32{ir.ISub(max, min)};
+    };
+
+    IR::U64 packed{ir.Imm64(u64{0})};
+    for (u32 lane = 0; lane < 4; ++lane) {
+        IR::U32 sad{ir.Imm32(0)};
+        for (u32 byte = 0; byte < 4; ++byte) {
+            const IR::U32 input_byte{byte_at_u64(src0, (lane + byte) * 8)};
+            const IR::U32 reference_byte{byte_at_u32(src1, byte * 8)};
+            const IR::U32 difference{abs_diff(input_byte, reference_byte)};
+            const IR::U32 term{masked ? IR::U32{ir.Select(ir.IEqual(reference_byte, ir.Imm32(0)),
+                                                          ir.Imm32(0), difference)}
+                                      : difference};
+            sad = ir.IAdd(sad, term);
+        }
+        const IR::U32 accumulator{ir.BitwiseAnd(
+            ir.UConvert(32, ir.ShiftRightLogical(src2, ir.Imm32(lane * 16))), ir.Imm32(0xFFFF))};
+        const IR::U32 result16{ir.BitwiseAnd(ir.IAdd(sad, accumulator), ir.Imm32(0xFFFF))};
+        const IR::U64 packed_lane{
+            ir.ShiftLeftLogical(ir.UConvert(64, result16), ir.Imm32(lane * 16))};
+        packed = ir.BitwiseOr(packed, packed_lane);
+    }
+    SetDst64(inst.dst[0], packed);
+}
+
+void Translator::V_MQSAD_U32_U8(const GcnInst& inst) {
+    const IR::U64 src0{GetSrc64<IR::U64>(inst.src[0])};
+    const IR::U32 src1{GetSrc<IR::U32>(inst.src[1])};
+    const auto byte_at_u64 = [this](const IR::U64& value, u32 shift) {
+        const IR::U64 shifted{ir.ShiftRightLogical(value, ir.Imm32(shift))};
+        return IR::U32{ir.BitwiseAnd(ir.UConvert(32, shifted), ir.Imm32(0xFF))};
+    };
+    const auto byte_at_u32 = [this](const IR::U32& value, u32 shift) {
+        return IR::U32{ir.BitwiseAnd(ir.ShiftRightLogical(value, ir.Imm32(shift)), ir.Imm32(0xFF))};
+    };
+    const auto abs_diff = [this](const IR::U32& lhs, const IR::U32& rhs) {
+        const IR::U32 max{ir.IMax(lhs, rhs, false)};
+        const IR::U32 min{ir.IMin(lhs, rhs, false)};
+        return IR::U32{ir.ISub(max, min)};
+    };
+    const auto read_dword = [this](const InstOperand& operand, u32 index) {
+        InstOperand dword = operand;
+        dword.code += index;
+        dword.type = ScalarType::Uint32;
+        return IR::U32{GetSrc<IR::U32>(dword)};
+    };
+
+    // Snapshot all four source accumulators and compute all results before writing, so legal
+    // source/destination VGPR aliasing cannot change a later lane's input.
+    const std::array accumulators{read_dword(inst.src[2], 0), read_dword(inst.src[2], 1),
+                                  read_dword(inst.src[2], 2), read_dword(inst.src[2], 3)};
+    const auto calculate_lane = [&](u32 lane, const IR::U32& accumulator) {
+        IR::U32 sad{ir.Imm32(0)};
+        for (u32 byte = 0; byte < 4; ++byte) {
+            const IR::U32 input_byte{byte_at_u64(src0, (lane + byte) * 8)};
+            const IR::U32 reference_byte{byte_at_u32(src1, byte * 8)};
+            const IR::U32 term{ir.Select(ir.IEqual(reference_byte, ir.Imm32(0)), ir.Imm32(0),
+                                         abs_diff(input_byte, reference_byte))};
+            sad = ir.IAdd(sad, term);
+        }
+        return IR::U32{ir.IAdd(sad, accumulator)};
+    };
+    const std::array results{calculate_lane(0, accumulators[0]), calculate_lane(1, accumulators[1]),
+                             calculate_lane(2, accumulators[2]),
+                             calculate_lane(3, accumulators[3])};
+
+    for (u32 lane = 0; lane < 4; ++lane) {
+        InstOperand destination = inst.dst[0];
+        destination.code += lane;
+        destination.type = ScalarType::Uint32;
+        SetDst(destination, results[lane]);
+    }
+}
+
+void Translator::V_SAD_U16(const GcnInst& inst) {
+    const IR::U32 src0{GetSrc<IR::U32>(inst.src[0])};
+    const IR::U32 src1{GetSrc<IR::U32>(inst.src[1])};
+    const IR::U32 src2{GetSrc<IR::U32>(inst.src[2])};
+    const auto abs_diff = [this](const IR::U32& lhs, const IR::U32& rhs) {
+        const IR::U32 max{ir.IMax(lhs, rhs, false)};
+        const IR::U32 min{ir.IMin(lhs, rhs, false)};
+        return IR::U32{ir.ISub(max, min)};
+    };
+    const IR::U32 lo0{ir.BitwiseAnd(src0, ir.Imm32(0xFFFF))};
+    const IR::U32 hi0{ir.ShiftRightLogical(src0, ir.Imm32(16))};
+    const IR::U32 lo1{ir.BitwiseAnd(src1, ir.Imm32(0xFFFF))};
+    const IR::U32 hi1{ir.ShiftRightLogical(src1, ir.Imm32(16))};
+    const IR::U32 sad{ir.IAdd(abs_diff(lo0, lo1), abs_diff(hi0, hi1))};
+    SetDst(inst.dst[0], ir.IAdd(sad, src2));
 }
 
 void Translator::V_CVT_PK_U16_U32(const GcnInst& inst) {
@@ -1633,8 +2144,23 @@ void Translator::V_MUL_HI_U32(bool is_signed, const GcnInst& inst) {
     const IR::U32 hi{ir.IMulHi(src0, src1, is_signed)};
     SetDst(inst.dst[0], hi);
 }
-
+void Translator::V_MUL_HI_24(const GcnInst& inst, bool is_signed) {
+    const IR::U32 src0{
+        ir.BitFieldExtract(GetSrc(inst.src[0]), ir.Imm32(0), ir.Imm32(24), is_signed)};
+    const IR::U32 src1{
+        ir.BitFieldExtract(GetSrc(inst.src[1]), ir.Imm32(0), ir.Imm32(24), is_signed)};
+    const IR::U32 hi{ir.IMulHi(src0, src1, is_signed)};
+    SetDst(inst.dst[0], hi);
+}
 void Translator::V_MAD_U64_U32(const GcnInst& inst) {
+    if (profile.is_d3d12_profile && !profile.supports_vop3_mad64_subset) {
+        LogMissingOpcode(inst);
+        return;
+    }
+    const bool d3d12_mad64 = profile.is_d3d12_profile;
+    if (d3d12_mad64) {
+        ValidateVop3Mad64(inst);
+    }
     const auto src0 = GetSrc<IR::U32>(inst.src[0]);
     const auto src1 = GetSrc<IR::U32>(inst.src[1]);
     const auto src2 = GetSrc64<IR::U64>(inst.src[2]);
@@ -1648,11 +2174,39 @@ void Translator::V_MAD_U64_U32(const GcnInst& inst) {
     const IR::U1 less_src1 = ir.ILessThan(sum_result, src2, false);
     const IR::U1 did_overflow = ir.LogicalOr(less_src0, less_src1);
 
-    const auto unpacked = ir.UnpackUint2x32(ir.Ballot(did_overflow));
-    const IR::U32 lo{ir.CompositeExtract(unpacked, 0U)};
-    const IR::U32 hi{ir.CompositeExtract(unpacked, 1U)};
-    ir.SetVccLo(lo);
-    ir.SetVccHi(hi);
+    if (d3d12_mad64) {
+        SetCarryOut(inst, did_overflow);
+    } else {
+        const auto unpacked = ir.UnpackUint2x32(ir.Ballot(did_overflow));
+        const IR::U32 lo{ir.CompositeExtract(unpacked, 0U)};
+        const IR::U32 hi{ir.CompositeExtract(unpacked, 1U)};
+        ir.SetVccLo(lo);
+        ir.SetVccHi(hi);
+    }
+}
+
+void Translator::V_MAD_I64_I32(const GcnInst& inst) {
+    if (!profile.is_d3d12_profile || !profile.supports_vop3_mad64_subset) {
+        throw std::runtime_error("GCN2 VOP3a MAD_I64_I32 is disabled for this shader profile");
+    }
+    ValidateVop3Mad64(inst);
+
+    const IR::U32 src0{GetSrc<IR::U32>(inst.src[0])};
+    const IR::U32 src1{GetSrc<IR::U32>(inst.src[1])};
+    const IR::U32 src0_sign{ir.ShiftRightArithmetic(src0, ir.Imm32(31))};
+    const IR::U32 src1_sign{ir.ShiftRightArithmetic(src1, ir.Imm32(31))};
+    const IR::U64 src0_signed{ir.PackUint2x32(ir.CompositeConstruct(src0, src0_sign))};
+    const IR::U64 src1_signed{ir.PackUint2x32(ir.CompositeConstruct(src1, src1_sign))};
+    const IR::U64 src2{GetSrc64<IR::U64>(inst.src[2])};
+
+    const IR::U64 mul_result{ir.IMul(src0_signed, src1_signed)};
+    const IR::U64 sum_result{ir.IAdd(mul_result, src2)};
+    SetDst64(inst.dst[0], sum_result);
+
+    const IR::U1 less_src0{ir.ILessThan(sum_result, mul_result, false)};
+    const IR::U1 less_src1{ir.ILessThan(sum_result, src2, false)};
+    const IR::U1 did_overflow{ir.LogicalOr(less_src0, less_src1)};
+    SetCarryOut(inst, did_overflow);
 }
 
 void Translator::V_LSHLREV_B16(const GcnInst& inst) {
@@ -1970,24 +2524,44 @@ void Translator::V_MAD_MIXHI_F16(const GcnInst& inst) {
 
 IR::U32 Translator::GetCarryIn(const GcnInst& inst) {
     IR::U64 carry;
-    if (inst.src_count == 3) { // VOP3
-        carry = GetSrc64(inst.src[2]);
-    } else { // VOP2
+    if (inst.encoding == InstEncoding::VOP3 && inst.src_count == 3) {
+        if (!IsCarryMaskRegister(inst.src[2].field)) {
+            throw std::runtime_error("VOP3B carry-in source must be an SGPR-pair or VCC mask");
+        }
+        InstOperand carry_operand = inst.src[2];
+        // The guest ISA is wave64 even when the backend emulates it on physical wave32.
+        if (carry_operand.field == OperandField::ScalarGPR) {
+            carry_operand.code &= ~u32{1};
+        }
+        carry = GetSrc64(carry_operand);
+    } else if (inst.encoding == InstEncoding::VOP2 && inst.src_count == 2) {
         carry = ir.PackUint2x32(ir.CompositeConstruct(ir.GetVccLo(), ir.GetVccHi()));
+    } else {
+        throw std::runtime_error("Unsupported VOP2/VOP3B carry-in encoding");
     }
 
     return IR::U32{ir.Select(ir.InverseBallot(carry), ir.Imm32(1), ir.Imm32(0))};
 }
 
 void Translator::SetCarryOut(const GcnInst& inst, const IR::U1& carry) {
-    if (inst.dst_count == 2) { // VOP3
-        SetDst64(inst.dst[1], ir.Ballot(carry));
-    } else { // VOP2
+    if (inst.encoding == InstEncoding::VOP3 && inst.dst_count == 2) {
+        if (!IsCarryMaskRegister(inst.dst[1].field)) {
+            throw std::runtime_error("VOP3 carry-out destination must be an SGPR-pair or VCC mask");
+        }
+        InstOperand carry_destination = inst.dst[1];
+        // Keep the guest wave64 SGPR-pair semantics independent of physical subgroup size.
+        if (carry_destination.field == OperandField::ScalarGPR) {
+            carry_destination.code &= ~u32{1};
+        }
+        SetDst64(carry_destination, ir.Ballot(carry));
+    } else if (inst.encoding == InstEncoding::VOP2 && inst.dst_count == 1) {
         const auto unpacked = ir.UnpackUint2x32(ir.Ballot(carry));
         const IR::U32 lo{ir.CompositeExtract(unpacked, 0U)};
         const IR::U32 hi{ir.CompositeExtract(unpacked, 1U)};
         ir.SetVccLo(lo);
         ir.SetVccHi(hi);
+    } else {
+        throw std::runtime_error("Unsupported VOP2/VOP3 carry-out encoding");
     }
 }
 

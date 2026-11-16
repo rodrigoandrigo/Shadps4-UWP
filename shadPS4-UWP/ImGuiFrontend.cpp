@@ -60,6 +60,8 @@ std::string Label(std::string text) {
         {"readback_offload", "Readback on copy queue"},
         {"memory_swap_enabled", "Memory swap (default on Xbox)"},
         {"show_fps_counter", "Show FPS counter"},
+        {"async_shader_recompiling", "Asynchronous shader compilation"},
+        {"enable_device_discovery", "Enable network device discovery"},
         {"console_language", "Console language"},
         {"volume_slider", "Volume (%)"},
         {"audio_backend", "Audio backend"},
@@ -425,6 +427,7 @@ void ImGuiFrontend::ResolveApi() {
     RESOLVE(set_setting, "shadps4_set_setting");
     RESOLVE(reset_settings, "shadps4_reset_settings");
     RESOLVE(mount, "shadps4_mount_storage_folder");
+    RESOLVE(mount_xbox_games, "shadps4_mount_xbox_games");
     RESOLVE(mount_pkg, "shadps4_mount_pkg");
     RESOLVE(mount_pkg_file, "shadps4_mount_pkg_file");
     RESOLVE(unmount, "shadps4_unmount_storage_folder");
@@ -923,8 +926,27 @@ void ImGuiFrontend::Scan() {
     std::vector<std::string> package_paths;
     std::vector<std::pair<std::string, Platform::Agile<StorageFile>>> selected_packages;
     std::unordered_map<std::string, std::string> names;
-    for (size_t index = 0; index < roots.size(); ++index) {
-        const auto& root = roots[index];
+    const auto& scan_roots = roots;
+    if (Windows::System::Profile::AnalyticsInfo::VersionInfo->DeviceFamily == "Windows.Xbox") {
+        const std::string path = "/xboxgames";
+        const auto code = mount_xbox_games(path.c_str());
+        if (!code) {
+            root_mounts.push_back(path);
+            folders.emplace_back(path, 0);
+            names.emplace(path, "D:\\DevelopmentFiles\\Games\\PS4");
+            UwpDiagnostics::Record("xbox_games_directory_mounted");
+        } else {
+            UwpDiagnostics::Record("xbox_games_directory_unavailable", code);
+            throw std::runtime_error("Cannot scan D:\\DevelopmentFiles\\Games\\PS4: " +
+                                     Utf8(core->Error()));
+        }
+    }
+    for (size_t index = 0; index < scan_roots.size(); ++index) {
+        const auto& root = scan_roots[index];
+        if (Windows::System::Profile::AnalyticsInfo::VersionInfo->DeviceFamily == "Windows.Xbox" &&
+            root.folder.Get() &&
+            _wcsicmp(root.folder.Get()->Path->Data(), L"D:\\DevelopmentFiles\\Games\\PS4") == 0)
+            continue;
         const auto label =
             Utf8(root.file.Get() ? root.file.Get()->Name->Data() : root.folder.Get()->Name->Data());
         result->roots.push_back({label, root.token, root.enabled});
@@ -1197,8 +1219,9 @@ ThumbnailPixels ImGuiFrontend::Decode(const std::string& key, const std::string&
     return output;
 }
 void ImGuiFrontend::RequestImage(const std::string& key, const std::string& path) {
-    if (pending_images.find(key) != pending_images.end() || pending_images.size() >= 32 ||
-        decoded.size() >= 16)
+    const bool startup = key.compare(0, 8, "startup:") == 0;
+    if (pending_images.find(key) != pending_images.end() ||
+        (!startup && (pending_images.size() >= 32 || decoded.size() >= 16)))
         return;
     const auto failure = failed_images.find(key);
     if (failure != failed_images.end() && std::chrono::steady_clock::now() < failure->second)
@@ -1214,11 +1237,16 @@ void ImGuiFrontend::RequestImage(const std::string& key, const std::string& path
                     auto pixels = Decode(key, path);
                     Complete([this, pixels = std::move(pixels), request]() mutable {
                         const bool startup = pixels.key.compare(0, 8, "startup:") == 0;
-                        if (library && library->generation == request && decoded.size() < 16 &&
-                            (!startup || (shader_startup_visible && pixels.key == shader_startup_image)))
-                            decoded.push_back(std::move(pixels));
-                        else
+                        if (library && library->generation == request &&
+                            (startup ? shader_startup_visible && pixels.key == shader_startup_image
+                                     : decoded.size() < 16)) {
+                            if (startup)
+                                decoded.push_front(std::move(pixels));
+                            else
+                                decoded.push_back(std::move(pixels));
+                        } else {
                             pending_images.erase(pixels.key);
+                        }
                     });
                 } catch (...) {
                     Complete([this, key] {
@@ -1230,7 +1258,7 @@ void ImGuiFrontend::RequestImage(const std::string& key, const std::string& path
                     });
                 }
             },
-            true))
+            !startup))
         pending_images.insert(key);
 }
 
@@ -1406,9 +1434,6 @@ void ImGuiFrontend::Draw() {
                                 idle && !scanning.load()) &&
                 choose_folder)
                 choose_folder(L"library");
-            if (ImGui::MenuItem("Add PKG…", nullptr, false, idle && !scanning.load()) &&
-                choose_folder)
-                choose_folder(L"pkg");
             if (ImGui::MenuItem("Start game", nullptr, false, can_play))
                 StartGame();
             if (ImGui::BeginMenu("Import", idle)) {
@@ -1621,13 +1646,14 @@ void ImGuiFrontend::DrawShaderCompilation() {
     if (texture)
         draw->AddImage(reinterpret_cast<ImTextureID>(texture), {0, 0}, display);
     draw->AddRectFilledMultiColor({0, std::max(0.0f, display.y - 220 * scale)}, display,
-                                 IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0),
-                                 IM_COL32(0, 0, 0, 240), IM_COL32(0, 0, 0, 240));
+                                  IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0),
+                                  IM_COL32(0, 0, 0, 240), IM_COL32(0, 0, 0, 240));
     ImGui::SetNextWindowPos({0, std::max(0.0f, display.y - 160 * scale)});
     ImGui::SetNextWindowSize({display.x, 160 * scale});
-    ImGui::Begin("shader-startup", nullptr, ImGuiWindowFlags_NoDecoration |
-                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
-                 ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoInputs);
+    ImGui::Begin("shader-startup", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBackground |
+                     ImGuiWindowFlags_NoInputs);
     const auto centered = [&](const char* text) {
         const float width = ImGui::CalcTextSize(text).x;
         ImGui::SetCursorPosX(std::max(16 * scale, (display.x - width) / 2));
@@ -1641,23 +1667,25 @@ void ImGuiFrontend::DrawShaderCompilation() {
         const float width = std::min(display.x - 32 * scale, 640 * scale);
         ImGui::SetCursorPosX((display.x - width) / 2);
         char label[128]{};
-        std::snprintf(label, sizeof(label), "%u / %u items (%u ready)",
-                      progress.processed, progress.total, progress.compiled);
-        const float fraction = progress.total ?
-            std::min(1.0f, static_cast<float>(progress.processed) / progress.total) : 0.0f;
+        std::snprintf(label, sizeof(label), "%u / %u items (%u ready)", progress.processed,
+                      progress.total, progress.compiled);
+        const float fraction =
+            progress.total ? std::min(1.0f, static_cast<float>(progress.processed) / progress.total)
+                           : 0.0f;
         ImGui::ProgressBar(fraction, {width, 24 * scale}, label);
     } else if (progress.stage == SHADPS4_SHADERS_LOADING_CACHE) {
         if (progress.total) {
             centered("Scanning shader files…");
             char label[96]{};
-            std::snprintf(label, sizeof(label), "%u / %u files", progress.processed, progress.total);
+            std::snprintf(label, sizeof(label), "%u / %u files", progress.processed,
+                          progress.total);
             centered(label);
         } else {
             centered("Loading shader cache…");
         }
     } else if (progress.stage == SHADPS4_SHADERS_READY) {
-        centered(progress.total ? "Shader cache preparation complete. Starting game…" :
-                                  "Starting game…");
+        centered(progress.total ? "Shader cache preparation complete. Starting game…"
+                                : "Starting game…");
     } else {
         centered("Preparing game…");
     }

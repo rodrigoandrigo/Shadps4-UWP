@@ -13,14 +13,25 @@ public:
     };
     ResourceBindings(D3D12DeviceContext& device, ResourceCache& buffers, ImageCache& images,
                      std::span<CompiledShader*> shaders,
-                     std::span<const StreamOutSlot> strmout_slots = {},
-                     D3D12DescriptorArena* resource_heap = nullptr,
-                     D3D12DescriptorArena* sampler_heap = nullptr, bool fence_safe = false);
+                     std::span<const StreamOutSlot> strmout_slots,
+                     D3D12DescriptorArena* resource_heap, D3D12DescriptorArena* sampler_heap,
+                     bool fence_safe, DescriptorBindingTier descriptor_tier,
+                     bool feature_level_11_1_or_higher);
     void Upload(ID3D12GraphicsCommandList* commands, Shader::PushData& push,
                 std::span<const float, 24> clip_planes, VAddr border_colors,
                 const ResourceCache::Read& read, std::span<const u8, 65536> gds,
                 std::span<const u8> shared_memory = {});
     void PrepareImages();
+    void SnapshotAttachmentFeedback(std::span<ImageCache::Image*> attachments,
+                                    std::span<const bool> attachment_writes,
+                                    bool writes_only_first_layer,
+                                    ID3D12GraphicsCommandList* commands);
+    const std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& FeedbackSnapshots() const {
+        return feedback_snapshots;
+    }
+    u64 FeedbackSnapshotBytes() const {
+        return feedback_snapshot_bytes;
+    }
     std::span<const ResourceCache::Range> GuestRanges() const {
         return guest_ranges;
     }
@@ -43,7 +54,8 @@ public:
     void Bind(ID3D12GraphicsCommandList* commands, bool graphics, u32 resource_slot,
               u32 sampler_slot);
     void ValidateInputRange(VAddr address, u64 size) const;
-    void ValidateTargetRange(VAddr address, u64 size, bool written = true) const;
+    void ValidateTargetRange(VAddr address, u64 size, bool written = true,
+                             bool allow_sampled_attachment_feedback = false) const;
     std::vector<ResourceCache::Range> AccessRanges(VAddr border_colors) const;
 
 private:
@@ -59,6 +71,9 @@ private:
     std::vector<Entry> entries;
     std::vector<ResourceCache::Range> guest_ranges;
     std::vector<D3D12_DESCRIPTOR_RANGE> resource_ranges, sampler_ranges;
+    std::vector<ID3D12Resource*> feedback_resource_views;
+    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> feedback_snapshots;
+    u64 feedback_snapshot_bytes{};
     D3D12DescriptorArena owned_resources, owned_samplers;
     D3D12DescriptorArena& resources;
     D3D12DescriptorArena& samplers;

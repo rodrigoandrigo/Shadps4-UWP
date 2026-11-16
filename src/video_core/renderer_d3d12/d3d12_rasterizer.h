@@ -50,6 +50,9 @@ public:
                       VAddr count_address) override;
     void DrawIndirect(bool indexed, VAddr address, u32 offset, u32 stride, u32 count,
                       VAddr count_address, u16 vertex_sgpr, u16 instance_sgpr) override;
+    void DrawIndirectWithDrawIndex(bool indexed, VAddr address, u32 offset, u32 stride, u32 count,
+                                   VAddr count_address, u16 vertex_sgpr, u16 instance_sgpr,
+                                   u16 draw_index_loc, bool draw_index_enabled) override;
     void DispatchDirect() override;
     void DispatchIndirect(VAddr address, u32 offset, u32 size) override;
     void FillBuffer(VAddr address, u32 size, u32 value, bool gds) override;
