@@ -298,6 +298,10 @@ int uwp_memory_copy(void* destination, const void* source, uint64_t size) {
     uintptr_t dst = (uintptr_t)destination, src = (uintptr_t)source;
     int dst_physical = dst - canonical_base < physical_size;
     int src_physical = src - canonical_base < physical_size;
+    UwpPage* dst_page = dst_physical ? NULL : uwp_page(dst);
+    UwpPage* src_page = src_physical ? NULL : uwp_page(src);
+    int dst_guest = dst_page && dst_page->mapped;
+    int src_guest = src_page && src_page->mapped;
     if ((!dst_physical && !src_physical) ||
         (dst_physical && size > physical_size - (dst - canonical_base)) ||
         (src_physical && size > physical_size - (src - canonical_base))) {
@@ -311,16 +315,24 @@ int uwp_memory_copy(void* destination, const void* source, uint64_t size) {
             bytes = (size_t)(PAGE - (src - canonical_base) % PAGE);
         if (dst_physical && bytes > PAGE - (dst - canonical_base) % PAGE)
             bytes = (size_t)(PAGE - (dst - canonical_base) % PAGE);
-        if (src_physical) {
-            if (!physical_copy(src - canonical_base, transfer_page, bytes, 0))
+        if (src_physical && !dst_physical && !dst_guest) {
+            if (!physical_copy(src - canonical_base, (void*)dst, bytes, 0))
                 uwp_fail("physical copy read", src);
-        } else
-            memcpy(transfer_page, (void*)src, bytes);
-        if (dst_physical) {
-            if (!physical_copy(dst - canonical_base, transfer_page, bytes, 1))
+        } else if (dst_physical && !src_physical && !src_guest) {
+            if (!physical_copy(dst - canonical_base, (void*)src, bytes, 1))
                 uwp_fail("physical copy write", dst);
-        } else
-            memcpy((void*)dst, transfer_page, bytes);
+        } else {
+            if (src_physical) {
+                if (!physical_copy(src - canonical_base, transfer_page, bytes, 0))
+                    uwp_fail("physical copy read", src);
+            } else
+                memcpy(transfer_page, (void*)src, bytes);
+            if (dst_physical) {
+                if (!physical_copy(dst - canonical_base, transfer_page, bytes, 1))
+                    uwp_fail("physical copy write", dst);
+            } else
+                memcpy((void*)dst, transfer_page, bytes);
+        }
         dst += bytes;
         src += bytes;
         size -= bytes;

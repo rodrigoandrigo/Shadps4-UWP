@@ -618,7 +618,11 @@ std::optional<u64> BufferCache::StreamViaLane(VAddr device_addr, u32 size) {
         return std::nullopt;
     }
     Core::MemoryManager::BackingSpan spans[2];
+#ifdef SHADPS4_UWP
+    const bool hardened = true;
+#else
     const bool hardened = lane.Hardened();
+#endif
     const u32 num_spans = memory->ResolveBackingSpans(device_addr, size, spans, 2, hardened);
     if (num_spans == 0) {
         lane.NoteInlineUnresolved();
@@ -629,27 +633,25 @@ std::optional<u64> BufferCache::StreamViaLane(VAddr device_addr, u32 size) {
             Core::MemoryManager::EndBackingPush();
         }
     };
-    std::shared_ptr<void> leases[2];
-#ifdef SHADPS4_UWP
-    for (u32 i = 0; i < num_spans; ++i) {
-        leases[i] = Core::AddressSpace::AcquireHostAccess(spans[i].ptr, spans[i].size);
-    }
-#endif
     // 64-byte slots keep each job's cache lines on one core.
     const u64 alignment = std::max<u64>(instance.UniformMinAlignment(), 64);
     auto [dst, offset] = stream_buffer.Map(size, alignment);
+#ifndef SHADPS4_UWP
     bool queued = true;
+#endif
     for (u32 i = 0; i < num_spans; ++i) {
+#ifdef SHADPS4_UWP
+        if (!Core::AddressSpace::CopyBacking(dst, spans[i].ptr, spans[i].size)) {
+            std::memcpy(dst, spans[i].ptr, spans[i].size);
+        }
+#else
         if (queued) {
-            queued =
-                lane.Push(spans[i].ptr, dst, static_cast<u32>(spans[i].size), std::move(leases[i]));
+            queued = lane.Push(spans[i].ptr, dst, static_cast<u32>(spans[i].size));
         }
         if (!queued) {
-#ifdef SHADPS4_UWP
-            if (!Core::AddressSpace::CopyBacking(dst, spans[i].ptr, spans[i].size))
-#endif
-                std::memcpy(dst, spans[i].ptr, spans[i].size);
+            std::memcpy(dst, spans[i].ptr, spans[i].size);
         }
+#endif
         dst += spans[i].size;
     }
     stream_buffer.Commit();

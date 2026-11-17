@@ -709,18 +709,16 @@ static int uwp_backing_read(uintptr_t address, void* dest, uint64_t size) {
                 uint64_t bytes = 4096 - (at - subpage);
                 if (bytes > n - copied)
                     bytes = n - copied;
-                MEMORY_BASIC_INFORMATION info;
                 DWORD old;
-                if (!VirtualQuery((void*)subpage, &info, sizeof(info))) {
-                    uwp_fail("host read protection query", subpage);
-                }
-                int change = (info.Protect == PAGE_NOACCESS);
+                DWORD protection =
+                    win_prot(page->protection[(subpage - page->address) / 4096]);
+                int change = protection == PAGE_NOACCESS;
                 if (change && !VirtualProtectFromApp((void*)subpage, 4096, PAGE_READONLY, &old)) {
                     result = 0;
                     break;
                 }
                 memcpy((unsigned char*)dest + copied, (const void*)at, (size_t)bytes);
-                if (change && !VirtualProtectFromApp((void*)subpage, 4096, info.Protect, &old)) {
+                if (change && !VirtualProtectFromApp((void*)subpage, 4096, protection, &old)) {
                     uwp_fail("host read protection restore", subpage);
                 }
                 copied += bytes;
